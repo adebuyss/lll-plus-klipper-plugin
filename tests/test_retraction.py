@@ -237,3 +237,64 @@ class TestDeretractFiltering:
         # Should return old extrusion velocity (~5), not retract speed (40)
         assert smoothed < 10.0
         assert smoothed > 0.0
+
+
+class TestPassiveFollow:
+    """Passive follow in critical zones when auto_enabled is off."""
+
+    def test_retract_in_full_zone_when_disabled(self, buf, reactor):
+        buf.material_present = True
+        buf._print_stats.state = "standby"
+        set_sensors(buf, full=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(buf, e_delta=-5.0, xyz_dist=0.0, speed=30.0)
+        assert buf.motor_direction == BACK
+
+    def test_feed_in_empty_zone_when_disabled(self, buf, reactor):
+        buf.material_present = True
+        buf._print_stats.state = "standby"
+        set_sensors(buf, empty=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(buf, e_delta=5.0, xyz_dist=0.0, speed=30.0)
+        assert buf.motor_direction == FORWARD
+
+    def test_no_follow_in_middle_zone(self, buf, reactor):
+        buf.material_present = True
+        buf._print_stats.state = "standby"
+        set_sensors(buf, middle=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(buf, e_delta=-5.0, xyz_dist=0.0, speed=30.0)
+        assert buf.motor_direction == STOP
+
+    def test_stops_when_extruder_stops(self, buf, reactor):
+        buf.material_present = True
+        buf._print_stats.state = "standby"
+        set_sensors(buf, full=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(buf, e_delta=-5.0, xyz_dist=0.0, speed=30.0)
+        assert buf.motor_direction == BACK
+
+        # Extruder velocity drops to 0
+        buf.extruder_velocity = 0.0
+        buf._evaluate_and_drive(10.5)
+        assert buf.motor_direction == STOP
+
+    def test_no_passive_follow_when_printing(self, buf, reactor):
+        buf.material_present = True
+        buf._print_stats.state = "printing"
+        set_sensors(buf, full=True)
+        reactor._monotonic = 10.0
+        simulate_e_move(buf, e_delta=-5.0, xyz_dist=0.0, speed=30.0)
+        assert buf.motor_direction == STOP
+
+    def test_no_passive_follow_without_material(self, buf, reactor):
+        buf.material_present = False
+        buf._print_stats.state = "standby"
+        set_sensors(buf, full=True)
+        reactor._monotonic = 10.0
+        # Can't use simulate_e_move since follow_retract gate in hook
+        # requires material detection path — set state directly
+        buf._extruder_retracting = True
+        buf.extruder_velocity = 30.0
+        buf._evaluate_and_drive(10.0)
+        assert buf.motor_direction == STOP

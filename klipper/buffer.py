@@ -47,6 +47,8 @@ ZONE_EMPTY_MIDDLE = "empty_middle"
 #   * -> MANUAL_RETRACT       on retract button press / BUFFER_RETRACT
 #   MANUAL_* -> STOPPED/IDLE  on button release (restores prior auto_enabled)
 #   * (both buttons)          toggle auto_enabled (IDLE <-> STOPPED)
+#   IDLE -> RETRACTING          on extruder retract in full zone (passive follow)
+#   IDLE -> FEEDING             on extruder advance in empty zone (passive follow)
 #   FEEDING/STOPPED/RETRACTING -> IDLE  on filament runout
 #   * -> DISABLED             on BUFFER_DISABLE / klippy:shutdown
 #
@@ -364,7 +366,7 @@ class Buffer:
         orig(gcmd)  # updates last_position, queues move
         new_e = self._gcode_move.last_position[3]
         e_delta = new_e - prev_pos[3]
-        if abs(e_delta) > 0.001 and self.auto_enabled:
+        if abs(e_delta) > 0.001 and (self.auto_enabled or self.follow_retract):
             self._on_e_movement(e_delta, prev_pos)
 
     def _on_e_movement(self, e_delta, prev_pos):
@@ -589,6 +591,8 @@ class Buffer:
                 self._manual_feed_full_start = 0.0
             return eventtime + self.control_interval
         if not self.auto_enabled:
+            # Still evaluate for passive follow in critical zones
+            self._evaluate_and_drive(eventtime)
             return eventtime + self.control_interval
         # Skip if in manual or error state
         if self.state in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT, STATE_ERROR, STATE_DISABLED):
@@ -624,6 +628,22 @@ class Buffer:
         return eventtime + self.control_interval
 
     # --- Zone handlers ---
+
+    def _passive_follow(self, eventtime):
+        """Follow extruder in critical zones when auto-control is off."""
+        # Retract when full and extruder is retracting
+        if self._extruder_retracting and self.follow_retract and self.sensor_states["full"]:
+            self._handle_retract_follow(eventtime)
+            return
+        # Feed when empty and extruder is advancing
+        if not self._extruder_retracting and self.extruder_velocity > self.min_velocity and self.sensor_states["empty"]:
+            if self.motor_direction != FORWARD:
+                self._set_motor(FORWARD)
+            return
+        # No critical condition — stop if we were passively driving
+        if self.motor_direction != STOP:
+            self._stop_motor()
+            self.state = STATE_IDLE
 
     def _handle_retract_follow(self, eventtime):
         if self.extruder_velocity > self.min_velocity:
@@ -741,6 +761,12 @@ class Buffer:
         return FORWARD, None
 
     def _evaluate_and_drive(self, eventtime):
+        # Passive follow: even when not auto-enabled, follow the extruder
+        # in critical zones to prevent overflow/starvation during manual ops
+        if not self.auto_enabled and self.material_present and not self._is_printing():
+            self._passive_follow(eventtime)
+            return
+
         if not self.auto_enabled or not self.material_present:
             return
         if self.state in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT, STATE_ERROR, STATE_DISABLED):

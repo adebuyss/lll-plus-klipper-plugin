@@ -9,6 +9,7 @@ A Klipper extras module for real-time control of the Mellow LLL Plus filament bu
 - **Initial fill** -- continuous forward feed on first filament insertion to fill the buffer tube before burst logic kicks in
 - **Burst recovery** -- automatically pulses the motor when the buffer empties during travel moves
 - **Retraction following** -- mirrors extruder retractions when idle; smooths through them during printing
+- **Passive follow** -- when auto-control is off, the buffer still follows the extruder in critical zones: retracts when full and extruder retracts, feeds when empty and extruder advances
 - **Manual override** -- physical feed/retract buttons and GCode commands for filament loading
 - **Error protection** -- forward timeout, sensor conflict detection, burst exhaustion limit, and optional pause-on-runout
 - **Rate-limited UART** -- deferred motor writes prevent overwhelming the TMC2208 on the STM32F072
