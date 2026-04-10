@@ -1,0 +1,100 @@
+digraph buffer_state_machine {
+    rankdir=LR
+    fontname="Helvetica"
+    fontsize=11
+    node [fontname="Helvetica" style=filled fontsize=10 shape=box margin="0.15,0.1"]
+    edge [fontname="Helvetica" fontsize=8]
+    nodesep=0.4
+    ranksep=1.0
+    compound=true
+
+    // ===== Zone clusters (left-to-right = empty-to-full) =====
+
+    subgraph cluster_empty {
+        label="EMPTY" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#b6d7a8" fillcolor="#eaf5e6"
+
+        e_fill  [label=<FORWARD<BR/><FONT POINT-SIZE="8">initial fill @ speed_rpm</FONT>> fillcolor="#d9ead3"]
+        e_fwd   [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × correction</FONT>> fillcolor="#d9ead3"]
+        e_burst [label=<FORWARD<BR/><FONT POINT-SIZE="8">burst @ speed_rpm</FONT>> fillcolor="#d9ead3"]
+        e_stop  [label=<STOP<BR/><FONT POINT-SIZE="8">burst delay</FONT>> fillcolor="#eeeeee"]
+    }
+
+    subgraph cluster_empty_middle {
+        label="EMPTY_MIDDLE" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#a4c2f4" fillcolor="#e8f0fe"
+
+        em_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">held V × correction</FONT>> fillcolor="#cfe2f3"]
+        em_base [label=<FORWARD<BR/><FONT POINT-SIZE="8">speed_rpm (no held V)</FONT>> fillcolor="#cfe2f3"]
+    }
+
+    subgraph cluster_middle {
+        label="MIDDLE" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#b6d7a8" fillcolor="#eaf5e6"
+
+        m_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × velocity_factor</FONT>> fillcolor="#d9ead3"]
+        m_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
+    }
+
+    subgraph cluster_full_middle {
+        label="FULL_MIDDLE" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#f9cb9c" fillcolor="#fef3e8"
+
+        fm_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × slowdown</FONT>> fillcolor="#fce5cd"]
+        fm_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
+    }
+
+    subgraph cluster_full {
+        label="FULL" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
+
+        f_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × slowdown</FONT>> fillcolor="#fce5cd"]
+        f_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
+        f_back [label=<BACK<BR/><FONT POINT-SIZE="8">retract @ speed_rpm</FONT>> fillcolor="#f4cccc"]
+    }
+
+    ERROR [fillcolor="#f4cccc" label="ERROR"]
+
+    // ===== Within-zone transitions (velocity / timing) =====
+
+    e_fill  -> e_fwd   [label="V > 0\nor fill ends"]
+    e_fill  -> e_stop  [label="fill\ntimeout"]
+    e_fwd   -> e_stop  [label="V → 0"]
+    e_stop  -> e_fwd   [label="V > 0"]
+    e_stop  -> e_burst [label="burst delay\nelapsed"]
+    e_burst -> e_stop  [label="burst time\nexpired"]
+    e_stop  -> ERROR   [label="burst\nexhausted" color="#cc0000"]
+
+    // EMPTY_MIDDLE: always forward, no V→0 transitions
+    em_fwd  -> em_base [label="held V\ndecays" style=dotted]
+    em_base -> em_fwd  [label="new extrusion\ncaptures V" style=dotted]
+
+    m_fwd  -> m_stop [label="V → 0"]
+    m_stop -> m_fwd  [label="V > 0"]
+
+    fm_fwd  -> fm_stop [label="V → 0"]
+    fm_stop -> fm_fwd  [label="V > 0"]
+
+    f_fwd  -> f_stop [label="V → 0"]
+    f_stop -> f_fwd  [label="V > 0"]
+    f_fwd  -> f_back [label="feed time >=\nfull_zone_timeout"]
+    f_fwd  -> ERROR  [label="empty+full\nconflict" color="#cc0000"]
+
+    // ===== Cross-zone transitions (sensor changes) =====
+
+    e_fwd  -> em_fwd [label="empty\nclears" style=dashed]
+    e_fwd  -> m_fwd  [label="middle\ntriggers" style=dashed]
+
+    em_fwd  -> e_fwd  [label="empty\ntriggers" style=dashed]
+    em_fwd  -> m_fwd  [label="middle\ntriggers" style=dashed]
+
+    m_fwd  -> em_fwd  [label="middle\nclears" style=dashed]
+    m_fwd  -> fm_fwd  [label="full\ntriggers" style=dashed]
+
+    fm_fwd  -> m_fwd  [label="full\nclears" style=dashed]
+    fm_fwd  -> f_fwd  [label="middle\nclears" style=dashed]
+
+    f_back -> fm_fwd  [label="middle\ntriggers" style=dashed]
+    f_back -> m_fwd   [label="full clears +\nmiddle triggers" style=dashed]
+    f_back -> em_fwd  [label="full\nclears" style=dashed]
+}
