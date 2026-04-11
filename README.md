@@ -1,23 +1,21 @@
 # LLL-Plus Klipper Plugin
 
-A Klipper extras module for real-time control of the Mellow LLL Plus filament buffer. Replaces the stock macro-based configuration with a native module that tracks extruder velocity and drives the buffer motor in closed-loop using hall effect sensor feedback.
+A Klipper extras module for real-time control of the Mellow LLL Plus filament buffer. Uses the AFC/Happy Hare motion strategy: the buffer stepper is synchronized with the main extruder via a shared trapq, and hall effect sensors dynamically adjust `rotation_distance` to keep the filament loop centered on the middle sensor.
 
 ## Features
 
-- **Velocity tracking** -- hooks into G0/G1/G2/G3 moves to match the buffer motor speed to the extruder in real time
-- **Zone-based control** -- three hall sensors (empty, middle, full) define buffer zones; the motor feeds, matches, or retracts accordingly
-- **Initial fill** -- continuous forward feed on first filament insertion to fill the buffer tube before burst logic kicks in
-- **Burst recovery** -- automatically pulses the motor when the buffer empties during travel moves
-- **Retraction following** -- mirrors extruder retractions when idle; smooths through them during printing
-- **Passive follow** -- when auto-control is off, the buffer still follows the extruder in critical zones: retracts when full and extruder retracts, feeds when empty and extruder advances
+- **Trapq sync** -- buffer stepper follows the extruder step-for-step via `extruder_stepper` and shared motion queue
+- **Middle-zone seeking** -- three hall sensors define a five-zone state; rotation_distance feedback keeps the filament centered on the middle sensor (dead-band at multiplier 1.0)
+- **Fault escalation** -- sustained time in a safety zone (EMPTY/FULL) increases the correction gain, then triggers an error or forced retract
+- **Initial fill** -- continuous forward feed on first filament insertion via `force_move`
 - **Manual override** -- physical feed/retract buttons and GCode commands for filament loading
-- **Error protection** -- forward timeout, sensor conflict detection, burst exhaustion limit, and optional pause-on-runout
-- **Rate-limited UART** -- deferred motor writes prevent overwhelming the TMC2208 on the STM32F072
+- **Error clear via buttons** -- hold both buttons for 2 seconds to clear an error state
+- **Error protection** -- forward timeout, sensor conflict detection, safety timeouts, and optional pause-on-runout
 
 ## Hardware
 
 - Mellow LLL Plus filament buffer board (STM32F072 MCU)
-- TMC2208 / TMC2225 stepper driver (controlled via VACTUAL over SPI UART)
+- TMC2208 / TMC2225 stepper driver (step/dir control; UART used only for initial config)
 - Three hall effect sensors (empty, middle, full positions)
 - Filament presence switch
 - Feed and retract buttons
@@ -37,115 +35,93 @@ sudo systemctl restart klipper
 
 ## Configuration
 
-Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust pin assignments and serial path for your setup. Key parameters:
+Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust pin assignments and serial path for your setup.
 
-| Parameter            | Default | Description                                                      |
-|----------------------|---------|------------------------------------------------------------------|
-| `speed_rpm`          | 120     | Base motor speed (RPM) for manual ops and safety overrides       |
-| `velocity_factor`    | 1.05    | Middle-zone speed multiplier to compensate for friction          |
-| `correction_factor`  | 1.3     | Speed multiplier when catching up from the empty zone            |
-| `slowdown_factor`    | 0.5     | Speed multiplier in the full zone before retract kicks in        |
-| `forward_timeout`    | 60.0    | Seconds of continuous forward feeding before error (0 = disable) |
-| `full_zone_timeout`  | 3.0     | Seconds in full zone before switching from slowdown to retract   |
-| `burst_feed_time`    | 0.5     | Duration (s) of each burst pulse                                 |
-| `burst_delay`        | 0.5     | Idle time (s) in empty zone before burst triggers                |
-| `velocity_window`    | 0.3     | Sliding window (s) for smoothed velocity                         |
-| `drive_interval`     | 0.1     | Minimum interval (s) between motor UART writes                   |
-| `initial_fill_timeout` | 10.0  | Duration (s) of continuous forward feed on first filament insertion |
-| `pause_on_runout`    | True    | Pause print on filament runout or forward timeout                |
-| `follow_retract`     | True    | Follow extruder retractions when not printing                    |
+**Important:** The buffer stepper is now configured as `[extruder_stepper buffer_stepper]` (not `[manual_stepper]`). The `extruder:` field must name the extruder to sync with (typically `extruder`).
+
+### Key parameters
+
+| Parameter              | Default | Description                                                      |
+|------------------------|---------|------------------------------------------------------------------|
+| `drift_gain`           | 0.02    | Multiplier offset in EMPTY_MIDDLE / FULL_MIDDLE zones            |
+| `safety_gain`          | 0.05    | Multiplier offset in EMPTY / FULL safety zones                   |
+| `fault_escalation_time`| 5.0     | Seconds in a safety zone before gain escalates to 1.5x           |
+| `empty_safety_timeout` | 30.0    | Seconds in EMPTY zone before raising an error                    |
+| `full_safety_timeout`  | 10.0    | Seconds in FULL zone before forced retract                       |
+| `manual_speed`         | 10.0    | Speed (mm/s) for manual feed/retract                             |
+| `manual_accel`         | 100.0   | Acceleration (mm/s^2) for manual feed/retract                    |
+| `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
+| `forward_timeout`      | 60.0    | Seconds of continuous forward before error (0 = disable)         |
+| `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
+| `pause_on_runout`      | True    | Pause print on filament runout or safety timeout                 |
 
 See `sample_config/lll-plus.cfg` for the full annotated reference.
 
 ## GCode Commands
 
-| Command                        | Description                                                  |
-|--------------------------------|--------------------------------------------------------------|
-| `BUFFER_STATUS`                | Report current state, sensor readings, velocities, and zone  |
-| `BUFFER_ENABLE`                | Enable automatic buffer control                              |
-| `BUFFER_DISABLE`               | Stop the motor and disable automatic control                 |
-| `BUFFER_FEED [SPEED=<rpm>]`    | Manual forward feed (auto-stops when full sensor triggers)   |
-| `BUFFER_RETRACT [SPEED=<rpm>]` | Manual retract                                               |
-| `BUFFER_STOP`                  | Stop the motor and return to automatic mode                  |
-| `BUFFER_SET_SPEED SPEED=<rpm>` | Change the base motor speed                                  |
-| `BUFFER_CLEAR_ERROR`           | Clear an error state and return to idle                      |
+| Command                              | Description                                                  |
+|--------------------------------------|--------------------------------------------------------------|
+| `BUFFER_STATUS`                      | Report state, sensors, zone, rd_multiplier, sync status      |
+| `BUFFER_ENABLE`                      | Sync to extruder and enable automatic control                |
+| `BUFFER_DISABLE`                     | Unsync and disable automatic control                         |
+| `BUFFER_FEED [SPEED=<mm/s>] [DIST=<mm>]` | Manual forward feed (default 50mm)                      |
+| `BUFFER_RETRACT [SPEED=<mm/s>] [DIST=<mm>]` | Manual retract (default 50mm)                         |
+| `BUFFER_STOP`                        | Stop any manual move, re-sync if auto-enabled                |
+| `BUFFER_SET_SPEED SPEED=<mm/s>`      | Set manual feed/retract speed                                |
+| `BUFFER_CLEAR_ERROR`                 | Clear error state (also via 2s both-button hold)             |
 
-## State Machine
+## Motion Strategy
+
+### How it works
+
+The buffer stepper is configured as a Klipper `[extruder_stepper]` and synced to the main extruder's motion queue (trapq) at startup. This means the buffer motor follows the extruder step-for-step through Klipper's standard motion pipeline -- no G-code hooks, no velocity prediction, no timing gap.
+
+Three hall effect sensors provide reactive feedback by adjusting the buffer stepper's `rotation_distance`:
+
+```
+rd_new = base_rotation_distance / multiplier
+```
+
+- **multiplier > 1.0** -- smaller rotation_distance -- more steps per mm -- delivers MORE filament
+- **multiplier < 1.0** -- larger rotation_distance -- fewer steps per mm -- delivers LESS filament
+- **multiplier = 1.0** -- baseline -- buffer follows extruder 1:1 (dead-band)
 
 ### Sensor Zones
 
-The three hall sensors map to a zone that drives motor behavior. Sensors read `1` when the filament loop blocks the magnet.
+| Empty | Middle | Full | Zone         | Multiplier                |
+|:-----:|:------:|:----:|--------------|---------------------------|
+|   1   |   *    |   1  | **ERROR**    | sensor conflict           |
+|   1   |   *    |   0  | EMPTY        | 1.0 + `safety_gain`       |
+|   0   |   0    |   0  | EMPTY_MIDDLE | 1.0 + `drift_gain`        |
+|   0   |   1    |   0  | **MIDDLE**   | **1.00 (dead-band)**      |
+|   0   |   1    |   1  | FULL_MIDDLE  | 1.0 - `drift_gain`        |
+|   0   |   0    |   1  | FULL         | 1.0 - `safety_gain`       |
 
-| Empty | Middle | Full | Zone                       |
-|:-----:|:------:|:----:|----------------------------|
-|   1   |   *    |   1  | **ERROR** -- sensor conflict |
-|   1   |   *    |   0  | EMPTY                       |
-|   0   |   0    |   1  | FULL                        |
-|   0   |   1    |   1  | FULL_MIDDLE                 |
-|   0   |   1    |   0  | MIDDLE                      |
-|   0   |   0    |   0  | EMPTY_MIDDLE                |
+The MIDDLE zone is the target equilibrium. When the middle sensor alone is active, the multiplier is exactly 1.0 -- the buffer rides the extruder step-for-step with zero correction. Deviations toward empty or full apply proportional corrections that push the filament loop back toward center.
 
-### Zone Behavior
+### Fault escalation
 
-Each zone decides a motor direction and speed. `V` is the smoothed extruder velocity. Speeds shown are the VACTUAL conversion of the velocity multiplied by the listed factor.
-
-| Zone        | Condition                          | Motor          | Speed                    |
-|-------------|------------------------------------|----------------|--------------------------|
-| EMPTY       | initial fill active                | FORWARD        | `speed_rpm`              |
-| EMPTY       | initial fill timed out             | STOP → STOPPED | --                       |
-| EMPTY       | V > min                            | FORWARD        | V * `correction_factor`  |
-| EMPTY       | V = 0, burst active                | FORWARD        | `speed_rpm`              |
-| EMPTY       | V = 0, burst delay elapsed         | FORWARD (burst) | `speed_rpm`             |
-| EMPTY       | V = 0, burst delay pending         | STOP           | --                       |
-| EMPTY       | burst count >= 5                   | **ERROR**      | --                       |
-| MIDDLE      | V > min                            | FORWARD        | V * `velocity_factor`    |
-| MIDDLE      | V = 0                              | STOP           | --                       |
-| FULL_MIDDLE | V > min                            | FORWARD        | V * `slowdown_factor`    |
-| FULL_MIDDLE | V = 0                              | STOP           | --                       |
-| FULL        | V > min, feed time < timeout       | FORWARD        | V * `slowdown_factor`    |
-| FULL        | V = 0, feed time < timeout         | STOP           | --                       |
-| FULL        | feed time >= `full_zone_timeout`   | BACK           | `speed_rpm`              |
-| EMPTY_MIDDLE | held velocity > min                          | FORWARD        | held V * `correction_factor` |
-| EMPTY_MIDDLE | no held velocity                             | FORWARD        | `speed_rpm`              |
-
-The EMPTY_MIDDLE zone (all sensors inactive) always feeds forward. On entry it captures the current extruder velocity and holds it, ignoring subsequent retractions and velocity decay. This ensures the buffer reaches the middle sensor. Retraction following and velocity decay are also suppressed while in this zone.
-
-When not printing and the extruder is retracting, zone evaluation is normally bypassed and the motor follows the retraction directly (`follow_retract`). During printing, retractions zero the velocity instead, allowing the smoothing window to bridge brief gaps. Neither applies in EMPTY_MIDDLE — the motor always feeds forward.
+If a safety zone (EMPTY or FULL) persists for `fault_escalation_time` seconds, the gain increases to `safety_gain * 1.5`. If it persists past the safety timeout, an error is raised (EMPTY) or a forced retract is executed (FULL).
 
 ### State Transitions
 
-| From                               | To             | Trigger                                                              |
-|------------------------------------|----------------|----------------------------------------------------------------------|
-| DISABLED                           | IDLE           | `klippy:ready`                                                       |
-| IDLE                               | STOPPED        | `BUFFER_ENABLE` or filament inserted (triggers initial fill)         |
-| IDLE                               | DISABLED       | `BUFFER_DISABLE`                                                     |
-| STOPPED                            | FEEDING        | Zone evaluation drives motor forward                                 |
-| STOPPED                            | RETRACTING     | Zone evaluation drives motor back                                    |
-| FEEDING                            | STOPPED        | Zone evaluation stops motor                                          |
-| FEEDING                            | RETRACTING     | Zone evaluation drives motor back                                    |
-| RETRACTING                         | STOPPED        | Zone evaluation stops motor                                          |
-| RETRACTING                         | FEEDING        | Zone evaluation drives motor forward                                 |
-| FEEDING (initial fill)             | STOPPED        | Initial fill timeout expires                                         |
-| FEEDING / STOPPED / RETRACTING     | IDLE           | Filament runout                                                      |
-| any (not ERROR)                    | MANUAL_FEED    | `BUFFER_FEED` or feed button press                                   |
-| any (not ERROR)                    | MANUAL_RETRACT | `BUFFER_RETRACT` or retract button press                             |
-| MANUAL_FEED                        | STOPPED/IDLE   | Button release (restores prior auto-enable state)                    |
-| MANUAL_FEED                        | IDLE           | Full sensor sustained for `manual_feed_full_timeout`                 |
-| MANUAL_RETRACT                     | STOPPED/IDLE   | Button release (restores prior auto-enable state)                    |
-| any (not ERROR)                    | STOPPED/IDLE   | Both buttons pressed (toggles auto-enable)                           |
-| any                                | ERROR          | Sensor conflict, forward timeout, or burst exhaustion                |
-| ERROR                              | STOPPED        | `BUFFER_CLEAR_ERROR` (auto-enabled)                                  |
-| ERROR                              | IDLE           | `BUFFER_CLEAR_ERROR` (not auto-enabled)                              |
-| any                                | DISABLED       | `BUFFER_DISABLE` or `klippy:shutdown`                                |
+| From               | To             | Trigger                                          |
+|--------------------|----------------|--------------------------------------------------|
+| DISABLED           | IDLE           | `klippy:ready`                                   |
+| IDLE               | FEEDING        | `BUFFER_ENABLE` or filament inserted              |
+| IDLE               | DISABLED       | `BUFFER_DISABLE`                                 |
+| FEEDING            | IDLE           | Filament runout                                   |
+| any (not ERROR)    | MANUAL_FEED    | `BUFFER_FEED` or feed button press               |
+| any (not ERROR)    | MANUAL_RETRACT | `BUFFER_RETRACT` or retract button press         |
+| MANUAL_*           | STOPPED/IDLE   | Button release                                   |
+| any (not ERROR)    | STOPPED/IDLE   | Both buttons pressed (toggles auto-enable)       |
+| any                | ERROR          | Sensor conflict, forward timeout, safety timeout |
+| ERROR              | STOPPED/IDLE   | `BUFFER_CLEAR_ERROR` or 2s both-button hold      |
+| any                | DISABLED       | `BUFFER_DISABLE` or `klippy:shutdown`            |
 
-**Invariants:**
+### Limitations
 
-- **ERROR** blocks all automatic control and manual feed/retract; only `BUFFER_CLEAR_ERROR` exits it.
-- **MANUAL_FEED / MANUAL_RETRACT** bypass zone evaluation; the motor is driven directly.
-- **Both buttons** toggle auto-enable: IDLE (disabled) <-> STOPPED (enabled).
-- **DISABLED** blocks material-insert auto-enable; only `BUFFER_ENABLE` exits it.
-
-Motor commands are rate-limited through a deferred write system to stay within TMC2208 UART bandwidth on the STM32F072.
+- **Single extruder only.** The buffer syncs to whichever extruder is active at `klippy:ready`. Multi-extruder tool changes are not handled.
 
 ## Tests
 
@@ -153,7 +129,7 @@ Motor commands are rate-limited through a deferred write system to stay within T
 pytest tests/
 ```
 
-The test suite uses pure mock objects with no Klipper dependency. Coverage includes zone transitions, velocity tracking, burst cycles, retraction handling, manual control, error conditions, and deferred drive rate-limiting.
+The test suite uses pure mock objects with no Klipper dependency. Coverage includes rotation_distance feedback, zone classification, dead-band invariant, fault escalation, safety timeouts, manual control, button handling, error conditions, and state transitions.
 
 ## License
 
