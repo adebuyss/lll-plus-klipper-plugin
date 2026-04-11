@@ -106,7 +106,7 @@ class Buffer:
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
-            "manual_feed_full_timeout", 5.0, above=0.0)
+            "manual_feed_full_timeout", 3.0, above=0.0)
         # Sensor pin names
         self.sensor_empty_pin = config.get("sensor_empty_pin")
         self.sensor_middle_pin = config.get("sensor_middle_pin")
@@ -160,6 +160,8 @@ class Buffer:
 
         # Manual move tracking
         self._manual_chunk_dist = 20.0  # mm per button-held chunk
+        self._continuous_feed_direction = STOP
+        self._continuous_feed_speed = 0.0
 
         # Print state tracking
         self._print_stats = None
@@ -528,6 +530,15 @@ class Buffer:
             else:
                 self._manual_feed_full_start = 0.0
             return eventtime + self.control_interval
+        # Manual retract auto-stop on empty sensor
+        if self.state == STATE_MANUAL_RETRACT:
+            if self.sensor_states["empty"]:
+                self._stop_manual()
+                self.state = STATE_IDLE
+                self.auto_enabled = False
+                self.gcode.respond_info(
+                    "Buffer: manual retract stopped - empty sensor")
+            return eventtime + self.control_interval
 
         if not self.auto_enabled:
             return eventtime + self.control_interval
@@ -716,6 +727,48 @@ class Buffer:
         except Exception as e:
             logging.warning("buffer: manual move failed: %s" % e)
 
+    def _start_continuous_feed(self, direction, speed):
+        """Feed/retract continuously via chunked moves until stopped.
+
+        Stopped by: full sensor auto-stop (feed), empty sensor auto-stop
+        (retract), BUFFER_STOP, or button release.
+        """
+        self._cancel_fill()
+        self._unsync()
+        if direction == FORWARD:
+            self.state = STATE_MANUAL_FEED
+        else:
+            self.state = STATE_MANUAL_RETRACT
+        self.motor_direction = direction
+        self._manual_feed_full_start = 0.0
+        self._continuous_feed_direction = direction
+        self._continuous_feed_speed = speed
+        self._do_continuous_chunk(self.reactor.monotonic())
+
+    def _do_continuous_chunk(self, eventtime):
+        """Issue one chunk of a continuous feed, schedule the next."""
+        # Abort if state changed (stop, disable, error, button release)
+        if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
+            return
+        if self.force_move is None:
+            return
+        stepper = self.extruder_stepper.stepper
+        dist = self._manual_chunk_dist
+        if self._continuous_feed_direction == BACK:
+            dist = -dist
+        try:
+            self.force_move.manual_move(
+                stepper, dist, self._continuous_feed_speed,
+                self.manual_accel)
+        except Exception as e:
+            logging.warning("buffer: continuous feed chunk failed: %s" % e)
+            return
+        # Schedule next chunk — reactor processes sensor callbacks between
+        self.reactor.register_callback(self._continuous_chunk_cb)
+
+    def _continuous_chunk_cb(self, eventtime):
+        self._do_continuous_chunk(eventtime)
+
     def _stop_manual(self):
         """Stop any pending manual move state."""
         self.motor_direction = STOP
@@ -845,20 +898,27 @@ class Buffer:
                 "Run BUFFER_CLEAR_ERROR first.")
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
-        dist = gcmd.get_float("DIST", 50.0, above=0.0)
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_FEED
-        self.motor_direction = FORWARD
-        self._manual_feed_full_start = 0.0
-        stepper = self.extruder_stepper.stepper
-        try:
-            self.force_move.manual_move(stepper, dist, speed,
-                                        self.manual_accel)
-        except Exception as e:
-            logging.warning("buffer: BUFFER_FEED failed: %s" % e)
-        gcmd.respond_info("Buffer: feeding %.0fmm at %.1f mm/s" % (dist,
-                                                                     speed))
+        dist = gcmd.get_float("DIST", 0.0, minval=0.0)
+        if dist > 0.0:
+            # Fixed distance feed
+            self._cancel_fill()
+            self._unsync()
+            self.state = STATE_MANUAL_FEED
+            self.motor_direction = FORWARD
+            self._manual_feed_full_start = 0.0
+            stepper = self.extruder_stepper.stepper
+            try:
+                self.force_move.manual_move(stepper, dist, speed,
+                                            self.manual_accel)
+            except Exception as e:
+                logging.warning("buffer: BUFFER_FEED failed: %s" % e)
+            gcmd.respond_info(
+                "Buffer: feeding %.0fmm at %.1f mm/s" % (dist, speed))
+        else:
+            # Continuous feed until full sensor auto-stop
+            self._start_continuous_feed(FORWARD, speed)
+            gcmd.respond_info(
+                "Buffer: feeding at %.1f mm/s until full sensor" % speed)
 
     def cmd_BUFFER_RETRACT(self, gcmd):
         if self.state == STATE_ERROR:
@@ -867,19 +927,27 @@ class Buffer:
                 "Run BUFFER_CLEAR_ERROR first.")
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
-        dist = gcmd.get_float("DIST", 50.0, above=0.0)
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_RETRACT
-        self.motor_direction = BACK
-        stepper = self.extruder_stepper.stepper
-        try:
-            self.force_move.manual_move(stepper, -dist, speed,
-                                        self.manual_accel)
-        except Exception as e:
-            logging.warning("buffer: BUFFER_RETRACT failed: %s" % e)
-        gcmd.respond_info("Buffer: retracting %.0fmm at %.1f mm/s"
-                          % (dist, speed))
+        dist = gcmd.get_float("DIST", 0.0, minval=0.0)
+        if dist > 0.0:
+            # Fixed distance retract
+            self._cancel_fill()
+            self._unsync()
+            self.state = STATE_MANUAL_RETRACT
+            self.motor_direction = BACK
+            stepper = self.extruder_stepper.stepper
+            try:
+                self.force_move.manual_move(stepper, -dist, speed,
+                                            self.manual_accel)
+            except Exception as e:
+                logging.warning("buffer: BUFFER_RETRACT failed: %s" % e)
+            gcmd.respond_info(
+                "Buffer: retracting %.0fmm at %.1f mm/s" % (dist, speed))
+        else:
+            # Continuous retract until empty sensor auto-stop
+            self._start_continuous_feed(BACK, speed)
+            gcmd.respond_info(
+                "Buffer: retracting at %.1f mm/s until empty sensor"
+                % speed)
 
     def cmd_BUFFER_STOP(self, gcmd):
         self._cancel_fill()
