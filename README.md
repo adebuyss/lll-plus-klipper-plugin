@@ -118,12 +118,14 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `fault_escalation_time`| 5.0     | Seconds in a safety zone before gain escalates to 1.5x           |
 | `empty_safety_timeout` | 30.0    | Seconds in EMPTY zone before raising an error                    |
 | `full_safety_timeout`  | 10.0    | Seconds in FULL zone before forced retract                       |
-| `manual_speed`         | 10.0    | Speed (mm/s) for manual feed/retract                             |
+| `manual_speed`         | 15.0    | Speed (mm/s) for manual feed/retract                             |
 | `manual_accel`         | 100.0   | Acceleration (mm/s^2) for manual feed/retract                    |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
 | `manual_feed_full_timeout` | 3.0 | Seconds full sensor must hold before auto-stopping manual feed   |
 | `pause_on_runout`      | True    | Pause print on filament runout or safety timeout                 |
+| `control_interval`     | 0.5     | Reactor timer interval (s) for safety timeout checks             |
+| `debug`                | False   | Enable debug logging of zone transitions and multiplier changes  |
 
 See `sample_config/lll-plus.cfg` for the full annotated reference.
 

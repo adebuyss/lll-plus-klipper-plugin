@@ -97,7 +97,7 @@ class Buffer:
                                                    10.0, above=0.0)
         self.error_clear_hold_time = config.getfloat("error_clear_hold_time",
                                                      2.0, above=0.0)
-        self.manual_speed = config.getfloat("manual_speed", 10.0, above=0.0)
+        self.manual_speed = config.getfloat("manual_speed", 15.0, above=0.0)
         self.manual_accel = config.getfloat("manual_accel", 100.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
         self.debug = config.getboolean("debug", False)

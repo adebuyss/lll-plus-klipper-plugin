@@ -102,6 +102,20 @@ class TestErrorBlocking:
         assert ret == pytest.approx(t + enabled_buf.control_interval)
 
 
+class TestUnsyncClearsSafetyTimer:
+    def test_unsync_clears_safety_timer(self, enabled_buf, reactor):
+        set_sensors(enabled_buf, empty=True)
+        t = 1.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+        assert enabled_buf._safety_zone_start > 0.0
+        assert enabled_buf._synced_to is not None
+
+        enabled_buf._unsync()
+        assert enabled_buf._safety_zone_start == 0.0
+        assert enabled_buf._safety_escalated is False
+
+
 class TestClearError:
     def test_clear_error_returns_to_stopped(self, enabled_buf):
         enabled_buf.state = STATE_ERROR

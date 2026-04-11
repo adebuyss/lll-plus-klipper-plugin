@@ -5,7 +5,7 @@ from conftest import (
     STOP,
     STATE_FEEDING,
     STATE_IDLE,
-    ZONE_MIDDLE,
+    STATE_MANUAL_FEED,
     MockGcmd,
     set_sensors,
 )
@@ -111,3 +111,35 @@ class TestInitialFillClear:
         buttons.callbacks["PE3"](t, 0)
         assert buf.material_present is False
         assert buf.state == STATE_IDLE
+
+    def test_fill_cancelled_by_feed_button(self, buf, buttons, reactor,
+                                            force_move):
+        """Pressing feed button during fill cancels the fill loop."""
+        t = 10.0
+        reactor._monotonic = t
+        buttons.callbacks["PE3"](t, 1)  # insert material, starts fill
+        assert buf._initial_fill_until > 0.0
+
+        # Press feed button — should cancel fill
+        buttons.callbacks["PE4"](t + 0.5, 1)
+        assert buf._initial_fill_until == 0.0
+        assert buf.state == STATE_MANUAL_FEED
+
+        # Pending fill chunk callback should not issue more fill chunks
+        chunks_before = len(force_move.moves)
+        reactor.flush_callbacks()
+        # Only the manual feed chunk, no more fill chunks
+        assert buf._initial_fill_until == 0.0
+
+    def test_fill_cancelled_by_buffer_feed_command(self, buf, buttons,
+                                                    reactor, force_move):
+        """BUFFER_FEED command during fill cancels the fill loop."""
+        t = 10.0
+        reactor._monotonic = t
+        buttons.callbacks["PE3"](t, 1)  # insert material, starts fill
+        assert buf._initial_fill_until > 0.0
+
+        gcmd = MockGcmd("BUFFER_FEED", {"DIST": 50.0})
+        buf.cmd_BUFFER_FEED(gcmd)
+        assert buf._initial_fill_until == 0.0
+        assert buf.state == STATE_MANUAL_FEED
