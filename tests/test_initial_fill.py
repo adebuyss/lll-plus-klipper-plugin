@@ -1,10 +1,11 @@
-"""Tests for initial fill mode on material insertion."""
+"""Tests for chunked initial fill on material insertion."""
 
 from conftest import (
     FORWARD,
     STOP,
-    STATE_STOPPED,
     STATE_FEEDING,
+    STATE_IDLE,
+    ZONE_MIDDLE,
     MockGcmd,
     set_sensors,
 )
@@ -16,18 +17,73 @@ class TestInitialFillActivation:
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
+        # First chunk should have been issued
         assert buf.state == STATE_FEEDING
         assert buf.motor_direction == FORWARD
-        # Should have issued a force_move for the fill
         assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] > 0  # positive distance
+        assert force_move.moves[0][1] > 0  # positive distance
 
-    def test_fill_timeout_stored(self, buf, buttons, reactor):
+    def test_fill_queues_continuation(self, buf, buttons, reactor):
+        """After the first chunk, a reactor callback is queued for the
+        next chunk."""
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
-        # After fill completes, initial_fill_until should be cleared
+        # There should be a pending callback for the next chunk
+        assert len(reactor._pending_callbacks) > 0
+
+
+class TestInitialFillAbortOnMiddle:
+    def test_middle_sensor_stops_fill(self, buf, buttons, reactor,
+                                      force_move):
+        """Fill aborts when the middle sensor triggers between chunks."""
+        t = 10.0
+        reactor._monotonic = t
+        buttons.callbacks["PE3"](t, 1)
+        chunks_before = len(force_move.moves)
+
+        # Simulate middle sensor triggering between chunks
+        set_sensors(buf, middle=True)
+        t += 0.5
+        reactor._monotonic = t
+        # Fire the pending chunk callback
+        reactor.flush_callbacks()
+
+        # No new chunk should have been issued
+        assert len(force_move.moves) == chunks_before
         assert buf._initial_fill_until == 0.0
+        # Should have synced to extruder
+        assert buf._synced_to is not None
+
+    def test_full_sensor_also_stops_fill(self, buf, buttons, reactor,
+                                          force_move):
+        t = 10.0
+        reactor._monotonic = t
+        buttons.callbacks["PE3"](t, 1)
+        chunks_before = len(force_move.moves)
+
+        set_sensors(buf, full=True)
+        t += 0.5
+        reactor._monotonic = t
+        reactor.flush_callbacks()
+
+        assert len(force_move.moves) == chunks_before
+        assert buf._initial_fill_until == 0.0
+
+
+class TestInitialFillTimeout:
+    def test_timeout_stops_fill(self, buf, buttons, reactor, force_move):
+        t = 10.0
+        reactor._monotonic = t
+        buttons.callbacks["PE3"](t, 1)
+
+        # Advance past timeout
+        t += buf.initial_fill_timeout + 1.0
+        reactor._monotonic = t
+        reactor.flush_callbacks()
+
+        assert buf._initial_fill_until == 0.0
+        assert buf.motor_direction == STOP
 
 
 class TestInitialFillClear:
@@ -43,14 +99,15 @@ class TestInitialFillClear:
         buf.cmd_BUFFER_ENABLE(MockGcmd("BUFFER_ENABLE"))
         assert buf._initial_fill_until == 0.0
 
-    def test_material_removal_during_fill(self, buf, buttons, reactor):
+    def test_material_removal_cancels_fill(self, buf, buttons, reactor):
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
+        assert buf._initial_fill_until > 0.0
 
-        # Remove material
+        # Remove material — sets initial_fill_until via _unsync path
         t += 2.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 0)
-        assert buf.motor_direction == STOP
         assert buf.material_present is False
+        assert buf.state == STATE_IDLE

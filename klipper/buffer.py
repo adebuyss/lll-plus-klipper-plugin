@@ -447,25 +447,59 @@ class Buffer:
     # --- Initial fill ---
 
     def _do_initial_fill(self, eventtime):
-        """Start forward feed to fill the buffer tube on filament insert."""
+        """Start chunked forward feed to fill the buffer tube.
+
+        Issues small move chunks via force_move, checking sensor state
+        between each chunk.  The reactor processes sensor callbacks
+        between chunks, so the fill aborts promptly when the middle
+        sensor (or beyond) triggers.
+        """
         if self.force_move is None:
             return
-        stepper = self.extruder_stepper.stepper
-        # Unsync to do an independent forward move
         self._unsync()
         self.state = STATE_FEEDING
         self.motor_direction = FORWARD
-        # Calculate distance from fill timeout and speed
-        dist = self.manual_speed * self.initial_fill_timeout
+        self._do_fill_chunk(eventtime)
+
+    def _do_fill_chunk(self, eventtime):
+        """Issue one fill chunk, then schedule the next via reactor."""
+        # Abort: timeout expired
+        if self._initial_fill_until > 0.0 and eventtime >= self._initial_fill_until:
+            self._initial_fill_until = 0.0
+            self.motor_direction = STOP
+            logging.info("buffer: initial fill timeout")
+            self.gcode.respond_info(
+                "Buffer: initial fill timed out after %.0fs"
+                % self.initial_fill_timeout)
+            self._sync()
+            return
+        # Abort: filament reached middle sensor or beyond
+        zone = self._compute_zone()
+        if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
+            self._initial_fill_until = 0.0
+            logging.info("buffer: initial fill complete (zone=%s)" % zone)
+            self._sync()
+            return
+        # Abort: fill was cancelled (disable, runout, error)
+        if self._initial_fill_until <= 0.0:
+            return
+        # Issue one chunk
         try:
             self.force_move.manual_move(
-                stepper, dist, self.manual_speed, self.manual_accel)
+                self.extruder_stepper.stepper, self._manual_chunk_dist,
+                self.manual_speed, self.manual_accel)
         except Exception as e:
-            logging.warning("buffer: initial fill move failed: %s" % e)
-        # After fill completes or if middle sensor triggered, sync
-        if self._initial_fill_until > 0.0:
+            logging.warning("buffer: fill chunk failed: %s" % e)
             self._initial_fill_until = 0.0
-        self._sync()
+            self._sync()
+            return
+        # Schedule next chunk — reactor will process sensor callbacks
+        # between this return and the next _fill_chunk_cb invocation
+        self.reactor.register_callback(self._fill_chunk_cb)
+
+    def _fill_chunk_cb(self, eventtime):
+        """Reactor callback: continue the fill if still active."""
+        self._do_fill_chunk(eventtime)
 
     # --- Control timer ---
 
