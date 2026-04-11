@@ -33,6 +33,75 @@ The script symlinks `buffer.py` into `~/klipper/klippy/extras/`. Restart Klipper
 sudo systemctl restart klipper
 ```
 
+## Macro Integration
+
+Add `BUFFER_ENABLE` and `BUFFER_DISABLE` to your printer macros so the buffer activates during prints and deactivates for maintenance operations.
+
+### Print start / end
+
+```ini
+[gcode_macro PRINT_START]
+gcode:
+    # ... homing, heating, bed mesh, etc.
+    BUFFER_ENABLE
+    # ... purge line, start printing
+
+[gcode_macro PRINT_END]
+gcode:
+    BUFFER_DISABLE
+    # ... retract, park, cooldown, etc.
+
+[gcode_macro CANCEL_PRINT]
+rename_existing: BASE_CANCEL_PRINT
+gcode:
+    BUFFER_DISABLE
+    BASE_CANCEL_PRINT
+```
+
+### Pause / resume
+
+The buffer automatically pauses the print on filament runout (`pause_on_runout: True`). If you use custom pause/resume macros, disable the buffer on pause and re-enable on resume so it doesn't fight the parked extruder:
+
+```ini
+[gcode_macro PAUSE]
+rename_existing: BASE_PAUSE
+gcode:
+    BUFFER_DISABLE
+    BASE_PAUSE
+
+[gcode_macro RESUME]
+rename_existing: BASE_RESUME
+gcode:
+    BUFFER_ENABLE
+    BASE_RESUME
+```
+
+### Filament change
+
+When the buffer is synced, it follows extruder moves automatically -- `G1 E-50` to retract from the hotend makes the buffer stepper retract in lockstep. No need to disable for normal load/unload. `BUFFER_FEED` / `BUFFER_RETRACT` are for threading filament *through the buffer tube itself* (spool to extruder entrance) when the extruder is not involved:
+
+```ini
+[gcode_macro UNLOAD_FILAMENT]
+gcode:
+    BUFFER_DISABLE
+    G1 E-50 F600              ; retract from hotend (buffer follows)
+    BUFFER_RETRACT DIST=200   ; pull filament back through buffer tube
+
+[gcode_macro LOAD_FILAMENT]
+gcode:
+    BUFFER_FEED DIST=200      ; thread filament through buffer tube
+    G1 E50 F300               ; push into hotend
+    BUFFER_ENABLE
+```
+
+### Notes
+
+- `BUFFER_ENABLE` syncs the buffer stepper to the extruder. Call it after heating and before the first extrusion move.
+- `BUFFER_DISABLE` unsyncs and stops the motor. Always call it before parking, tool changes, or filament operations.
+- `BUFFER_FEED` and `BUFFER_RETRACT` accept `SPEED=` (mm/s) and `DIST=` (mm) parameters for manual moves.
+- The physical feed/retract buttons work independently of these macros and can be used any time (except in error state).
+- Hold both buttons for 2 seconds to clear an error without needing a console.
+
 ## Configuration
 
 Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust pin assignments and serial path for your setup.
