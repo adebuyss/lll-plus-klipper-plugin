@@ -339,6 +339,8 @@ class Buffer:
         self._synced_to = None
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
+        self._safety_zone_start = 0.0
+        self._safety_escalated = False
         if self.debug:
             self.gcode.respond_info("Buffer debug: unsynced")
 
