@@ -8,93 +8,79 @@ digraph buffer_state_machine {
     ranksep=1.0
     compound=true
 
-    // ===== Zone clusters (left-to-right = empty-to-full) =====
+    // ===== Rotation distance feedback zones =====
+    // The buffer stepper is synced to the extruder via shared trapq.
+    // Each zone sets a rotation_distance multiplier:
+    //   rd_new = base_rd / multiplier
 
     subgraph cluster_empty {
-        label="EMPTY" labeljust=c fontsize=11 penwidth=2
-        style="filled,rounded" color="#b6d7a8" fillcolor="#eaf5e6"
+        label="EMPTY\nmult = 1 + safety_gain" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        e_fill  [label=<FORWARD<BR/><FONT POINT-SIZE="8">initial fill @ speed_rpm</FONT>> fillcolor="#d9ead3"]
-        e_fwd   [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × correction</FONT>> fillcolor="#d9ead3"]
-        e_burst [label=<FORWARD<BR/><FONT POINT-SIZE="8">burst @ speed_rpm</FONT>> fillcolor="#d9ead3"]
-        e_stop  [label=<STOP<BR/><FONT POINT-SIZE="8">burst delay</FONT>> fillcolor="#eeeeee"]
+        e_safety  [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 1.05 → deliver MORE</FONT>> fillcolor="#f4cccc"]
+        e_escal   [label=<SYNCED<BR/><FONT POINT-SIZE="8">ESCALATED ×1.5</FONT>> fillcolor="#e06666"]
     }
 
     subgraph cluster_empty_middle {
-        label="EMPTY_MIDDLE" labeljust=c fontsize=11 penwidth=2
-        style="filled,rounded" color="#a4c2f4" fillcolor="#e8f0fe"
+        label="EMPTY_MIDDLE\nmult = 1 + drift_gain" labeljust=c fontsize=11 penwidth=2
+        style="filled,rounded" color="#f9cb9c" fillcolor="#fef3e8"
 
-        em_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">held V × correction</FONT>> fillcolor="#cfe2f3"]
-        em_base [label=<FORWARD<BR/><FONT POINT-SIZE="8">speed_rpm (no held V)</FONT>> fillcolor="#cfe2f3"]
+        em_drift [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 1.02 → slight MORE</FONT>> fillcolor="#fce5cd"]
     }
 
     subgraph cluster_middle {
-        label="MIDDLE" labeljust=c fontsize=11 penwidth=2
+        label="MIDDLE (dead-band)\nmult = 1.00" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#b6d7a8" fillcolor="#eaf5e6"
 
-        m_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × velocity_factor</FONT>> fillcolor="#d9ead3"]
-        m_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
+        m_neutral [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 1.00 → 1:1 follow</FONT>> fillcolor="#d9ead3"]
     }
 
     subgraph cluster_full_middle {
-        label="FULL_MIDDLE" labeljust=c fontsize=11 penwidth=2
+        label="FULL_MIDDLE\nmult = 1 − drift_gain" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#f9cb9c" fillcolor="#fef3e8"
 
-        fm_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × slowdown</FONT>> fillcolor="#fce5cd"]
-        fm_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
+        fm_drift [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 0.98 → slight LESS</FONT>> fillcolor="#fce5cd"]
     }
 
     subgraph cluster_full {
-        label="FULL" labeljust=c fontsize=11 penwidth=2
+        label="FULL\nmult = 1 − safety_gain" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        f_fwd  [label=<FORWARD<BR/><FONT POINT-SIZE="8">V × slowdown</FONT>> fillcolor="#fce5cd"]
-        f_stop [label=<STOP<BR/><FONT POINT-SIZE="8">V = 0</FONT>> fillcolor="#eeeeee"]
-        f_back [label=<BACK<BR/><FONT POINT-SIZE="8">retract @ speed_rpm</FONT>> fillcolor="#f4cccc"]
+        f_safety [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 0.95 → deliver LESS</FONT>> fillcolor="#f4cccc"]
+        f_escal  [label=<SYNCED<BR/><FONT POINT-SIZE="8">ESCALATED ×1.5</FONT>> fillcolor="#e06666"]
+        f_retract [label=<RETRACT<BR/><FONT POINT-SIZE="8">unsync + force_move</FONT>> fillcolor="#cc0000" fontcolor=white]
     }
 
     ERROR [fillcolor="#f4cccc" label="ERROR"]
 
-    // ===== Within-zone transitions (velocity / timing) =====
+    // ===== Within-zone transitions (timing) =====
 
-    e_fill  -> e_fwd   [label="V > 0\nor fill ends"]
-    e_fill  -> e_stop  [label="fill\ntimeout"]
-    e_fwd   -> e_stop  [label="V → 0"]
-    e_stop  -> e_fwd   [label="V > 0"]
-    e_stop  -> e_burst [label="burst delay\nelapsed"]
-    e_burst -> e_stop  [label="burst time\nexpired"]
-    e_stop  -> ERROR   [label="burst\nexhausted" color="#cc0000"]
+    e_safety -> e_escal  [label="fault_escalation\n_time elapsed"]
+    e_escal  -> ERROR    [label="empty_safety\n_timeout" color="#cc0000"]
 
-    // EMPTY_MIDDLE: always forward, no V→0 transitions
-    em_fwd  -> em_base [label="held V\ndecays" style=dotted]
-    em_base -> em_fwd  [label="new extrusion\ncaptures V" style=dotted]
-
-    m_fwd  -> m_stop [label="V → 0"]
-    m_stop -> m_fwd  [label="V > 0"]
-
-    fm_fwd  -> fm_stop [label="V → 0"]
-    fm_stop -> fm_fwd  [label="V > 0"]
-
-    f_fwd  -> f_stop [label="V → 0"]
-    f_stop -> f_fwd  [label="V > 0"]
-    f_fwd  -> f_back [label="feed time >=\nfull_zone_timeout"]
-    f_fwd  -> ERROR  [label="empty+full\nconflict" color="#cc0000"]
+    f_safety -> f_escal  [label="fault_escalation\n_time elapsed"]
+    f_escal  -> f_retract [label="full_safety\n_timeout" color="#cc0000"]
 
     // ===== Cross-zone transitions (sensor changes) =====
 
-    e_fwd  -> em_fwd [label="empty\nclears" style=dashed]
-    e_fwd  -> m_fwd  [label="middle\ntriggers" style=dashed]
+    e_safety -> em_drift  [label="empty\nclears" style=dashed]
+    e_safety -> m_neutral [label="middle\ntriggers" style=dashed]
 
-    em_fwd  -> e_fwd  [label="empty\ntriggers" style=dashed]
-    em_fwd  -> m_fwd  [label="middle\ntriggers" style=dashed]
+    em_drift -> e_safety  [label="empty\ntriggers" style=dashed]
+    em_drift -> m_neutral [label="middle\ntriggers" style=dashed]
 
-    m_fwd  -> em_fwd  [label="middle\nclears" style=dashed]
-    m_fwd  -> fm_fwd  [label="full\ntriggers" style=dashed]
+    m_neutral -> em_drift [label="middle\nclears" style=dashed]
+    m_neutral -> fm_drift [label="full\ntriggers" style=dashed]
 
-    fm_fwd  -> m_fwd  [label="full\nclears" style=dashed]
-    fm_fwd  -> f_fwd  [label="middle\nclears" style=dashed]
+    fm_drift -> m_neutral [label="full\nclears" style=dashed]
+    fm_drift -> f_safety  [label="middle\nclears" style=dashed]
 
-    f_back -> fm_fwd  [label="middle\ntriggers" style=dashed]
-    f_back -> m_fwd   [label="full clears +\nmiddle triggers" style=dashed]
-    f_back -> em_fwd  [label="full\nclears" style=dashed]
+    f_safety -> fm_drift  [label="middle\ntriggers" style=dashed]
+    f_safety -> m_neutral [label="full clears +\nmiddle triggers" style=dashed]
+
+    f_retract -> m_neutral [label="re-sync after\nretract" style=dashed]
+
+    // ===== Sensor conflict =====
+
+    e_safety -> ERROR [label="empty+full\nconflict" color="#cc0000" style=bold]
 }
