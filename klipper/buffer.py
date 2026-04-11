@@ -65,6 +65,7 @@ _DEPRECATED_PARAMS = [
     ("full_zone_timeout", 3.0, "above", 0.0),
     ("full_zone_retract_length", 0.0, "minval", 0.0),
     ("min_extrusion_velocity", 0.05, "minval", 0.0),
+    ("forward_timeout", 60.0, "minval", 0.0),
 ]
 
 
@@ -106,9 +107,6 @@ class Buffer:
                                                     10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
             "manual_feed_full_timeout", 5.0, above=0.0)
-        self.forward_timeout = config.getfloat("forward_timeout", 60.0,
-                                               minval=0.0)
-
         # Sensor pin names
         self.sensor_empty_pin = config.get("sensor_empty_pin")
         self.sensor_middle_pin = config.get("sensor_middle_pin")
@@ -280,19 +278,25 @@ class Buffer:
                 self._update_rotation_distance(eventtime)
         return callback
 
+    def _cancel_fill(self):
+        """Cancel any in-progress initial fill loop."""
+        self._initial_fill_until = 0.0
+
     def _material_callback(self, eventtime, state):
         was_present = self.material_present
         self.material_present = bool(state)
         if not self.material_present and self.auto_enabled:
+            self._cancel_fill()
             self._unsync()
             self.state = STATE_IDLE
             if self.pause_on_runout:
                 self._trigger_pause("buffer: filament runout detected")
         elif self.material_present and not was_present:
-            if self.state == STATE_DISABLED:
+            if self.state in (STATE_DISABLED, STATE_ERROR):
                 logging.info(
-                    "buffer: filament detected but buffer is disabled; "
-                    "use BUFFER_ENABLE to activate")
+                    "buffer: filament detected but buffer is %s; "
+                    "use BUFFER_ENABLE or BUFFER_CLEAR_ERROR"
+                    % self.state)
                 return
             self.auto_enabled = True
             self.state = STATE_STOPPED
@@ -526,7 +530,7 @@ class Buffer:
         if not self.auto_enabled:
             return eventtime + self.control_interval
 
-        if self.state in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
+        if self.state in (STATE_MANUAL_RETRACT,
                           STATE_ERROR, STATE_DISABLED):
             return eventtime + self.control_interval
 
@@ -550,7 +554,13 @@ class Buffer:
         return eventtime + self.control_interval
 
     def _do_safety_retract(self, eventtime):
-        """Forced retract when full zone times out."""
+        """Forced retract when full zone times out.
+
+        Unsyncs, issues a retract via force_move, then leaves the
+        stepper unsynced.  The next control timer cycle will re-sync
+        via _update_rotation_distance once the retract has completed
+        and print_time has advanced past the move.
+        """
         logging.info("buffer: full zone safety retract")
         self.gcode.respond_info(
             "Buffer: full zone timeout - retracting")
@@ -566,7 +576,9 @@ class Buffer:
             logging.warning("buffer: safety retract failed: %s" % e)
         self._safety_zone_start = 0.0
         self._safety_escalated = False
-        self._sync()
+        # Do NOT re-sync here — the retract move is still in the MCU's
+        # step buffer.  The next control timer cycle will re-sync via
+        # _update_rotation_distance -> _sync() once the move completes.
 
     # --- Button callbacks ---
 
@@ -663,6 +675,7 @@ class Buffer:
 
     def _start_manual_feed(self, eventtime):
         """Begin manual forward feed (button or command)."""
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_MANUAL_FEED
         self.motor_direction = FORWARD
@@ -671,6 +684,7 @@ class Buffer:
 
     def _start_manual_retract(self, eventtime):
         """Begin manual retract (button or command)."""
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_MANUAL_RETRACT
         self.motor_direction = BACK
@@ -698,6 +712,7 @@ class Buffer:
     # --- Error handling ---
 
     def _handle_error(self, msg):
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_ERROR
         self.error_msg = msg
@@ -806,6 +821,7 @@ class Buffer:
 
     def cmd_BUFFER_DISABLE(self, gcmd):
         self.auto_enabled = False
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_DISABLED
         gcmd.respond_info("Buffer: automatic control disabled")
@@ -818,6 +834,7 @@ class Buffer:
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
         dist = gcmd.get_float("DIST", 50.0, above=0.0)
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_MANUAL_FEED
         self.motor_direction = FORWARD
@@ -839,6 +856,7 @@ class Buffer:
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
         dist = gcmd.get_float("DIST", 50.0, above=0.0)
+        self._cancel_fill()
         self._unsync()
         self.state = STATE_MANUAL_RETRACT
         self.motor_direction = BACK
@@ -852,8 +870,8 @@ class Buffer:
                           % (dist, speed))
 
     def cmd_BUFFER_STOP(self, gcmd):
+        self._cancel_fill()
         self._stop_manual()
-        self._manual_feed_full_start = 0.0
         if self.auto_enabled:
             self.state = STATE_STOPPED
             self._sync()
