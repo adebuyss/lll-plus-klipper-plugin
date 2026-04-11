@@ -149,8 +149,6 @@ class Buffer:
         # Safety timeout tracking
         self._safety_zone_start = 0.0  # when we entered EMPTY or FULL
         self._safety_escalated = False
-        self._forward_start_time = 0.0
-        self._forward_elapsed = 0.0
 
         # Initial fill
         self._initial_fill_until = 0.0
@@ -163,7 +161,6 @@ class Buffer:
         self._error_clear_timer = None
 
         # Manual move tracking
-        self._manual_move_timer = None
         self._manual_chunk_dist = 20.0  # mm per button-held chunk
 
         # Print state tracking
@@ -220,6 +217,13 @@ class Buffer:
         self._base_rd = (
             self.extruder_stepper.stepper.get_rotation_distance()[0])
         self._rd_multiplier = 1.0
+        # Undo the auto-sync that [extruder_stepper]'s handle_connect
+        # performed at klippy:connect.  The buffer stepper should not
+        # follow the extruder until the user enables the buffer.
+        try:
+            self.extruder_stepper.sync_to_extruder(None)
+        except Exception:
+            pass
         # Transition to IDLE
         self.state = STATE_IDLE
         # Look up print_stats
@@ -314,7 +318,6 @@ class Buffer:
             if self.state == STATE_STOPPED:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
-                self._forward_start_time = self.reactor.monotonic()
             if self.debug:
                 self.gcode.respond_info(
                     "Buffer debug: synced to %s" % extruder_name)
@@ -425,16 +428,18 @@ class Buffer:
         # Compute and apply multiplier
         multiplier = self._zone_to_multiplier(zone)
 
-        # Fault escalation: if in safety zone too long, increase gain
-        if (self._safety_zone_start > 0.0
-                and not self._safety_escalated
-                and eventtime - self._safety_zone_start
-                >= self.fault_escalation_time):
-            self._safety_escalated = True
-            if multiplier > 1.0:
-                multiplier = 1.0 + self.safety_gain * 1.5
-            elif multiplier < 1.0:
-                multiplier = 1.0 - self.safety_gain * 1.5
+        # Fault escalation: if in safety zone too long, increase gain.
+        # Once escalated, the higher gain persists until the zone clears.
+        if self._safety_zone_start > 0.0:
+            if (not self._safety_escalated
+                    and eventtime - self._safety_zone_start
+                    >= self.fault_escalation_time):
+                self._safety_escalated = True
+            if self._safety_escalated:
+                if multiplier > 1.0:
+                    multiplier = 1.0 + self.safety_gain * 1.5
+                elif multiplier < 1.0:
+                    multiplier = 1.0 - self.safety_gain * 1.5
 
         if self._synced_to is not None:
             self._apply_multiplier(multiplier)
@@ -490,16 +495,6 @@ class Buffer:
         if self.state in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
                           STATE_ERROR, STATE_DISABLED):
             return eventtime + self.control_interval
-
-        # Forward timeout
-        if (self.state == STATE_FEEDING and self.forward_timeout > 0.0
-                and self._forward_start_time > 0.0):
-            self._forward_elapsed = eventtime - self._forward_start_time
-            if self._forward_elapsed > self.forward_timeout:
-                self._handle_error(
-                    "Continuous forward motion exceeded %.0fs timeout"
-                    % self.forward_timeout)
-                return eventtime + self.control_interval
 
         # Safety timeout check
         zone = self._compute_zone()
@@ -682,7 +677,6 @@ class Buffer:
         """Clear error state."""
         self.state = STATE_STOPPED if self.auto_enabled else STATE_IDLE
         self.error_msg = ""
-        self._forward_elapsed = 0.0
         self._safety_zone_start = 0.0
         self._safety_escalated = False
         if self.auto_enabled:
@@ -714,8 +708,6 @@ class Buffer:
             "rd_multiplier": round(self._rd_multiplier, 4),
             "base_rotation_distance": round(self._base_rd, 4),
             "synced_to": self._synced_to,
-            "forward_elapsed": round(self._forward_elapsed, 1),
-            "forward_timeout": self.forward_timeout,
             "manual_speed": self.manual_speed,
             "drift_gain": self.drift_gain,
             "safety_gain": self.safety_gain,
@@ -744,7 +736,6 @@ class Buffer:
             "  RD multiplier: %.4f (base: %.4f)\n"
             "  Synced to: %s\n"
             "  Manual speed: %.1f mm/s\n"
-            "  Forward elapsed: %.1f / %.0f s\n"
             "  Drift gain: %.3f  Safety gain: %.3f\n"
             "  Printing: %s"
             % (
@@ -761,8 +752,6 @@ class Buffer:
                 status["base_rotation_distance"],
                 status["synced_to"] or "none",
                 status["manual_speed"],
-                status["forward_elapsed"],
-                status["forward_timeout"],
                 status["drift_gain"],
                 status["safety_gain"],
                 status["is_printing"],
@@ -776,7 +765,6 @@ class Buffer:
         self.auto_enabled = True
         self.state = STATE_STOPPED
         self.error_msg = ""
-        self._forward_elapsed = 0.0
         self._safety_zone_start = 0.0
         self._safety_escalated = False
         self._sync()

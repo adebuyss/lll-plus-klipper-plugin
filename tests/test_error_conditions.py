@@ -1,4 +1,4 @@
-"""Tests for error conditions: timeouts, sensor conflicts, safety zones."""
+"""Tests for error conditions: safety timeouts, sensor conflicts."""
 
 import pytest
 from conftest import (
@@ -7,35 +7,6 @@ from conftest import (
     STATE_STOPPED,
     set_sensors,
 )
-
-
-class TestForwardTimeout:
-    def test_timeout_triggers_error(self, enabled_buf, reactor):
-        enabled_buf.state = STATE_FEEDING
-        enabled_buf._forward_start_time = 1.0
-        t = 1.0 + enabled_buf.forward_timeout + 1.0
-        reactor._monotonic = t
-        enabled_buf._control_timer_cb(t)
-        assert enabled_buf.state == STATE_ERROR
-        assert "timeout" in enabled_buf.error_msg.lower()
-
-    def test_timeout_triggers_pause(self, enabled_buf, reactor, gcode):
-        enabled_buf.pause_on_runout = True
-        enabled_buf.state = STATE_FEEDING
-        enabled_buf._forward_start_time = 1.0
-        t = 1.0 + enabled_buf.forward_timeout + 1.0
-        reactor._monotonic = t
-        enabled_buf._control_timer_cb(t)
-        assert "PAUSE" in gcode.scripts_run
-
-    def test_no_timeout_when_disabled(self, enabled_buf, reactor):
-        enabled_buf.forward_timeout = 0.0
-        enabled_buf.state = STATE_FEEDING
-        enabled_buf._forward_start_time = 1.0
-        t = 100.0
-        reactor._monotonic = t
-        enabled_buf._control_timer_cb(t)
-        assert enabled_buf.state == STATE_FEEDING
 
 
 class TestEmptySafetyTimeout:

@@ -137,6 +137,27 @@ class TestFaultEscalation:
         assert enabled_buf._rd_multiplier == pytest.approx(escalated_mult)
         assert enabled_buf._safety_escalated is True
 
+    def test_escalation_persists_on_subsequent_calls(self, enabled_buf, reactor):
+        """Escalated multiplier must persist, not revert to base gain."""
+        set_sensors(enabled_buf, empty=True)
+        t = 1.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+
+        # Escalate
+        t += enabled_buf.fault_escalation_time + 0.1
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+        escalated_mult = enabled_buf._rd_multiplier
+        assert enabled_buf._safety_escalated is True
+
+        # Call again — escalated multiplier must persist
+        t += 1.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+        assert enabled_buf._rd_multiplier == pytest.approx(escalated_mult)
+        assert enabled_buf._safety_escalated is True
+
     def test_returning_to_middle_resets_escalation(self, enabled_buf, reactor):
         set_sensors(enabled_buf, empty=True)
         enabled_buf._update_rotation_distance(1.0)
