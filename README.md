@@ -84,8 +84,9 @@ When the buffer is synced, it follows extruder moves automatically -- `G1 E-50` 
 [gcode_macro UNLOAD_FILAMENT]
 gcode:
     BUFFER_DISABLE
-    G1 E-50 F600              ; retract from hotend (buffer follows)
-    BUFFER_RETRACT             ; pull filament back until empty sensor
+    G1 E-50 F600              ; retract from hotend
+    BUFFER_RETRACT ; retracts until buffer enters the empty state
+ #   BUFFER_RETRACT_UNTIL_CLEAR ; optionally, retract until filament leaves the tube
 
 [gcode_macro LOAD_FILAMENT]
 gcode:
@@ -135,6 +136,7 @@ See `sample_config/lll-plus.cfg` for the full annotated reference.
 | `BUFFER_DISABLE`                     | Unsync and disable automatic control                         |
 | `BUFFER_FEED [SPEED=<mm/s>] [DIST=<mm>]` | Forward feed. No DIST = feed until full sensor stops it |
 | `BUFFER_RETRACT [SPEED=<mm/s>] [DIST=<mm>]` | Retract. No DIST = retract until empty sensor stops it |
+| `BUFFER_RETRACT_UNTIL_CLEAR [SPEED=<mm/s>]` | Retract until filament presence switch clears          |
 | `BUFFER_STOP`                        | Stop any manual move, re-sync if auto-enabled                |
 | `BUFFER_SET_SPEED SPEED=<mm/s>`      | Set manual feed/retract speed                                |
 | `BUFFER_CLEAR_ERROR`                 | Clear error state (also via 2s both-button hold)             |

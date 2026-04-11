@@ -162,6 +162,7 @@ class Buffer:
         self._manual_chunk_dist = 20.0  # mm per button-held chunk
         self._continuous_feed_direction = STOP
         self._continuous_feed_speed = 0.0
+        self._retract_until_clear = False
 
         # Print state tracking
         self._print_stats = None
@@ -191,6 +192,10 @@ class Buffer:
         self.gcode.register_command(
             "BUFFER_RETRACT", self.cmd_BUFFER_RETRACT,
             desc="Manually retract filament")
+        self.gcode.register_command(
+            "BUFFER_RETRACT_UNTIL_CLEAR",
+            self.cmd_BUFFER_RETRACT_UNTIL_CLEAR,
+            desc="Retract until filament presence switch clears")
         self.gcode.register_command(
             "BUFFER_STOP", self.cmd_BUFFER_STOP,
             desc="Stop motor and return to auto mode")
@@ -949,8 +954,62 @@ class Buffer:
                 "Buffer: retracting at %.1f mm/s until empty sensor"
                 % speed)
 
+    def cmd_BUFFER_RETRACT_UNTIL_CLEAR(self, gcmd):
+        """Retract continuously until the filament presence switch clears."""
+        if self.state == STATE_ERROR:
+            gcmd.respond_info(
+                "Buffer: cannot retract while in error state. "
+                "Run BUFFER_CLEAR_ERROR first.")
+            return
+        speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
+        self._cancel_fill()
+        self._unsync()
+        self.state = STATE_MANUAL_RETRACT
+        self.motor_direction = BACK
+        self._continuous_feed_direction = BACK
+        self._continuous_feed_speed = speed
+        self._retract_until_clear = True
+        self._do_retract_until_clear_chunk(self.reactor.monotonic())
+        gcmd.respond_info(
+            "Buffer: retracting at %.1f mm/s until filament clears" % speed)
+
+    def _do_retract_until_clear_chunk(self, eventtime):
+        """Issue one retract chunk, check material switch, schedule next."""
+        if not self._retract_until_clear:
+            return
+        if self.state != STATE_MANUAL_RETRACT:
+            self._retract_until_clear = False
+            return
+        if not self.material_present:
+            # Filament has cleared the switch
+            self._retract_until_clear = False
+            self._stop_manual()
+            self.state = STATE_IDLE
+            self.auto_enabled = False
+            self.gcode.respond_info(
+                "Buffer: retract complete - filament cleared")
+            return
+        if self.force_move is None:
+            self._retract_until_clear = False
+            return
+        stepper = self.extruder_stepper.stepper
+        try:
+            self.force_move.manual_move(
+                stepper, -self._manual_chunk_dist,
+                self._continuous_feed_speed, self.manual_accel)
+        except Exception as e:
+            logging.warning(
+                "buffer: retract_until_clear chunk failed: %s" % e)
+            self._retract_until_clear = False
+            return
+        self.reactor.register_callback(self._retract_until_clear_cb)
+
+    def _retract_until_clear_cb(self, eventtime):
+        self._do_retract_until_clear_chunk(eventtime)
+
     def cmd_BUFFER_STOP(self, gcmd):
         self._cancel_fill()
+        self._retract_until_clear = False
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED
