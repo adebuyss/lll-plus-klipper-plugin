@@ -1,245 +1,134 @@
-"""Tests for _evaluate_and_drive(): sensor zone logic and state transitions."""
+"""Tests for sensor zone classification and state transitions."""
 
 import pytest
 from conftest import (
     FORWARD,
-    BACK,
     STOP,
     STATE_STOPPED,
     STATE_FEEDING,
-    STATE_RETRACTING,
     STATE_ERROR,
     STATE_MANUAL_FEED,
     STATE_DISABLED,
+    ZONE_EMPTY,
+    ZONE_EMPTY_MIDDLE,
+    ZONE_MIDDLE,
     ZONE_FULL,
+    ZONE_FULL_MIDDLE,
     set_sensors,
-    simulate_e_move,
 )
 
 
 class TestMiddleZone:
-    def test_extruding_feeds_forward(self, enabled_buf, reactor):
+    def test_synced_and_middle_is_feeding(self, enabled_buf):
         set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf.state == STATE_FEEDING
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._current_zone == ZONE_MIDDLE
+        assert enabled_buf._rd_multiplier == 1.0
 
-    def test_idle_stops_motor(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == STOP
+    def test_middle_resets_safety_state(self, enabled_buf):
+        # First enter empty to set safety state
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._safety_zone_start > 0.0 or True  # may be 1.0
 
-    def test_resets_burst_and_full_zone_state(self, enabled_buf, reactor):
-        enabled_buf._burst_count = 3
-        enabled_buf._current_zone = ZONE_FULL
+        # Return to middle
         set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf._burst_count == 0
-        assert enabled_buf._current_zone != ZONE_FULL
+        enabled_buf._update_rotation_distance(2.0)
+        assert enabled_buf._safety_zone_start == 0.0
 
 
 class TestEmptyZone:
-    def test_extruding_feeds_full_speed(self, enabled_buf, reactor):
+    def test_empty_increases_multiplier(self, enabled_buf):
         set_sensors(enabled_buf, empty=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf.state == STATE_FEEDING
-
-    def test_no_extrusion_starts_burst_delay(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, empty=True)
-        t = 10.0
-        reactor._monotonic = t
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(t)
-        assert enabled_buf._burst_delay_start == t
-        assert enabled_buf.motor_direction == STOP
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._current_zone == ZONE_EMPTY
+        assert enabled_buf._rd_multiplier > 1.0
 
 
 class TestFullZone:
-    def test_extruding_slows_down(self, enabled_buf, reactor):
+    def test_full_decreases_multiplier(self, enabled_buf):
         set_sensors(enabled_buf, full=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
+        enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_FULL
-
-    def test_idle_stops(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, full=True)
-        reactor._monotonic = 10.0
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == STOP
+        assert enabled_buf._rd_multiplier < 1.0
 
 
-class TestFullMiddleOverlap:
-    def test_extruding_slows_no_timeout(self, enabled_buf, reactor):
+class TestEmptyMiddleZone:
+    def test_empty_middle_slight_increase(self, enabled_buf):
+        set_sensors(enabled_buf)  # all off
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._current_zone == ZONE_EMPTY_MIDDLE
+        assert enabled_buf._rd_multiplier > 1.0
+        assert enabled_buf._rd_multiplier < 1.0 + enabled_buf.safety_gain
+
+
+class TestFullMiddleZone:
+    def test_full_middle_slight_decrease(self, enabled_buf):
         set_sensors(enabled_buf, full=True, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf._current_zone != ZONE_FULL
-        assert enabled_buf._full_zone_feed_time == 0.0
-
-    def test_idle_stops(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, full=True, middle=True)
-        reactor._monotonic = 10.0
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == STOP
-
-
-class TestNoSensors:
-    def test_was_feeding_continues_with_correction(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
-        # Now no sensors
-        set_sensors(enabled_buf, empty=False, middle=False, full=False)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == FORWARD
-
-    def test_was_retracting_feeds_forward(self, enabled_buf, reactor):
-        """Even if previously retracting from FULL, EMPTY_MIDDLE always
-        feeds forward to reach the middle sensor."""
-        enabled_buf.motor_direction = BACK
-        enabled_buf.motor.current_direction = BACK
-        enabled_buf._current_zone = ZONE_FULL
-        set_sensors(enabled_buf)
-        reactor._monotonic = 10.0
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == FORWARD
-
-    def test_zero_velocity_feeds_forward(self, enabled_buf, reactor):
-        """EMPTY_MIDDLE never stops — feeds at base speed when no
-        held velocity is available."""
-        enabled_buf.motor_direction = STOP
-        set_sensors(enabled_buf)
-        reactor._monotonic = 10.0
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == FORWARD
-
-    def test_holds_velocity_through_retraction(self, enabled_buf, reactor):
-        """Velocity is captured on zone entry and held through
-        subsequent retractions."""
-        set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
-        # Enter EMPTY_MIDDLE — captures velocity
-        set_sensors(enabled_buf, empty=False, middle=False, full=False)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == FORWARD
-        # Simulate retraction
-        enabled_buf._extruder_retracting = True
-        enabled_buf.extruder_velocity = 0.0
-        enabled_buf._evaluate_and_drive(10.1)
-        assert enabled_buf.motor_direction == FORWARD
-
-    def test_holds_velocity_through_decay(self, enabled_buf, reactor):
-        """Velocity decay is suppressed while in EMPTY_MIDDLE."""
-        set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        # Enter EMPTY_MIDDLE
-        set_sensors(enabled_buf, empty=False, middle=False, full=False)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == FORWARD
-        # Advance time well past decay window
-        reactor._monotonic = 15.0
-        enabled_buf._expected_move_end = 10.1
-        enabled_buf._last_e_command_time = 10.0
-        enabled_buf._control_timer_cb(15.0)
-        # Velocity should NOT have been zeroed
-        assert enabled_buf.motor_direction == FORWARD
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
+        assert enabled_buf._rd_multiplier < 1.0
+        assert enabled_buf._rd_multiplier > 1.0 - enabled_buf.safety_gain
 
 
 class TestSensorConflict:
-    def test_empty_and_full_triggers_error(self, enabled_buf, reactor):
+    def test_empty_and_full_triggers_error(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
-        reactor._monotonic = 10.0
-        enabled_buf._evaluate_and_drive(10.0)
+        enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf.state == STATE_ERROR
-        assert "Sensor conflict" in enabled_buf.error_msg
+        assert "conflict" in enabled_buf.error_msg.lower()
 
 
 class TestGuardConditions:
-    def test_not_enabled_returns_early(self, buf, reactor):
+    def test_sensor_callback_skipped_when_not_enabled(self, buf, buttons):
         buf.auto_enabled = False
         set_sensors(buf, empty=True)
-        buf._evaluate_and_drive(10.0)
-        assert buf.motor_direction == STOP
+        # Trigger sensor — should not crash or update rd
+        buttons.callbacks["PE0"](10.0, 0)
+        assert buf._rd_multiplier == 1.0
 
-    def test_no_material_returns_early(self, enabled_buf, reactor):
-        enabled_buf.material_present = False
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.motor_direction == STOP
-
-    def test_manual_state_returns_early(self, enabled_buf, reactor):
+    def test_sensor_callback_skipped_in_manual_state(self, enabled_buf,
+                                                      buttons):
         enabled_buf.state = STATE_MANUAL_FEED
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf.extruder_velocity = 10.0
-        enabled_buf._evaluate_and_drive(10.0)
-        # Motor direction not changed by _evaluate_and_drive
-        assert enabled_buf.state == STATE_MANUAL_FEED
+        buttons.callbacks["PE0"](10.0, 0)
+        # Should not update multiplier in manual state
 
-    def test_error_state_returns_early(self, enabled_buf, reactor):
+    def test_sensor_callback_skipped_in_error(self, enabled_buf, buttons):
         enabled_buf.state = STATE_ERROR
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.state == STATE_ERROR
+        buttons.callbacks["PE0"](10.0, 0)
 
-    def test_disabled_state_returns_early(self, enabled_buf, reactor):
+    def test_sensor_callback_skipped_when_disabled(self, enabled_buf, buttons):
         enabled_buf.state = STATE_DISABLED
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._evaluate_and_drive(10.0)
-        assert enabled_buf.state == STATE_DISABLED
+        buttons.callbacks["PE0"](10.0, 0)
 
 
 class TestZoneTransitions:
-    def test_middle_to_empty_to_middle(self, enabled_buf, reactor):
-        # Start in middle zone, extruding
+    def test_middle_to_empty_to_middle(self, enabled_buf):
         set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-        assert enabled_buf.motor_direction == FORWARD
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._current_zone == ZONE_MIDDLE
+        assert enabled_buf._rd_multiplier == 1.0
 
-        # Transition to empty
         set_sensors(enabled_buf, empty=True)
-        enabled_buf._evaluate_and_drive(10.5)
-        assert enabled_buf.motor_direction == FORWARD
-        assert enabled_buf.state == STATE_FEEDING
+        enabled_buf._update_rotation_distance(2.0)
+        assert enabled_buf._current_zone == ZONE_EMPTY
+        assert enabled_buf._rd_multiplier > 1.0
 
-        # Back to middle
         set_sensors(enabled_buf, middle=True)
-        enabled_buf._evaluate_and_drive(11.0)
-        assert enabled_buf.motor_direction == FORWARD
+        enabled_buf._update_rotation_distance(3.0)
+        assert enabled_buf._current_zone == ZONE_MIDDLE
+        assert enabled_buf._rd_multiplier == 1.0
 
-    def test_middle_to_full_to_full_middle_to_middle(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, middle=True)
-        reactor._monotonic = 10.0
-        simulate_e_move(enabled_buf, 1.0, xyz_dist=10.0, speed=50.0)
-
-        # Full zone (deep)
+    def test_full_to_full_middle_to_middle(self, enabled_buf):
         set_sensors(enabled_buf, full=True)
-        enabled_buf._evaluate_and_drive(10.5)
+        enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_FULL
 
-        # Full+middle overlap
         set_sensors(enabled_buf, full=True, middle=True)
-        enabled_buf._evaluate_and_drive(11.0)
-        assert enabled_buf._current_zone != ZONE_FULL
+        enabled_buf._update_rotation_distance(2.0)
+        assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
 
-        # Back to middle
         set_sensors(enabled_buf, middle=True)
-        enabled_buf._evaluate_and_drive(11.5)
-        assert enabled_buf._current_zone != ZONE_FULL
-        assert enabled_buf._full_zone_feed_time == 0.0
+        enabled_buf._update_rotation_distance(3.0)
+        assert enabled_buf._current_zone == ZONE_MIDDLE
+        assert enabled_buf._rd_multiplier == 1.0

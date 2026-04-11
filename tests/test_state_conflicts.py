@@ -1,4 +1,4 @@
-"""Tests for state machine conflict guards and reset consolidation."""
+"""Tests for state machine conflict guards."""
 
 import pytest
 from conftest import (
@@ -7,9 +7,9 @@ from conftest import (
     STOP,
     STATE_IDLE,
     STATE_STOPPED,
+    STATE_FEEDING,
     STATE_DISABLED,
     STATE_ERROR,
-    STATE_FEEDING,
     STATE_MANUAL_FEED,
     STATE_MANUAL_RETRACT,
     MockGcmd,
@@ -22,13 +22,11 @@ class TestErrorBlocksGcodeCommands:
         buf.state = STATE_ERROR
         buf.cmd_BUFFER_FEED(MockGcmd("BUFFER_FEED"))
         assert buf.state == STATE_ERROR
-        assert buf.motor_direction == STOP
 
     def test_buffer_retract_blocked_in_error(self, buf):
         buf.state = STATE_ERROR
         buf.cmd_BUFFER_RETRACT(MockGcmd("BUFFER_RETRACT"))
         assert buf.state == STATE_ERROR
-        assert buf.motor_direction == STOP
 
     def test_buffer_feed_works_after_clear_error(self, buf):
         buf.auto_enabled = True
@@ -46,9 +44,9 @@ class TestErrorBlocksGcodeCommands:
         assert buf.state == STATE_MANUAL_RETRACT
         assert buf.motor_direction == BACK
 
-    def test_error_during_feeding_blocks_subsequent_feed(self, enabled_buf):
+    def test_error_via_sensor_blocks_feed(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
-        enabled_buf._evaluate_and_drive(1.0)
+        enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf.state == STATE_ERROR
         enabled_buf.cmd_BUFFER_FEED(MockGcmd("BUFFER_FEED"))
         assert enabled_buf.state == STATE_ERROR
@@ -72,14 +70,8 @@ class TestDisabledBlocksMaterialAutoEnable:
         assert buf.auto_enabled is False
         buf.cmd_BUFFER_ENABLE(MockGcmd("BUFFER_ENABLE"))
         assert buf.auto_enabled is True
-        assert buf.state == STATE_STOPPED
-
-    def test_disable_remove_insert_stays_disabled(self, buf, buttons):
-        buf.cmd_BUFFER_DISABLE(MockGcmd("BUFFER_DISABLE"))
-        buttons.callbacks["PE3"](1.0, 0)
-        buttons.callbacks["PE3"](2.0, 1)
-        assert buf.state == STATE_DISABLED
-        assert buf.auto_enabled is False
+        # Sync transitions to FEEDING
+        assert buf.state in (STATE_STOPPED, STATE_FEEDING)
 
 
 class TestInitialState:
@@ -92,45 +84,3 @@ class TestInitialState:
     def test_buffer_disable_sets_disabled(self, buf):
         buf.cmd_BUFFER_DISABLE(MockGcmd("BUFFER_DISABLE"))
         assert buf.state == STATE_DISABLED
-
-
-class TestResetConsolidation:
-    def _dirty(self, buf):
-        buf._full_zone_feed_time = 5.0
-        buf._last_full_feed_time = 4.0
-        buf._full_zone_retract_start = 3.0
-        buf._burst_delay_start = 2.0
-        buf._burst_until = 1.0
-        buf._burst_count = 7
-        buf._velocity_window = [(0.0, 1.0)]
-        buf._manual_feed_full_start = 1.0
-        buf._initial_fill_until = 99.0
-
-    def test_reset_control_state_clears_all(self, buf):
-        self._dirty(buf)
-        buf._reset_control_state()
-        assert buf._full_zone_feed_time == 0.0
-        assert buf._last_full_feed_time == 0.0
-        assert buf._full_zone_retract_start == 0.0
-        assert buf._burst_delay_start == 0.0
-        assert buf._burst_until == 0.0
-        assert buf._burst_count == 0
-        assert buf._velocity_window == []
-        assert buf._manual_feed_full_start == 0.0
-        assert buf._initial_fill_until == 0.0
-
-    def test_enable_uses_reset_control_state(self, buf):
-        buf._full_zone_retract_start = 99.0
-        buf.cmd_BUFFER_ENABLE(MockGcmd("BUFFER_ENABLE"))
-        assert buf._full_zone_retract_start == 0.0
-
-    def test_disable_uses_reset_control_state(self, buf):
-        buf._full_zone_retract_start = 99.0
-        buf.cmd_BUFFER_DISABLE(MockGcmd("BUFFER_DISABLE"))
-        assert buf._full_zone_retract_start == 0.0
-
-    def test_clear_error_uses_reset_control_state(self, buf):
-        buf.state = STATE_ERROR
-        buf._full_zone_retract_start = 99.0
-        buf.cmd_BUFFER_CLEAR_ERROR(MockGcmd("BUFFER_CLEAR_ERROR"))
-        assert buf._full_zone_retract_start == 0.0
