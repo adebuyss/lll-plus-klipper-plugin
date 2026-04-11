@@ -114,12 +114,16 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | Parameter              | Default | Description                                                      |
 |------------------------|---------|------------------------------------------------------------------|
 | `drift_gain`           | 0.02    | Multiplier offset in EMPTY_MIDDLE / FULL_MIDDLE zones            |
-| `safety_gain`          | 0.05    | Multiplier offset in EMPTY / FULL safety zones                   |
-| `fault_escalation_time`| 5.0     | Seconds in a safety zone before gain escalates to 1.5x           |
+| `multiplier_low`       | 0.9     | rd_multiplier in FULL zone (under-feed). AFC default              |
+| `multiplier_high`      | 1.1     | rd_multiplier in EMPTY zone (over-feed). AFC default              |
+| `fault_multiplier_low` | 0.36    | rd_multiplier in FULL after fault_escalation_time (AFC formula)   |
+| `fault_multiplier_high`| 1.65    | rd_multiplier in EMPTY after fault_escalation_time (AFC formula)  |
+| `fault_escalation_time`| 5.0     | Seconds in a safety zone before jumping to fault_multiplier_*    |
 | `empty_safety_timeout` | 30.0    | Seconds in EMPTY zone before raising an error                    |
 | `full_safety_timeout`  | 10.0    | Seconds in FULL zone before forced retract                       |
 | `manual_speed`         | 15.0    | Speed (mm/s) for manual feed/retract                             |
 | `manual_accel`         | 100.0   | Acceleration (mm/s^2) for manual feed/retract                    |
+| `manual_move_distance` | 10.0    | Distance (mm) per manual / safety-retract chunk                  |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
 | `manual_feed_full_timeout` | 3.0 | Seconds full sensor must hold before auto-stopping manual feed   |
@@ -164,17 +168,17 @@ rd_new = base_rotation_distance / multiplier
 | Empty | Middle | Full | Zone         | Multiplier                |
 |:-----:|:------:|:----:|--------------|---------------------------|
 |   1   |   *    |   1  | **ERROR**    | sensor conflict           |
-|   1   |   *    |   0  | EMPTY        | 1.0 + `safety_gain`       |
+|   1   |   *    |   0  | EMPTY        | `multiplier_high` (1.1)   |
 |   0   |   0    |   0  | EMPTY_MIDDLE | 1.0 + `drift_gain`        |
 |   0   |   1    |   0  | **MIDDLE**   | **1.00 (dead-band)**      |
 |   0   |   1    |   1  | FULL_MIDDLE  | 1.0 - `drift_gain`        |
-|   0   |   0    |   1  | FULL         | 1.0 - `safety_gain`       |
+|   0   |   0    |   1  | FULL         | `multiplier_low` (0.9)    |
 
 The MIDDLE zone is the target equilibrium. When the middle sensor alone is active, the multiplier is exactly 1.0 -- the buffer rides the extruder step-for-step with zero correction. Deviations toward empty or full apply proportional corrections that push the filament loop back toward center.
 
 ### Fault escalation
 
-If a safety zone (EMPTY or FULL) persists for `fault_escalation_time` seconds, the gain increases to `safety_gain * 1.5`. If it persists past the safety timeout, an error is raised (EMPTY) or a forced retract is executed (FULL).
+If a safety zone (EMPTY or FULL) persists for `fault_escalation_time` seconds, the multiplier jumps to the absolute `fault_multiplier_low` / `fault_multiplier_high` value (AFC defaults: 0.36 / 1.65 — strong corrections that drain or fill the loop quickly). If it persists past the safety timeout, an error is raised (EMPTY) or a forced retract is executed (FULL).
 
 ### State Transitions
 

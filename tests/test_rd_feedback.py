@@ -55,17 +55,17 @@ class TestMultiplierMapping:
         m = enabled_buf._zone_to_multiplier(ZONE_EMPTY_MIDDLE)
         assert m == pytest.approx(1.0 + enabled_buf.drift_gain)
 
-    def test_empty_adds_safety_gain(self, enabled_buf):
+    def test_empty_uses_multiplier_high(self, enabled_buf):
         m = enabled_buf._zone_to_multiplier(ZONE_EMPTY)
-        assert m == pytest.approx(1.0 + enabled_buf.safety_gain)
+        assert m == pytest.approx(enabled_buf.multiplier_high)
 
     def test_full_middle_subtracts_drift_gain(self, enabled_buf):
         m = enabled_buf._zone_to_multiplier(ZONE_FULL_MIDDLE)
         assert m == pytest.approx(1.0 - enabled_buf.drift_gain)
 
-    def test_full_subtracts_safety_gain(self, enabled_buf):
+    def test_full_uses_multiplier_low(self, enabled_buf):
         m = enabled_buf._zone_to_multiplier(ZONE_FULL)
-        assert m == pytest.approx(1.0 - enabled_buf.safety_gain)
+        assert m == pytest.approx(enabled_buf.multiplier_low)
 
 
 class TestDeadBand:
@@ -87,7 +87,7 @@ class TestRotationDistanceApplication:
         base_rd = enabled_buf._base_rd
         set_sensors(enabled_buf, empty=True)
         enabled_buf._update_rotation_distance(1.0)
-        expected_mult = 1.0 + enabled_buf.safety_gain
+        expected_mult = enabled_buf.multiplier_high
         expected_rd = base_rd / expected_mult
         assert enabled_buf._rd_multiplier == pytest.approx(expected_mult)
         assert stepper.get_rotation_distance()[0] == pytest.approx(expected_rd)
@@ -96,7 +96,7 @@ class TestRotationDistanceApplication:
         base_rd = enabled_buf._base_rd
         set_sensors(enabled_buf, full=True)
         enabled_buf._update_rotation_distance(1.0)
-        expected_mult = 1.0 - enabled_buf.safety_gain
+        expected_mult = enabled_buf.multiplier_low
         expected_rd = base_rd / expected_mult
         assert enabled_buf._rd_multiplier == pytest.approx(expected_mult)
         assert stepper.get_rotation_distance()[0] == pytest.approx(expected_rd)
@@ -132,8 +132,8 @@ class TestFaultEscalation:
         reactor._monotonic = 1.0 + enabled_buf.fault_escalation_time + 0.1
         enabled_buf._update_rotation_distance(reactor._monotonic)
 
-        # Multiplier should be escalated (safety_gain * 1.5)
-        escalated_mult = 1.0 + enabled_buf.safety_gain * 1.5
+        # Multiplier should jump to the absolute fault_multiplier_high
+        escalated_mult = enabled_buf.fault_multiplier_high
         assert enabled_buf._rd_multiplier == pytest.approx(escalated_mult)
         assert enabled_buf._safety_escalated is True
 
