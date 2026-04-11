@@ -538,12 +538,14 @@ class Buffer:
 
         # Safety timeout check — only tick while printing.  When the
         # extruder is idle, the multiplier has no moves to act on, so
-        # being in a safety zone is static, not worsening.  Reset the
-        # start time so idle periods don't accumulate toward the limit.
+        # being in a safety zone is static, not worsening.  Clear the
+        # start time so it can only be set by a zone-entry transition
+        # that occurs during active printing (_update_rotation_distance
+        # sets _safety_zone_start on 'entered').
         zone = self._compute_zone()
         if zone is not None and self._safety_zone_start > 0.0:
             if not self._is_printing():
-                self._safety_zone_start = eventtime
+                self._safety_zone_start = 0.0
             else:
                 elapsed = eventtime - self._safety_zone_start
                 if (zone == ZONE_EMPTY
