@@ -536,18 +536,26 @@ class Buffer:
                           STATE_ERROR, STATE_DISABLED):
             return eventtime + self.control_interval
 
-        # Safety timeout check
+        # Safety timeout check — only tick while printing.  When the
+        # extruder is idle, the multiplier has no moves to act on, so
+        # being in a safety zone is static, not worsening.  Reset the
+        # start time so idle periods don't accumulate toward the limit.
         zone = self._compute_zone()
         if zone is not None and self._safety_zone_start > 0.0:
-            elapsed = eventtime - self._safety_zone_start
-            if zone == ZONE_EMPTY and elapsed >= self.empty_safety_timeout:
-                self._handle_error(
-                    "Buffer stuck in empty zone for %.0fs"
-                    % self.empty_safety_timeout)
-                return eventtime + self.control_interval
-            if zone == ZONE_FULL and elapsed >= self.full_safety_timeout:
-                self._do_safety_retract(eventtime)
-                return eventtime + self.control_interval
+            if not self._is_printing():
+                self._safety_zone_start = eventtime
+            else:
+                elapsed = eventtime - self._safety_zone_start
+                if (zone == ZONE_EMPTY
+                        and elapsed >= self.empty_safety_timeout):
+                    self._handle_error(
+                        "Buffer stuck in empty zone for %.0fs"
+                        % self.empty_safety_timeout)
+                    return eventtime + self.control_interval
+                if (zone == ZONE_FULL
+                        and elapsed >= self.full_safety_timeout):
+                    self._do_safety_retract(eventtime)
+                    return eventtime + self.control_interval
 
         # Periodic re-evaluation of rotation_distance
         if self._synced_to is not None:

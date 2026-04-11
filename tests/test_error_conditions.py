@@ -11,6 +11,7 @@ from conftest import (
 
 class TestEmptySafetyTimeout:
     def test_empty_timeout_triggers_error(self, enabled_buf, reactor):
+        enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, empty=True)
         t = 1.0
         reactor._monotonic = t
@@ -23,10 +24,24 @@ class TestEmptySafetyTimeout:
         assert enabled_buf.state == STATE_ERROR
         assert "empty" in enabled_buf.error_msg.lower()
 
+    def test_no_timeout_when_not_printing(self, enabled_buf, reactor):
+        """Safety timeout must not fire when the extruder is idle."""
+        enabled_buf._print_stats.state = "standby"
+        set_sensors(enabled_buf, empty=True)
+        t = 1.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+
+        t += enabled_buf.empty_safety_timeout + 1.0
+        reactor._monotonic = t
+        enabled_buf._control_timer_cb(t)
+        assert enabled_buf.state != STATE_ERROR
+
 
 class TestFullSafetyTimeout:
     def test_full_timeout_triggers_retract(self, enabled_buf, reactor,
                                            force_move):
+        enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, full=True)
         t = 1.0
         reactor._monotonic = t
@@ -38,6 +53,20 @@ class TestFullSafetyTimeout:
         # Should have done a safety retract via force_move
         assert len(force_move.moves) > 0
         assert force_move.moves[-1][1] < 0  # negative dist = retract
+
+    def test_no_retract_when_not_printing(self, enabled_buf, reactor,
+                                           force_move):
+        """Safety retract must not fire when the extruder is idle."""
+        enabled_buf._print_stats.state = "standby"
+        set_sensors(enabled_buf, full=True)
+        t = 1.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+
+        t += enabled_buf.full_safety_timeout + 1.0
+        reactor._monotonic = t
+        enabled_buf._control_timer_cb(t)
+        assert len(force_move.moves) == 0
 
 
 class TestSensorConflict:
