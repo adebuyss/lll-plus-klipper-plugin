@@ -33,6 +33,76 @@ The script symlinks `buffer.py` into `~/klipper/klippy/extras/`. Restart Klipper
 sudo systemctl restart klipper
 ```
 
+## Macro Integration
+
+Add `BUFFER_ENABLE` and `BUFFER_DISABLE` to your printer macros so the buffer activates during prints and deactivates for maintenance operations.
+
+### Print start / end
+
+```ini
+[gcode_macro PRINT_START]
+gcode:
+    # ... homing, heating, bed mesh, etc.
+    BUFFER_ENABLE
+    # ... purge line, start printing
+
+[gcode_macro PRINT_END]
+gcode:
+    BUFFER_DISABLE
+    # ... retract, park, cooldown, etc.
+
+[gcode_macro CANCEL_PRINT]
+rename_existing: BASE_CANCEL_PRINT
+gcode:
+    BUFFER_DISABLE
+    BASE_CANCEL_PRINT
+```
+
+### Pause / resume
+
+The buffer automatically pauses the print on filament runout (`pause_on_runout: True`). If you use custom pause/resume macros, disable the buffer on pause and re-enable on resume so it doesn't fight the parked extruder:
+
+```ini
+[gcode_macro PAUSE]
+rename_existing: BASE_PAUSE
+gcode:
+    BUFFER_DISABLE
+    BASE_PAUSE
+
+[gcode_macro RESUME]
+rename_existing: BASE_RESUME
+gcode:
+    BUFFER_ENABLE
+    BASE_RESUME
+```
+
+### Filament change
+
+When the buffer is synced, it follows extruder moves automatically -- `G1 E-50` to retract from the hotend makes the buffer stepper retract in lockstep. No need to disable for normal load/unload. `BUFFER_FEED` / `BUFFER_RETRACT` are for threading filament *through the buffer tube itself* (spool to extruder entrance) when the extruder is not involved. With no `DIST` argument, `BUFFER_FEED` runs continuously until the full sensor triggers and `BUFFER_RETRACT` runs until the empty sensor triggers:
+
+```ini
+[gcode_macro UNLOAD_FILAMENT]
+gcode:
+    BUFFER_DISABLE
+    G1 E-50 F600              ; retract from hotend
+    BUFFER_RETRACT ; retracts until buffer enters the empty state
+ #   BUFFER_RETRACT_UNTIL_CLEAR ; optionally, retract until filament leaves the tube
+
+[gcode_macro LOAD_FILAMENT]
+gcode:
+    BUFFER_FEED                ; thread filament through tube until full sensor
+    G1 E50 F300               ; push into hotend
+    BUFFER_ENABLE
+```
+
+### Notes
+
+- `BUFFER_ENABLE` syncs the buffer stepper to the extruder. Call it after heating and before the first extrusion move.
+- `BUFFER_DISABLE` unsyncs and stops the motor. Always call it before parking, tool changes, or filament operations.
+- `BUFFER_FEED` and `BUFFER_RETRACT` accept `SPEED=` (mm/s) and `DIST=` (mm) parameters for manual moves.
+- The physical feed/retract buttons work independently of these macros and can be used any time (except in error state).
+- Hold both buttons for 2 seconds to clear an error without needing a console.
+
 ## Configuration
 
 Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust pin assignments and serial path for your setup.
@@ -51,8 +121,8 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `manual_speed`         | 10.0    | Speed (mm/s) for manual feed/retract                             |
 | `manual_accel`         | 100.0   | Acceleration (mm/s^2) for manual feed/retract                    |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
-| `forward_timeout`      | 60.0    | Seconds of continuous forward before error (0 = disable)         |
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
+| `manual_feed_full_timeout` | 3.0 | Seconds full sensor must hold before auto-stopping manual feed   |
 | `pause_on_runout`      | True    | Pause print on filament runout or safety timeout                 |
 
 See `sample_config/lll-plus.cfg` for the full annotated reference.
@@ -64,8 +134,9 @@ See `sample_config/lll-plus.cfg` for the full annotated reference.
 | `BUFFER_STATUS`                      | Report state, sensors, zone, rd_multiplier, sync status      |
 | `BUFFER_ENABLE`                      | Sync to extruder and enable automatic control                |
 | `BUFFER_DISABLE`                     | Unsync and disable automatic control                         |
-| `BUFFER_FEED [SPEED=<mm/s>] [DIST=<mm>]` | Manual forward feed (default 50mm)                      |
-| `BUFFER_RETRACT [SPEED=<mm/s>] [DIST=<mm>]` | Manual retract (default 50mm)                         |
+| `BUFFER_FEED [SPEED=<mm/s>] [DIST=<mm>]` | Forward feed. No DIST = feed until full sensor stops it |
+| `BUFFER_RETRACT [SPEED=<mm/s>] [DIST=<mm>]` | Retract. No DIST = retract until empty sensor stops it |
+| `BUFFER_RETRACT_UNTIL_CLEAR [SPEED=<mm/s>]` | Retract until filament presence switch clears          |
 | `BUFFER_STOP`                        | Stop any manual move, re-sync if auto-enabled                |
 | `BUFFER_SET_SPEED SPEED=<mm/s>`      | Set manual feed/retract speed                                |
 | `BUFFER_CLEAR_ERROR`                 | Clear error state (also via 2s both-button hold)             |

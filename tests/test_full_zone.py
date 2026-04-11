@@ -33,6 +33,7 @@ class TestFullZoneEntry:
 class TestFullZoneTimeout:
     def test_timeout_triggers_safety_retract(self, enabled_buf, reactor,
                                               force_move):
+        enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, full=True)
         t = 10.0
         reactor._monotonic = t
