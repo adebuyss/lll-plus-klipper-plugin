@@ -46,6 +46,24 @@ class TestFullZoneTimeout:
         assert force_move.moves[-1][1] < 0  # retract = negative dist
 
 
+class TestSafetyRetractBehavior:
+    def test_safety_retract_leaves_unsynced(self, enabled_buf, reactor,
+                                             force_move):
+        """After safety retract, stepper must remain unsynced so the
+        retract move completes before re-sync on next timer cycle."""
+        enabled_buf._print_stats.state = "printing"
+        set_sensors(enabled_buf, full=True)
+        t = 10.0
+        reactor._monotonic = t
+        enabled_buf._update_rotation_distance(t)
+
+        t += enabled_buf.full_safety_timeout + 1.0
+        reactor._monotonic = t
+        enabled_buf._control_timer_cb(t)
+        assert len(force_move.moves) > 0
+        assert enabled_buf._synced_to is None
+
+
 class TestFullMiddleOverlap:
     def test_full_middle_does_not_trigger_safety(self, enabled_buf, reactor):
         set_sensors(enabled_buf, full=True, middle=True)

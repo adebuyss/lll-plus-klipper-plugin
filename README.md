@@ -124,6 +124,8 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
 | `manual_feed_full_timeout` | 3.0 | Seconds full sensor must hold before auto-stopping manual feed   |
 | `pause_on_runout`      | True    | Pause print on filament runout or safety timeout                 |
+| `control_interval`     | 0.5     | Reactor timer interval (s) for safety timeout checks             |
+| `debug`                | False   | Enable debug logging of zone transitions and multiplier changes  |
 
 See `sample_config/lll-plus.cfg` for the full annotated reference.
 
