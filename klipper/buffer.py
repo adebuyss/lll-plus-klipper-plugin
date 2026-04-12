@@ -87,8 +87,24 @@ class Buffer:
         self.stepper_name = config.get("stepper")
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
-        self.safety_gain = config.getfloat("safety_gain", 0.05, minval=0.0,
-                                           maxval=0.5)
+        # Absolute rotation_distance multipliers, matching AFC_buffer.py.
+        # _low is applied in the FULL safety zone (under-feed to drain
+        # the loop); _high is applied in the EMPTY safety zone (over-feed
+        # to fill it).  The fault_* variants are the escalated values
+        # used after fault_escalation_time seconds in the same zone.
+        # AFC defaults: 0.9 / 1.1 normal, 0.36 / 1.65 fault.
+        self.multiplier_low = config.getfloat(
+            "multiplier_low", 0.9, minval=0.0, maxval=1.0)
+        self.multiplier_high = config.getfloat(
+            "multiplier_high", 1.1, minval=1.0)
+        self.fault_multiplier_low = config.getfloat(
+            "fault_multiplier_low",
+            (self.multiplier_low * 2.0) / 5.0,
+            minval=0.0, maxval=self.multiplier_low)
+        self.fault_multiplier_high = config.getfloat(
+            "fault_multiplier_high",
+            self.multiplier_high * 1.5,
+            minval=self.multiplier_high)
         self.fault_escalation_time = config.getfloat("fault_escalation_time",
                                                      5.0, above=0.0)
         self.empty_safety_timeout = config.getfloat("empty_safety_timeout",
@@ -99,6 +115,8 @@ class Buffer:
                                                      2.0, above=0.0)
         self.manual_speed = config.getfloat("manual_speed", 15.0, above=0.0)
         self.manual_accel = config.getfloat("manual_accel", 100.0, above=0.0)
+        self.manual_move_distance = config.getfloat(
+            "manual_move_distance", 10.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
@@ -159,7 +177,7 @@ class Buffer:
         self._error_clear_timer = None
 
         # Manual move tracking
-        self._manual_chunk_dist = 20.0  # mm per button-held chunk
+        self._manual_chunk_dist = self.manual_move_distance
         self._continuous_feed_direction = STOP
         self._continuous_feed_speed = 0.0
         self._retract_until_clear = False
@@ -382,11 +400,11 @@ class Buffer:
         if zone == ZONE_EMPTY_MIDDLE:
             return 1.0 + self.drift_gain
         if zone == ZONE_EMPTY:
-            return 1.0 + self.safety_gain
+            return self.multiplier_high
         if zone == ZONE_FULL_MIDDLE:
             return 1.0 - self.drift_gain
         if zone == ZONE_FULL:
-            return 1.0 - self.safety_gain
+            return self.multiplier_low
         return 1.0
 
     def _apply_multiplier(self, multiplier):
@@ -423,9 +441,22 @@ class Buffer:
         if self._synced_to is None and self._initial_fill_until <= 0.0:
             self._sync()
 
-        # Safety timeout tracking
+        # Safety timeout tracking.  Edge-based arming on zone entry
+        # preserves the be70969 intent: stale state from before printing
+        # must not accrue toward the timeout.  As a fallback, also arm
+        # from current state when we're already in a safety zone *and*
+        # printing — this catches the case where the zone-entry edge
+        # fired before _print_stats flipped to "printing" (e.g. during
+        # the prime line) and was then cleared by the not-printing
+        # branch of _control_timer_cb.  The fresh timestamp is critical:
+        # the timer counts only post-print-start time, exactly as
+        # be70969 intended.
         if zone in (ZONE_EMPTY, ZONE_FULL):
             if entered:
+                self._safety_zone_start = eventtime
+                self._safety_escalated = False
+            elif (self._safety_zone_start <= 0.0
+                    and self._is_printing()):
                 self._safety_zone_start = eventtime
                 self._safety_escalated = False
         else:
@@ -441,18 +472,19 @@ class Buffer:
         # Compute and apply multiplier
         multiplier = self._zone_to_multiplier(zone)
 
-        # Fault escalation: if in safety zone too long, increase gain.
-        # Once escalated, the higher gain persists until the zone clears.
+        # Fault escalation: if in safety zone too long, jump to the
+        # absolute fault multiplier.  Once escalated, the stronger
+        # value persists until the zone clears.
         if self._safety_zone_start > 0.0:
             if (not self._safety_escalated
                     and eventtime - self._safety_zone_start
                     >= self.fault_escalation_time):
                 self._safety_escalated = True
             if self._safety_escalated:
-                if multiplier > 1.0:
-                    multiplier = 1.0 + self.safety_gain * 1.5
-                elif multiplier < 1.0:
-                    multiplier = 1.0 - self.safety_gain * 1.5
+                if zone == ZONE_FULL:
+                    multiplier = self.fault_multiplier_low
+                elif zone == ZONE_EMPTY:
+                    multiplier = self.fault_multiplier_high
 
         if self._synced_to is not None:
             self._apply_multiplier(multiplier)
@@ -828,8 +860,12 @@ class Buffer:
             "base_rotation_distance": round(self._base_rd, 4),
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
+            "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
-            "safety_gain": self.safety_gain,
+            "multiplier_low": self.multiplier_low,
+            "multiplier_high": self.multiplier_high,
+            "fault_multiplier_low": self.fault_multiplier_low,
+            "fault_multiplier_high": self.fault_multiplier_high,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -854,8 +890,10 @@ class Buffer:
             "  Zone: %s (prev: %s)\n"
             "  RD multiplier: %.4f (base: %.4f)\n"
             "  Synced to: %s\n"
-            "  Manual speed: %.1f mm/s\n"
-            "  Drift gain: %.3f  Safety gain: %.3f\n"
+            "  Manual speed: %.1f mm/s  chunk: %.1f mm\n"
+            "  Drift gain: %.3f\n"
+            "  Multiplier low/high: %.3f / %.3f\n"
+            "  Fault multiplier low/high: %.3f / %.3f\n"
             "  Printing: %s"
             % (
                 status["state"],
@@ -871,8 +909,12 @@ class Buffer:
                 status["base_rotation_distance"],
                 status["synced_to"] or "none",
                 status["manual_speed"],
+                status["manual_move_distance"],
                 status["drift_gain"],
-                status["safety_gain"],
+                status["multiplier_low"],
+                status["multiplier_high"],
+                status["fault_multiplier_low"],
+                status["fault_multiplier_high"],
                 status["is_printing"],
             )
         )

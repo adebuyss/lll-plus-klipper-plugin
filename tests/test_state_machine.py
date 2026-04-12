@@ -59,7 +59,8 @@ class TestEmptyMiddleZone:
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_EMPTY_MIDDLE
         assert enabled_buf._rd_multiplier > 1.0
-        assert enabled_buf._rd_multiplier < 1.0 + enabled_buf.safety_gain
+        # drift correction is gentler than the safety zone correction
+        assert enabled_buf._rd_multiplier < enabled_buf.multiplier_high
 
 
 class TestFullMiddleZone:
@@ -68,7 +69,8 @@ class TestFullMiddleZone:
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
         assert enabled_buf._rd_multiplier < 1.0
-        assert enabled_buf._rd_multiplier > 1.0 - enabled_buf.safety_gain
+        # drift correction is gentler than the safety zone correction
+        assert enabled_buf._rd_multiplier > enabled_buf.multiplier_low
 
 
 class TestSensorConflict:
