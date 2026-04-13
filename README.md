@@ -22,7 +22,7 @@ A Klipper extras module for real-time control of the Mellow LLL Plus filament bu
 
 ## Flashing
 
-There is a good guide for flashing the buffer with klipper [Here](https://github.com/ss1gohan13/BufferPLUS-klipper)
+There is a good guide for flashing and calibrating the buffer with klipper [Here](https://github.com/ss1gohan13/BufferPLUS-klipper)
 
 ## Installation
 
