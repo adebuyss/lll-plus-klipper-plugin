@@ -218,7 +218,7 @@ The test suite uses pure mock objects with no Klipper dependency. Coverage inclu
 
 Hardware and original firmware by [Mellow 3D](https://github.com/mellow-3d).
 
-
+Armoured Turtle [AFC](https://www.armoredturtle.xyz/docs/afc-klipper-add-on/index.html) - Used for ideas when researching speed matching strategies.
 
 
 ## License
