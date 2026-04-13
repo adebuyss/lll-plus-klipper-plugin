@@ -20,6 +20,10 @@ A Klipper extras module for real-time control of the Mellow LLL Plus filament bu
 - Filament presence switch
 - Feed and retract buttons
 
+## Flashing
+
+There is a good guide for flashing the buffer with klipper [Here](https://github.com/ss1gohan13/BufferPLUS-klipper)
+
 ## Installation
 
 ```bash
@@ -207,6 +211,15 @@ pytest tests/
 ```
 
 The test suite uses pure mock objects with no Klipper dependency. Coverage includes rotation_distance feedback, zone classification, dead-band invariant, fault escalation, safety timeouts, manual control, button handling, error conditions, and state transitions.
+
+
+## Credits
+[@ss1gohan13](https://github.com/ss1gohan13) for his inital work with a macro version and execlent flashing instrucations.
+
+Hardware and original firmware by [Mellow 3D](https://github.com/mellow-3d).
+
+
+
 
 ## License
 
