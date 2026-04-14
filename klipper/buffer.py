@@ -82,9 +82,17 @@ class Buffer:
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object("gcode")
         self.name = config.get_name()
+        # Instance name: "buffer" for [buffer], "my_buf" for [buffer my_buf]
+        parts = self.name.split(None, 1)
+        self.short_name = parts[1] if len(parts) > 1 else parts[0]
 
         # Config — new AFC-style parameters
         self.stepper_name = config.get("stepper")
+        # Optional extruder binding.  When set, the buffer only syncs while
+        # this extruder is the active one (enables multi-extruder setups).
+        # When None, the buffer follows whatever extruder is currently
+        # active and re-syncs on tool changes (single-buffer default).
+        self.extruder_name = config.get("extruder", None)
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
         # Absolute rotation_distance multipliers, matching AFC_buffer.py.
@@ -151,6 +159,7 @@ class Buffer:
         self._base_rd = 0.0
         self._rd_multiplier = 1.0
         self._synced_to = None  # extruder name when synced, None when not
+        self._last_active_extruder = None  # tracked for tool-change detection
 
         # State
         self.state = STATE_DISABLED
@@ -194,35 +203,37 @@ class Buffer:
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
 
-        # Register gcode commands
-        self.gcode.register_command(
-            "BUFFER_STATUS", self.cmd_BUFFER_STATUS,
-            desc="Report buffer status")
-        self.gcode.register_command(
-            "BUFFER_ENABLE", self.cmd_BUFFER_ENABLE,
-            desc="Enable automatic buffer control")
-        self.gcode.register_command(
-            "BUFFER_DISABLE", self.cmd_BUFFER_DISABLE,
-            desc="Disable buffer control and stop motor")
-        self.gcode.register_command(
-            "BUFFER_FEED", self.cmd_BUFFER_FEED,
-            desc="Manually feed filament forward")
-        self.gcode.register_command(
-            "BUFFER_RETRACT", self.cmd_BUFFER_RETRACT,
-            desc="Manually retract filament")
-        self.gcode.register_command(
-            "BUFFER_RETRACT_UNTIL_CLEAR",
-            self.cmd_BUFFER_RETRACT_UNTIL_CLEAR,
-            desc="Retract until filament presence switch clears")
-        self.gcode.register_command(
-            "BUFFER_STOP", self.cmd_BUFFER_STOP,
-            desc="Stop motor and return to auto mode")
-        self.gcode.register_command(
-            "BUFFER_SET_SPEED", self.cmd_BUFFER_SET_SPEED,
-            desc="Set manual feed/retract speed in mm/s")
-        self.gcode.register_command(
-            "BUFFER_CLEAR_ERROR", self.cmd_BUFFER_CLEAR_ERROR,
-            desc="Clear buffer error state")
+        # Register gcode commands via mux so multiple [buffer ...] sections
+        # can coexist and be selected with BUFFER=name.  For the bare
+        # [buffer] section we also register a value=None default so that
+        # existing macros calling BUFFER_* without BUFFER=... keep working.
+        gcode_commands = [
+            ("BUFFER_STATUS", self.cmd_BUFFER_STATUS,
+             "Report buffer status (BUFFER=name to target a specific buffer)"),
+            ("BUFFER_ENABLE", self.cmd_BUFFER_ENABLE,
+             "Enable automatic buffer control"),
+            ("BUFFER_DISABLE", self.cmd_BUFFER_DISABLE,
+             "Disable buffer control and stop motor"),
+            ("BUFFER_FEED", self.cmd_BUFFER_FEED,
+             "Manually feed filament forward"),
+            ("BUFFER_RETRACT", self.cmd_BUFFER_RETRACT,
+             "Manually retract filament"),
+            ("BUFFER_RETRACT_UNTIL_CLEAR",
+             self.cmd_BUFFER_RETRACT_UNTIL_CLEAR,
+             "Retract until filament presence switch clears"),
+            ("BUFFER_STOP", self.cmd_BUFFER_STOP,
+             "Stop motor and return to auto mode"),
+            ("BUFFER_SET_SPEED", self.cmd_BUFFER_SET_SPEED,
+             "Set manual feed/retract speed in mm/s"),
+            ("BUFFER_CLEAR_ERROR", self.cmd_BUFFER_CLEAR_ERROR,
+             "Clear buffer error state"),
+        ]
+        for cmd, handler, desc in gcode_commands:
+            self.gcode.register_mux_command(
+                cmd, "BUFFER", self.short_name, handler, desc=desc)
+            if self.short_name == "buffer":
+                self.gcode.register_mux_command(
+                    cmd, "BUFFER", None, handler, desc=desc)
 
         # Register sensor pins via buttons module
         self._register_sensors(config)
@@ -247,30 +258,56 @@ class Buffer:
             self.extruder_stepper.sync_to_extruder(None)
         except Exception:
             pass
+        # Record the currently active extruder so the control timer can
+        # detect tool changes via polling (see _control_timer_cb).
+        try:
+            self._last_active_extruder = (
+                self.toolhead.get_extruder().get_name())
+        except Exception:
+            self._last_active_extruder = None
         # Transition to IDLE
         self.state = STATE_IDLE
         # Look up print_stats
         try:
             self._print_stats = self.printer.lookup_object("print_stats")
         except Exception:
-            logging.info("buffer: print_stats not available")
+            logging.info("buffer[%s]: print_stats not available"
+                         % self.short_name)
         # Emit deprecation warnings
         if self._deprecated_warnings:
-            msg = ("Buffer: deprecated config params ignored: %s. "
+            msg = ("Buffer[%s]: deprecated config params ignored: %s. "
                    "These will be removed in a future release."
-                   % ", ".join(self._deprecated_warnings))
-            logging.warning("buffer: %s" % msg)
+                   % (self.short_name,
+                      ", ".join(self._deprecated_warnings)))
+            logging.warning("buffer[%s]: %s"
+                            % (self.short_name, msg))
             self.gcode.respond_info(msg)
+        # Warn if multiple buffers omit the 'extruder' binding.  Two
+        # unbound buffers both follow the active extruder, which is
+        # usually a misconfiguration on multi-extruder printers.
+        try:
+            unbound = []
+            for obj_name, obj in self.printer.lookup_objects("buffer"):
+                if getattr(obj, "extruder_name", "_missing_") is None:
+                    unbound.append(getattr(obj, "short_name", obj_name))
+            if len(unbound) > 1:
+                logging.warning(
+                    "buffer[%s]: multiple buffers without 'extruder' "
+                    "param will all follow the active extruder: %s"
+                    % (self.short_name, ", ".join(unbound)))
+        except Exception:
+            pass
         # Start control timer
         self._control_timer = self.reactor.register_timer(
             self._control_timer_cb, self.reactor.monotonic() + 1.0)
-        logging.info("buffer: ready (base_rd=%.4f)" % self._base_rd)
+        logging.info("buffer[%s]: ready (base_rd=%.4f)"
+                     % (self.short_name, self._base_rd))
 
     def _handle_shutdown(self):
         self._unsync()
         self.state = STATE_DISABLED
         self.auto_enabled = False
-        logging.info("buffer: shutdown")
+        logging.info("buffer[%s]: shutdown" % self.short_name)
 
     # --- Sensor registration ---
 
@@ -327,7 +364,8 @@ class Buffer:
             self.state = STATE_STOPPED
             self.error_msg = ""
             self._initial_fill_until = eventtime + self.initial_fill_timeout
-            logging.info("buffer: filament detected, starting fill")
+            logging.info("buffer[%s]: filament detected, starting fill"
+                         % self.short_name)
             self.gcode.respond_info(
                 "Buffer: filament detected, starting fill")
             self._do_initial_fill(eventtime)
@@ -335,12 +373,26 @@ class Buffer:
     # --- Extruder sync/unsync ---
 
     def _sync(self):
-        """Sync the buffer stepper to the active extruder's trapq."""
+        """Sync the buffer stepper to the active extruder's trapq.
+
+        If this buffer is bound to a specific extruder via the 'extruder'
+        config param, only sync when that extruder is currently active.
+        Otherwise sync to whatever extruder is active.
+        """
         if self._synced_to is not None:
             return
         try:
             extruder = self.toolhead.get_extruder()
             extruder_name = extruder.get_name()
+            # If bound to a specific extruder, only sync when it's active.
+            if (self.extruder_name is not None
+                    and extruder_name != self.extruder_name):
+                if self.debug:
+                    self.gcode.respond_info(
+                        "Buffer[%s] debug: skip sync (active=%s, "
+                        "bound=%s)" % (self.short_name, extruder_name,
+                                       self.extruder_name))
+                return
             self.extruder_stepper.sync_to_extruder(extruder_name)
             self._synced_to = extruder_name
             self._apply_multiplier(self._rd_multiplier)
@@ -349,9 +401,11 @@ class Buffer:
                 self.motor_direction = FORWARD
             if self.debug:
                 self.gcode.respond_info(
-                    "Buffer debug: synced to %s" % extruder_name)
+                    "Buffer[%s] debug: synced to %s"
+                    % (self.short_name, extruder_name))
         except Exception as e:
-            logging.warning("buffer: sync failed: %s" % e)
+            logging.warning("buffer[%s]: sync failed: %s"
+                            % (self.short_name, e))
 
     def _unsync(self):
         """Unsync the buffer stepper from the extruder."""
@@ -360,14 +414,44 @@ class Buffer:
         try:
             self.extruder_stepper.sync_to_extruder(None)
         except Exception as e:
-            logging.warning("buffer: unsync failed: %s" % e)
+            logging.warning("buffer[%s]: unsync failed: %s"
+                            % (self.short_name, e))
         self._synced_to = None
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
         self._safety_escalated = False
         if self.debug:
-            self.gcode.respond_info("Buffer debug: unsynced")
+            self.gcode.respond_info("Buffer[%s] debug: unsynced"
+                                    % self.short_name)
+
+    def _handle_extruder_change(self, new_extruder_name):
+        """React to the active extruder changing.
+
+        For bound buffers: sync iff the new extruder matches our binding,
+        otherwise unsync.  For unbound buffers: re-sync to whatever is
+        now active.  No-op while disabled, errored, or auto-disabled.
+        """
+        if self.state in (STATE_DISABLED, STATE_ERROR):
+            return
+        if not self.auto_enabled:
+            return
+        if self.extruder_name is not None:
+            if new_extruder_name == self.extruder_name:
+                if self._synced_to is None:
+                    self._sync()
+            else:
+                if self._synced_to is not None:
+                    self._unsync()
+                    # Return to STOPPED so _sync() can promote back to
+                    # FEEDING when our extruder is active again.
+                    if self.state == STATE_FEEDING:
+                        self.state = STATE_STOPPED
+        else:
+            # Unbound — follow whatever is active.
+            if self._synced_to is not None:
+                self._unsync()
+            self._sync()
 
     # --- Rotation distance feedback ---
 
@@ -512,7 +596,8 @@ class Buffer:
         if self._initial_fill_until > 0.0 and eventtime >= self._initial_fill_until:
             self._initial_fill_until = 0.0
             self.motor_direction = STOP
-            logging.info("buffer: initial fill timeout")
+            logging.info("buffer[%s]: initial fill timeout"
+                         % self.short_name)
             self.gcode.respond_info(
                 "Buffer: initial fill timed out after %.0fs"
                 % self.initial_fill_timeout)
@@ -522,7 +607,8 @@ class Buffer:
         zone = self._compute_zone()
         if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
             self._initial_fill_until = 0.0
-            logging.info("buffer: initial fill complete (zone=%s)" % zone)
+            logging.info("buffer[%s]: initial fill complete (zone=%s)"
+                         % (self.short_name, zone))
             self._sync()
             return
         # Abort: fill was cancelled (disable, runout, error)
@@ -534,7 +620,8 @@ class Buffer:
                 self.extruder_stepper.stepper, self._manual_chunk_dist,
                 self.manual_speed, self.manual_accel)
         except Exception as e:
-            logging.warning("buffer: fill chunk failed: %s" % e)
+            logging.warning("buffer[%s]: fill chunk failed: %s"
+                            % (self.short_name, e))
             self._initial_fill_until = 0.0
             self._sync()
             return
@@ -549,6 +636,17 @@ class Buffer:
     # --- Control timer ---
 
     def _control_timer_cb(self, eventtime):
+        # Poll active extruder to detect tool changes.  The toolhead's
+        # active extruder can change via ACTIVATE_EXTRUDER / T0/T1 macros
+        # without firing a dedicated event, so we sample it each tick.
+        if self.toolhead is not None:
+            try:
+                current_extruder = self.toolhead.get_extruder().get_name()
+            except Exception:
+                current_extruder = self._last_active_extruder
+            if current_extruder != self._last_active_extruder:
+                self._handle_extruder_change(current_extruder)
+                self._last_active_extruder = current_extruder
         # Manual feed auto-stop on sustained full sensor
         if self.state == STATE_MANUAL_FEED:
             if self.sensor_states["full"]:
@@ -621,7 +719,8 @@ class Buffer:
         via _update_rotation_distance once the retract has completed
         and print_time has advanced past the move.
         """
-        logging.info("buffer: full zone safety retract")
+        logging.info("buffer[%s]: full zone safety retract"
+                     % self.short_name)
         self.gcode.respond_info(
             "Buffer: full zone timeout - retracting")
         stepper = self.extruder_stepper.stepper
@@ -633,7 +732,8 @@ class Buffer:
                 stepper, -self._manual_chunk_dist,
                 self.manual_speed, self.manual_accel)
         except Exception as e:
-            logging.warning("buffer: safety retract failed: %s" % e)
+            logging.warning("buffer[%s]: safety retract failed: %s"
+                            % (self.short_name, e))
         self._safety_zone_start = 0.0
         self._safety_escalated = False
         # Do NOT re-sync here — the retract move is still in the MCU's
@@ -762,7 +862,8 @@ class Buffer:
             self.force_move.manual_move(
                 stepper, dist, self.manual_speed, self.manual_accel)
         except Exception as e:
-            logging.warning("buffer: manual move failed: %s" % e)
+            logging.warning("buffer[%s]: manual move failed: %s"
+                            % (self.short_name, e))
 
     def _start_continuous_feed(self, direction, speed):
         """Feed/retract continuously via chunked moves until stopped.
@@ -798,7 +899,8 @@ class Buffer:
                 stepper, dist, self._continuous_feed_speed,
                 self.manual_accel)
         except Exception as e:
-            logging.warning("buffer: continuous feed chunk failed: %s" % e)
+            logging.warning("buffer[%s]: continuous feed chunk failed: %s"
+                            % (self.short_name, e))
             return
         # Schedule next chunk — reactor processes sensor callbacks between
         self.reactor.register_callback(self._continuous_chunk_cb)
@@ -819,7 +921,7 @@ class Buffer:
         self.state = STATE_ERROR
         self.error_msg = msg
         self.motor_direction = STOP
-        logging.error("buffer: %s" % msg)
+        logging.error("buffer[%s]: %s" % (self.short_name, msg))
         self.gcode.respond_info("Buffer ERROR: %s" % msg)
         if self.pause_on_runout:
             self._trigger_pause(msg)
@@ -840,12 +942,15 @@ class Buffer:
                 self.gcode.respond_info("Buffer: pausing print - %s" % msg)
                 self.gcode.run_script("PAUSE")
         except Exception:
-            logging.warning("buffer: failed to trigger pause")
+            logging.warning("buffer[%s]: failed to trigger pause"
+                            % self.short_name)
 
     # --- Status ---
 
     def get_status(self, eventtime):
         return {
+            "name": self.short_name,
+            "extruder": self.extruder_name,
             "state": self.state,
             "motor_direction": self.motor_direction,
             "sensor_empty": self.sensor_states["empty"],
@@ -881,7 +986,8 @@ class Buffer:
     def cmd_BUFFER_STATUS(self, gcmd):
         status = self.get_status(self.reactor.monotonic())
         msg = (
-            "Buffer status:\n"
+            "Buffer status [%s]:\n"
+            "  Extruder binding: %s\n"
             "  State: %s\n"
             "  Motor: %s\n"
             "  Sensors: empty=%s middle=%s full=%s\n"
@@ -896,6 +1002,8 @@ class Buffer:
             "  Fault multiplier low/high: %.3f / %.3f\n"
             "  Printing: %s"
             % (
+                status["name"],
+                status["extruder"] or "(any active)",
                 status["state"],
                 status["motor_direction"],
                 status["sensor_empty"],
@@ -958,7 +1066,8 @@ class Buffer:
                 self.force_move.manual_move(stepper, dist, speed,
                                             self.manual_accel)
             except Exception as e:
-                logging.warning("buffer: BUFFER_FEED failed: %s" % e)
+                logging.warning("buffer[%s]: BUFFER_FEED failed: %s"
+                                % (self.short_name, e))
             gcmd.respond_info(
                 "Buffer: feeding %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -986,7 +1095,8 @@ class Buffer:
                 self.force_move.manual_move(stepper, -dist, speed,
                                             self.manual_accel)
             except Exception as e:
-                logging.warning("buffer: BUFFER_RETRACT failed: %s" % e)
+                logging.warning("buffer[%s]: BUFFER_RETRACT failed: %s"
+                                % (self.short_name, e))
             gcmd.respond_info(
                 "Buffer: retracting %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -1074,4 +1184,10 @@ class Buffer:
 
 
 def load_config(config):
+    # Handles the bare [buffer] section.
+    return Buffer(config)
+
+
+def load_config_prefix(config):
+    # Handles named sections like [buffer my_buf] for multi-buffer setups.
     return Buffer(config)
