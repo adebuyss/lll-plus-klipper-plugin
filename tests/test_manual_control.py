@@ -162,9 +162,12 @@ class TestManualFeedAutoStop:
 
         reactor._monotonic = 15.5
         enabled_buf._control_timer_cb(15.5)
-        assert enabled_buf.state == STATE_IDLE
-        assert enabled_buf.motor_direction == STOP
-        assert enabled_buf.auto_enabled is False
+        # After auto-stop, auto_enabled is preserved and the buffer
+        # returns to STOPPED (then FEEDING once _sync() completes) so
+        # normal control resumes instead of silently disabling.
+        assert enabled_buf.state in (STATE_STOPPED, STATE_FEEDING)
+        assert enabled_buf.motor_direction in (STOP, FORWARD)
+        assert enabled_buf.auto_enabled is True
 
     def test_no_stop_on_brief_full(self, enabled_buf, reactor):
         enabled_buf.state = STATE_MANUAL_FEED
@@ -181,3 +184,53 @@ class TestManualFeedAutoStop:
         reactor._monotonic = 12.5
         enabled_buf._control_timer_cb(12.5)
         assert enabled_buf.state == STATE_MANUAL_FEED
+
+
+class TestButtonHeldOverridesAutoStop:
+    def test_button_held_feed_ignores_full_sensor(
+            self, enabled_buf, reactor):
+        """Holding the feed button keeps MANUAL_FEED running even if the
+        full sensor triggers — user's explicit intent."""
+        enabled_buf.state = STATE_MANUAL_FEED
+        enabled_buf.motor_direction = FORWARD
+        enabled_buf._feed_button_pressed = True
+        set_sensors(enabled_buf, full=True)
+
+        reactor._monotonic = 10.0
+        enabled_buf._control_timer_cb(10.0)
+        reactor._monotonic = 15.5
+        enabled_buf._control_timer_cb(15.5)
+        # Still manual feeding; auto-stop skipped while button is held.
+        assert enabled_buf.state == STATE_MANUAL_FEED
+        assert enabled_buf.auto_enabled is True
+
+    def test_button_held_retract_ignores_empty_sensor(
+            self, enabled_buf, reactor):
+        """Holding the retract button keeps MANUAL_RETRACT running even
+        if the empty sensor triggers."""
+        enabled_buf.state = STATE_MANUAL_RETRACT
+        enabled_buf.motor_direction = "back"
+        enabled_buf._retract_button_pressed = True
+        set_sensors(enabled_buf, empty=True)
+
+        reactor._monotonic = 10.0
+        enabled_buf._control_timer_cb(10.0)
+        # Still manual retracting; empty-sensor auto-stop skipped.
+        assert enabled_buf.state == STATE_MANUAL_RETRACT
+        assert enabled_buf.auto_enabled is True
+
+    def test_non_button_retract_auto_stop_preserves_auto_enabled(
+            self, enabled_buf, reactor):
+        """BUFFER_RETRACT continuous hitting empty sensor should stop the
+        motor but leave auto_enabled intact so the buffer returns to
+        normal control after the motor stops."""
+        enabled_buf.state = STATE_MANUAL_RETRACT
+        enabled_buf.motor_direction = "back"
+        enabled_buf._retract_button_pressed = False  # not button-held
+        set_sensors(enabled_buf, empty=True)
+
+        reactor._monotonic = 10.0
+        enabled_buf._control_timer_cb(10.0)
+        assert enabled_buf.auto_enabled is True
+        # State should have returned to STOPPED/FEEDING via _sync().
+        assert enabled_buf.state in (STATE_STOPPED, STATE_FEEDING)

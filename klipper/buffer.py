@@ -164,7 +164,18 @@ class Buffer:
         # State
         self.state = STATE_DISABLED
         self.auto_enabled = False
-        self.sensor_states = {"empty": False, "middle": False, "full": False}
+        # Default sensor_states to True (all sensors "triggered").
+        # Rationale: Klipper's buttons module fires callbacks only on
+        # state CHANGES from an internal default of 0.  For our `^!`
+        # inverted hall pins, a sensor that is actively triggered at
+        # boot reads raw HIGH → post-invert 0 → matches the internal
+        # default and does NOT fire an initial callback.  Inactive
+        # sensors read raw LOW → post-invert 1 → differ from default
+        # and DO fire an initial callback with state=1 → `not bool(1)`
+        # = False.  Starting True means inactive sensors flip to False
+        # via the initial report, and active-at-boot sensors correctly
+        # stay True without needing a callback.
+        self.sensor_states = {"empty": True, "middle": True, "full": True}
         self.material_present = False
         self.error_msg = ""
         self.motor_direction = STOP
@@ -176,6 +187,12 @@ class Buffer:
         # klippy:ready — we need to absorb those without treating them
         # as physical events (e.g. filament inserted).
         self._initial_state_received = False
+        # Track whether any hall-sensor callback has fired.  sensor_states
+        # defaults to all-True (see above) but remains unreliable until at
+        # least one inactive-at-boot sensor has reported and flipped to
+        # False.  _update_rotation_distance defers while this is False to
+        # avoid spurious sensor-conflict errors during the boot window.
+        self._any_sensor_reported = False
 
         # Safety timeout tracking
         self._safety_zone_start = 0.0  # when we entered EMPTY or FULL
@@ -340,6 +357,7 @@ class Buffer:
     def _make_sensor_callback(self, sensor_name):
         def callback(eventtime, state):
             self.sensor_states[sensor_name] = not bool(state)
+            self._any_sensor_reported = True
             if self.auto_enabled and self.state not in (
                     STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
                     STATE_ERROR, STATE_DISABLED):
@@ -521,6 +539,14 @@ class Buffer:
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
+        # Defer until at least one hall-sensor callback has fired.
+        # sensor_states defaults to all-True at boot so that active-at-
+        # boot sensors (which don't fire initial callbacks under Klipper's
+        # buttons module change-detection logic) are correctly reflected.
+        # During the short window before the first callback, the default
+        # would spuriously look like a sensor conflict.
+        if not self._any_sensor_reported:
+            return
         zone = self._compute_zone()
         if zone is None:
             self._handle_error(
@@ -663,32 +689,50 @@ class Buffer:
             if current_extruder != self._last_active_extruder:
                 self._handle_extruder_change(current_extruder)
                 self._last_active_extruder = current_extruder
-        # Manual feed auto-stop on sustained full sensor
+        # Manual feed auto-stop on sustained full sensor.  Skip for
+        # button-held feed (user's explicit intent — release to stop).
+        # Preserves auto_enabled so the buffer returns to normal control
+        # instead of silently disabling itself.
         if self.state == STATE_MANUAL_FEED:
-            if self.sensor_states["full"]:
+            if (self.sensor_states["full"]
+                    and not self._feed_button_pressed):
                 if self._manual_feed_full_start == 0.0:
                     self._manual_feed_full_start = eventtime
                 elif (eventtime - self._manual_feed_full_start
                       >= self.manual_feed_full_timeout):
                     self._stop_manual()
-                    self.state = STATE_IDLE
-                    self.auto_enabled = False
+                    if self.auto_enabled:
+                        self.state = STATE_STOPPED
+                        self._sync()
+                    else:
+                        self.state = STATE_IDLE
                     self._manual_feed_full_start = 0.0
                     self.gcode.respond_info(
-                        "Buffer: manual feed stopped - full zone "
+                        "Buffer[%s]: manual feed stopped - full zone "
                         "sustained for %.0fs"
-                        % self.manual_feed_full_timeout)
+                        % (self.short_name,
+                           self.manual_feed_full_timeout))
             else:
                 self._manual_feed_full_start = 0.0
             return eventtime + self.control_interval
-        # Manual retract auto-stop on empty sensor — but NOT during
-        # retract-until-clear, which needs to keep going until the
-        # filament presence switch clears (material_present = False).
+        # Manual retract auto-stop on empty sensor.  Skip for:
+        #   * retract-until-clear (stops on material_present instead)
+        #   * button-held retract (user's explicit intent — they can
+        #     release the button to stop)
+        # Also: this is a soft stop (back to STOPPED/IDLE) that preserves
+        # auto_enabled.  The prior behavior of clearing auto_enabled meant
+        # a button-held retract that brushed the empty sensor would
+        # silently disable the buffer, requiring a manual BUFFER_ENABLE.
         if self.state == STATE_MANUAL_RETRACT:
-            if self.sensor_states["empty"] and not self._retract_until_clear:
+            if (self.sensor_states["empty"]
+                    and not self._retract_until_clear
+                    and not self._retract_button_pressed):
                 self._stop_manual()
-                self.state = STATE_IDLE
-                self.auto_enabled = False
+                if self.auto_enabled:
+                    self.state = STATE_STOPPED
+                    self._sync()
+                else:
+                    self.state = STATE_IDLE
                 self.gcode.respond_info(
                     "Buffer[%s]: manual retract stopped - empty sensor"
                     % self.short_name)

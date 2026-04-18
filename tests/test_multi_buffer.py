@@ -325,3 +325,67 @@ class TestMultipleBuffers:
         # unbound buffers.
         assert any("multiple buffers without 'extruder'" in r.message
                    for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Initial sensor / material callback behavior
+# ---------------------------------------------------------------------------
+
+
+class TestInitialSensorState:
+    def test_sensor_states_default_all_true(self):
+        """At boot, sensor_states should be True for all hall sensors so
+        active-at-boot sensors (whose callbacks won't fire under Klipper's
+        change-only reporting) are correctly reflected."""
+        printer = _make_printer_with_extruders()
+        buf = _make_buffer(printer, "buffer")
+        _fire_ready(printer)
+        # Before any callbacks, all should default to True.
+        assert buf.sensor_states == {
+            "empty": True, "middle": True, "full": True}
+        assert buf._any_sensor_reported is False
+
+    def test_update_rotation_distance_defers_until_sensor_reports(self):
+        """With default {all: True} (a would-be conflict), the update
+        must short-circuit so we don't trigger a spurious error."""
+        printer = _make_printer_with_extruders()
+        buf = _make_buffer(printer, "buffer")
+        _fire_ready(printer)
+        buf.auto_enabled = True
+        # All three True would normally be a sensor conflict.
+        buf._update_rotation_distance(1.0)
+        # No error was raised because we deferred.
+        assert buf.error_msg == ""
+        assert buf.state != "error"
+
+    def test_inactive_sensor_callback_flips_to_false(self, printer, buf):
+        """A sensor that's inactive at boot fires a callback with state=1,
+        flipping sensor_states[name] to False.  _any_sensor_reported also
+        flips so subsequent updates proceed."""
+        # buf fixture already clears _any_sensor_reported state; simulate
+        # a fresh startup by resetting the flags.
+        buf._any_sensor_reported = False
+        buf.sensor_states = {"empty": True, "middle": True, "full": True}
+        # Fire the middle sensor callback with state=1 (inactive).
+        cb = printer.buttons.callbacks["PE1"]
+        cb(1.0, 1)
+        assert buf.sensor_states["middle"] is False
+        assert buf._any_sensor_reported is True
+
+    def test_material_callback_first_call_is_absorbed(self, printer, buf):
+        """The first material callback after boot (from the initial MCU
+        report) must not trigger auto-enable or initial fill, even if
+        filament is present."""
+        # Reset the guard to simulate a fresh buffer that hasn't seen
+        # the initial material report yet.
+        buf._initial_state_received = False
+        buf.material_present = False
+        buf.auto_enabled = False
+        cb = printer.buttons.callbacks["PE3"]  # material_switch_pin
+        cb(1.0, 1)  # initial report says filament is present
+        # Guard absorbed — no auto-enable, no fill.
+        assert buf.auto_enabled is False
+        assert buf._initial_fill_until == 0.0
+        # But material_present was still recorded.
+        assert buf.material_present is True
+        assert buf._initial_state_received is True

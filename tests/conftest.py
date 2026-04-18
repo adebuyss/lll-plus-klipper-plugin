@@ -428,6 +428,14 @@ def buf(config, printer):
     # (material switch = no filament).  This consumes the _initial_state_received
     # guard so subsequent test callbacks are treated as real events.
     b._initial_state_received = True
+    # Tests use set_sensors() which bypasses callbacks; pretend at least
+    # one sensor callback has fired so _update_rotation_distance runs.
+    b._any_sensor_reported = True
+    # Reset sensor_states to all-False — the "inactive" baseline most
+    # tests expect.  In production, inactive sensors flip to False via
+    # their initial callbacks; active sensors stay True.  Tests that care
+    # about sensor state call set_sensors() explicitly.
+    b.sensor_states = {"empty": False, "middle": False, "full": False}
     return b
 
 
