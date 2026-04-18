@@ -424,6 +424,10 @@ def buf(config, printer):
     # Fire ready
     for handler in printer.event_handlers.get("klippy:ready", []):
         handler()
+    # Simulate the initial pin-state report from Klipper's buttons module
+    # (material switch = no filament).  This consumes the _initial_state_received
+    # guard so subsequent test callbacks are treated as real events.
+    b._initial_state_received = True
     return b
 
 

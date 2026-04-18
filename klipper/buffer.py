@@ -170,6 +170,12 @@ class Buffer:
         self.motor_direction = STOP
         self._current_zone = None
         self._prev_zone = None
+        # Guard: suppress insertion/fill logic until the first round of
+        # pin-state reports has been consumed.  Klipper's buttons module
+        # fires callbacks for the initial pin state shortly after
+        # klippy:ready — we need to absorb those without treating them
+        # as physical events (e.g. filament inserted).
+        self._initial_state_received = False
 
         # Safety timeout tracking
         self._safety_zone_start = 0.0  # when we entered EMPTY or FULL
@@ -347,6 +353,15 @@ class Buffer:
     def _material_callback(self, eventtime, state):
         was_present = self.material_present
         self.material_present = bool(state)
+        if not self._initial_state_received:
+            # First report from the MCU after startup — record the state
+            # but do NOT treat it as a physical insertion or removal.
+            self._initial_state_received = True
+            if self.material_present:
+                logging.info(
+                    "buffer[%s]: filament already present at startup"
+                    % self.short_name)
+            return
         if not self.material_present and self.auto_enabled:
             self._cancel_fill()
             self._unsync()
@@ -356,9 +371,9 @@ class Buffer:
         elif self.material_present and not was_present:
             if self.state in (STATE_DISABLED, STATE_ERROR):
                 logging.info(
-                    "buffer: filament detected but buffer is %s; "
+                    "buffer[%s]: filament detected but buffer is %s; "
                     "use BUFFER_ENABLE or BUFFER_CLEAR_ERROR"
-                    % self.state)
+                    % (self.short_name, self.state))
                 return
             self.auto_enabled = True
             self.state = STATE_STOPPED
@@ -367,7 +382,8 @@ class Buffer:
             logging.info("buffer[%s]: filament detected, starting fill"
                          % self.short_name)
             self.gcode.respond_info(
-                "Buffer: filament detected, starting fill")
+                "Buffer[%s]: filament detected, starting fill"
+                % self.short_name)
             self._do_initial_fill(eventtime)
 
     # --- Extruder sync/unsync ---
@@ -665,14 +681,17 @@ class Buffer:
             else:
                 self._manual_feed_full_start = 0.0
             return eventtime + self.control_interval
-        # Manual retract auto-stop on empty sensor
+        # Manual retract auto-stop on empty sensor — but NOT during
+        # retract-until-clear, which needs to keep going until the
+        # filament presence switch clears (material_present = False).
         if self.state == STATE_MANUAL_RETRACT:
-            if self.sensor_states["empty"]:
+            if self.sensor_states["empty"] and not self._retract_until_clear:
                 self._stop_manual()
                 self.state = STATE_IDLE
                 self.auto_enabled = False
                 self.gcode.respond_info(
-                    "Buffer: manual retract stopped - empty sensor")
+                    "Buffer[%s]: manual retract stopped - empty sensor"
+                    % self.short_name)
             return eventtime + self.control_interval
 
         if not self.auto_enabled:
@@ -1151,7 +1170,8 @@ class Buffer:
                 self._continuous_feed_speed, self.manual_accel)
         except Exception as e:
             logging.warning(
-                "buffer: retract_until_clear chunk failed: %s" % e)
+                "buffer[%s]: retract_until_clear chunk failed: %s"
+                % (self.short_name, e))
             self._retract_until_clear = False
             return
         self.reactor.register_callback(self._retract_until_clear_cb)
