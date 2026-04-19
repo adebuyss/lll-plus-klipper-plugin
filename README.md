@@ -253,7 +253,7 @@ Existing single-buffer setups are fully backward compatible — `[buffer]` with 
 
 ### Status fields
 
-Each buffer registers as a separate Klipper object (`buffer`, `buffer buffer_t0`, etc.) for Moonraker/Mainsail/Fluidd. The status dict now includes `name` and `extruder` fields so UIs can distinguish buffers.
+Each buffer registers as a separate Klipper object (`buffer`, `buffer buffer_t0`, etc.) for Moonraker/Mainsail/Fluidd. The status dict includes `name` and `bound_extruder` fields so UIs can distinguish buffers. The binding field is deliberately *not* called `extruder` — Mainsail and some Fluidd panels treat any printer object that exposes an `extruder` status field as part of that extruder's control card, which would cause the Extruder dashboard card to render buffer state instead of hotend state.
 
 ## Tests
 

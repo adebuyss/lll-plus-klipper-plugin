@@ -1013,7 +1013,7 @@ class Buffer:
     def get_status(self, eventtime):
         return {
             "name": self.short_name,
-            "extruder": self.extruder_name,
+            "bound_extruder": self.extruder_name,
             "state": self.state,
             "motor_direction": self.motor_direction,
             "sensor_empty": self.sensor_states["empty"],
@@ -1066,7 +1066,7 @@ class Buffer:
             "  Printing: %s"
             % (
                 status["name"],
-                status["extruder"] or "(any active)",
+                status["bound_extruder"] or "(any active)",
                 status["state"],
                 status["motor_direction"],
                 status["sensor_empty"],
