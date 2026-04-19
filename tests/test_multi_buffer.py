@@ -98,10 +98,14 @@ class TestConfigParsing:
         buf = _make_buffer(printer, "buffer t0", extruder="extruder1")
         assert buf.extruder_name == "extruder1"
 
-    def test_get_status_includes_name_and_extruder(self, buf):
+    def test_get_status_includes_name_and_bound_extruder(self, buf):
         status = buf.get_status(0.0)
         assert status["name"] == "buffer"
-        assert status["extruder"] is None
+        assert status["bound_extruder"] is None
+        # Must NOT expose a plain "extruder" key — Mainsail-adjacent UIs
+        # treat that as a signal the object belongs to an extruder's
+        # control card and render buffer state inside it.
+        assert "extruder" not in status
 
 
 # ---------------------------------------------------------------------------
