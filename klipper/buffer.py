@@ -92,7 +92,11 @@ class Buffer:
         # this extruder is the active one (enables multi-extruder setups).
         # When None, the buffer follows whatever extruder is currently
         # active and re-syncs on tool changes (single-buffer default).
-        self.extruder_name = config.get("extruder", None)
+        # Named 'bound_extruder' (not 'extruder') because Mainsail and some
+        # Fluidd panels treat any config section whose settings expose an
+        # 'extruder' field as part of that extruder's dashboard card and
+        # would render buffer state inside the main Extruder panel.
+        self.extruder_name = config.get("bound_extruder", None)
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
         # Absolute rotation_distance multipliers, matching AFC_buffer.py.
