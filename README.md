@@ -200,9 +200,60 @@ If a safety zone (EMPTY or FULL) persists for `fault_escalation_time` seconds, t
 | ERROR              | STOPPED/IDLE   | `BUFFER_CLEAR_ERROR` or 2s both-button hold      |
 | any                | DISABLED       | `BUFFER_DISABLE` or `klippy:shutdown`            |
 
-### Limitations
+## Multi-Buffer / Multi-Extruder Support
 
-- **Single extruder only.** The buffer syncs to whichever extruder is active at `klippy:ready`. Multi-extruder tool changes are not handled.
+Multi-extruder printers can declare a separate buffer per extruder. Each buffer is fully independent — its own sensors, stepper, state machine, and rotation_distance feedback loop.
+
+### Named config sections
+
+Use `[buffer <name>]` to declare additional buffers alongside (or instead of) the bare `[buffer]` section:
+
+```ini
+[buffer buffer_t0]
+stepper: buffer_stepper_t0
+extruder: extruder
+sensor_empty_pin: ...
+...
+
+[buffer buffer_t1]
+stepper: buffer_stepper_t1
+extruder: extruder1
+sensor_empty_pin: ...
+...
+```
+
+### Optional `extruder` parameter
+
+| `extruder` setting | Behavior |
+|--------------------|----------|
+| Set (e.g. `extruder: extruder1`) | **Bound.** Buffer only syncs while `extruder1` is the active extruder. On tool change: auto-syncs when its extruder becomes active, auto-unsyncs when another extruder becomes active. |
+| Omitted | **Unbound.** Buffer follows whatever extruder is currently active; re-syncs to the new extruder on every tool change. This is the default single-buffer behavior. |
+
+Tool changes are detected by polling the active extruder in the control timer (every `control_interval`, default 0.5s), so any tool-change mechanism (`ACTIVATE_EXTRUDER`, `T0`/`T1` macros, etc.) works without additional configuration.
+
+Multiple unbound buffers are allowed but log a warning at startup — two unbound buffers will both follow the same active extruder, which is usually a misconfiguration.
+
+### Targeting buffers in GCode
+
+All `BUFFER_*` commands accept an optional `BUFFER=<name>` parameter to select a specific buffer:
+
+```
+BUFFER_STATUS BUFFER=buffer_t0
+BUFFER_ENABLE BUFFER=buffer_t1
+BUFFER_FEED BUFFER=buffer_t0 DIST=10
+```
+
+| Configuration | `BUFFER_STATUS` alone | `BUFFER_STATUS BUFFER=name` |
+|--------------|-----------------------|-----------------------------|
+| Only `[buffer]` | Targets `[buffer]` | `BUFFER=buffer` targets `[buffer]` |
+| `[buffer]` + `[buffer other]` | Targets `[buffer]` (bare section is the default) | `BUFFER=other` targets the named buffer |
+| Only `[buffer t0]` + `[buffer t1]` (no bare `[buffer]`) | Error: `BUFFER` param required | `BUFFER=t0` targets the named buffer |
+
+Existing single-buffer setups are fully backward compatible — `[buffer]` with no `extruder` param behaves exactly as before, and every `BUFFER_*` command works without a `BUFFER=` argument.
+
+### Status fields
+
+Each buffer registers as a separate Klipper object (`buffer`, `buffer buffer_t0`, etc.) for Moonraker/Mainsail/Fluidd. The status dict includes `name` and `bound_extruder` fields so UIs can distinguish buffers. The binding field is deliberately *not* called `extruder` — Mainsail and some Fluidd panels treat any printer object that exposes an `extruder` status field as part of that extruder's control card, which would cause the Extruder dashboard card to render buffer state instead of hotend state.
 
 ## Tests
 

@@ -96,10 +96,55 @@ class MockGcode:
         self.responses = []
         self.ready_gcode_handlers = {}
         self.scripts_run = []
+        # mux_commands[cmd] = (key, {value: handler})
+        self.mux_commands = {}
 
     def register_command(self, name, handler, desc=""):
         self.commands[name] = handler
         self.ready_gcode_handlers[name] = handler
+
+    def register_mux_command(self, cmd, key, value, handler, desc=""):
+        """Mimic Klipper's mux command dispatch.
+
+        Tests can dispatch with dispatch_mux(cmd, gcmd) which reads the
+        key param from gcmd and routes to the right handler.  For
+        backward-compat with tests that call mock.commands[name] directly,
+        the default (value=None) handler is also exposed as commands[name].
+        """
+        entry = self.mux_commands.setdefault(cmd, (key, {}))
+        _, values = entry
+        values[value] = handler
+        self.ready_gcode_handlers[cmd] = handler
+        # Expose a plain-command alias for simple tests.  If a value=None
+        # handler is registered, that's the default; otherwise expose the
+        # most recently registered handler so existing single-buffer
+        # tests that look up commands[name] still work.
+        if None in values:
+            self.commands[cmd] = values[None]
+        elif cmd not in self.commands:
+            self.commands[cmd] = handler
+
+    def dispatch_mux(self, cmd, gcmd):
+        """Simulate Klipper's mux dispatch: read the key param and route.
+
+        Matches Klipper's _cmd_mux_wrapper semantics:
+        - If None is registered, the key param is optional (missing -> None)
+        - If None is not registered, the key param is required
+        - If the param is provided but not registered, raise Unknown
+        """
+        entry = self.mux_commands.get(cmd)
+        if entry is None:
+            raise Exception("No mux command registered: %s" % cmd)
+        key, values = entry
+        if None in values:
+            key_val = gcmd._params.get(key, None)
+        else:
+            if key not in gcmd._params:
+                raise Exception("Missing required param: %s" % key)
+            key_val = gcmd._params[key]
+        if key_val not in values:
+            raise Exception("Unknown %s: %s" % (key, key_val))
+        return values[key_val](gcmd)
 
     def respond_info(self, msg):
         self.responses.append(msg)
@@ -124,6 +169,12 @@ class MockGcmd:
         if val is _SENTINEL:
             raise self._error("Missing required param: %s" % name)
         return float(val)
+
+    def get(self, name, default=_SENTINEL):
+        val = self._params.get(name, default)
+        if val is _SENTINEL:
+            raise self._error("Missing required param: %s" % name)
+        return val
 
     def respond_info(self, msg):
         self.responses.append(msg)
@@ -233,6 +284,10 @@ class MockToolhead:
     def get_extruder(self):
         return self._extruder
 
+    def set_extruder(self, extruder):
+        """Test helper: swap the active extruder."""
+        self._extruder = extruder
+
     def flush_step_generation(self):
         self.flush_count += 1
 
@@ -307,6 +362,19 @@ class MockPrinter:
             return default
         raise Exception("Unknown object: %s" % name)
 
+    def lookup_objects(self, module=None):
+        """Return [(name, obj)] for all registered objects optionally
+        filtered to those whose config section starts with `module`."""
+        if module is None:
+            return list(self._objects.items())
+        prefix = module
+        return [(name, obj) for name, obj in self._objects.items()
+                if name == prefix or name.startswith(prefix + " ")]
+
+    def add_object(self, name, obj):
+        """Test helper: register an object for lookup_object/lookup_objects."""
+        self._objects[name] = obj
+
     def load_object(self, config, name):
         if name == "buttons":
             return self.buttons
@@ -356,6 +424,18 @@ def buf(config, printer):
     # Fire ready
     for handler in printer.event_handlers.get("klippy:ready", []):
         handler()
+    # Simulate the initial pin-state report from Klipper's buttons module
+    # (material switch = no filament).  This consumes the _initial_state_received
+    # guard so subsequent test callbacks are treated as real events.
+    b._initial_state_received = True
+    # Tests use set_sensors() which bypasses callbacks; pretend at least
+    # one sensor callback has fired so _update_rotation_distance runs.
+    b._any_sensor_reported = True
+    # Reset sensor_states to all-False — the "inactive" baseline most
+    # tests expect.  In production, inactive sensors flip to False via
+    # their initial callbacks; active sensors stay True.  Tests that care
+    # about sensor state call set_sensors() explicitly.
+    b.sensor_states = {"empty": False, "middle": False, "full": False}
     return b
 
 
