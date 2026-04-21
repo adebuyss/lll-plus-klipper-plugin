@@ -55,7 +55,7 @@ def _make_buffer(printer, section_name, stepper_name="buffer_stepper",
     values["_name"] = section_name
     values["stepper"] = stepper_name
     if extruder is not None:
-        values["extruder"] = extruder
+        values["bound_extruder"] = extruder
     # Each buffer needs distinct sensor pins to avoid collisions when
     # multiple buffers are registered in one printer.  The MockButtons
     # mock doesn't validate, but we still give each one a unique set to

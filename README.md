@@ -211,23 +211,25 @@ Use `[buffer <name>]` to declare additional buffers alongside (or instead of) th
 ```ini
 [buffer buffer_t0]
 stepper: buffer_stepper_t0
-extruder: extruder
+bound_extruder: extruder
 sensor_empty_pin: ...
 ...
 
 [buffer buffer_t1]
 stepper: buffer_stepper_t1
-extruder: extruder1
+bound_extruder: extruder1
 sensor_empty_pin: ...
 ...
 ```
 
-### Optional `extruder` parameter
+### Optional `bound_extruder` parameter
 
-| `extruder` setting | Behavior |
-|--------------------|----------|
-| Set (e.g. `extruder: extruder1`) | **Bound.** Buffer only syncs while `extruder1` is the active extruder. On tool change: auto-syncs when its extruder becomes active, auto-unsyncs when another extruder becomes active. |
+| `bound_extruder` setting | Behavior |
+|--------------------------|----------|
+| Set (e.g. `bound_extruder: extruder1`) | **Bound.** Buffer only syncs while `extruder1` is the active extruder. On tool change: auto-syncs when its extruder becomes active, auto-unsyncs when another extruder becomes active. |
 | Omitted | **Unbound.** Buffer follows whatever extruder is currently active; re-syncs to the new extruder on every tool change. This is the default single-buffer behavior. |
+
+The parameter is named `bound_extruder` (not `extruder`) on purpose: Mainsail and some Fluidd panels treat any printer object whose config exposes an `extruder` field as part of that extruder's dashboard card, which would render buffer state inside the main Extruder panel. `bound_extruder` sidesteps that heuristic.
 
 Tool changes are detected by polling the active extruder in the control timer (every `control_interval`, default 0.5s), so any tool-change mechanism (`ACTIVATE_EXTRUDER`, `T0`/`T1` macros, etc.) works without additional configuration.
 
@@ -249,7 +251,7 @@ BUFFER_FEED BUFFER=buffer_t0 DIST=10
 | `[buffer]` + `[buffer other]` | Targets `[buffer]` (bare section is the default) | `BUFFER=other` targets the named buffer |
 | Only `[buffer t0]` + `[buffer t1]` (no bare `[buffer]`) | Error: `BUFFER` param required | `BUFFER=t0` targets the named buffer |
 
-Existing single-buffer setups are fully backward compatible — `[buffer]` with no `extruder` param behaves exactly as before, and every `BUFFER_*` command works without a `BUFFER=` argument.
+Single-buffer setups that omit `bound_extruder` behave exactly like the original single-buffer default, and every `BUFFER_*` command works without a `BUFFER=` argument.
 
 ### Status fields
 
