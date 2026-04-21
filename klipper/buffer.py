@@ -817,7 +817,7 @@ class Buffer:
                 return
             if self.state == STATE_ERROR:
                 return
-            self._start_manual_feed(eventtime)
+            self._start_continuous_feed(FORWARD, self.manual_speed)
         else:
             # Release
             self._cancel_error_clear_hold()
@@ -836,7 +836,7 @@ class Buffer:
                 return
             if self.state == STATE_ERROR:
                 return
-            self._start_manual_retract(eventtime)
+            self._start_continuous_feed(BACK, self.manual_speed)
         else:
             self._cancel_error_clear_hold()
             if self.state == STATE_MANUAL_RETRACT:
@@ -895,38 +895,6 @@ class Buffer:
         return self.reactor.NEVER
 
     # --- Manual feed/retract ---
-
-    def _start_manual_feed(self, eventtime):
-        """Begin manual forward feed (button or command)."""
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_FEED
-        self.motor_direction = FORWARD
-        self._manual_feed_full_start = 0.0
-        self._do_manual_chunk(FORWARD)
-
-    def _start_manual_retract(self, eventtime):
-        """Begin manual retract (button or command)."""
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_RETRACT
-        self.motor_direction = BACK
-        self._do_manual_chunk(BACK)
-
-    def _do_manual_chunk(self, direction):
-        """Issue a single manual move chunk."""
-        if self.force_move is None:
-            return
-        stepper = self.extruder_stepper.stepper
-        dist = self._manual_chunk_dist
-        if direction == BACK:
-            dist = -dist
-        try:
-            self.force_move.manual_move(
-                stepper, dist, self.manual_speed, self.manual_accel)
-        except Exception as e:
-            logging.warning("buffer[%s]: manual move failed: %s"
-                            % (self.short_name, e))
 
     def _start_continuous_feed(self, direction, speed):
         """Feed/retract continuously via chunked moves until stopped.
