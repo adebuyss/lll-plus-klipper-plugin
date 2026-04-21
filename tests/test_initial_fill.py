@@ -125,10 +125,15 @@ class TestInitialFillClear:
         assert buf._initial_fill_until == 0.0
         assert buf.state == STATE_MANUAL_FEED
 
-        # Pending fill chunk callback should not issue more fill chunks
+        # Fire only the pending fill-chunk callback (first in the queue).
+        # It should see _initial_fill_until == 0.0 and bail without issuing
+        # another move. We don't drain the rest of the queue because the
+        # manual continuous-feed loop keeps re-scheduling itself while the
+        # button is "held" — that behavior is covered by its own tests.
         chunks_before = len(force_move.moves)
-        reactor.flush_callbacks()
-        # Only the manual feed chunk, no more fill chunks
+        fill_cb = reactor._pending_callbacks.pop(0)
+        fill_cb(reactor._monotonic)
+        assert len(force_move.moves) == chunks_before
         assert buf._initial_fill_until == 0.0
 
     def test_fill_cancelled_by_buffer_feed_command(self, buf, buttons,
