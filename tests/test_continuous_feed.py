@@ -21,8 +21,8 @@ class TestContinuousFeed:
         assert buf.motor_direction == FORWARD
         assert len(force_move.moves) > 0
         assert force_move.moves[-1][1] > 0  # positive distance
-        # A continuation callback should be pending
-        assert len(reactor._pending_callbacks) > 0
+        # A continuation timer should be armed with a finite waketime.
+        assert any(wake != reactor.NEVER for _cb, wake in reactor._timers)
 
     def test_feed_continuous_stops_on_full(self, buf, force_move, reactor):
         reactor._monotonic = 1.0
@@ -48,13 +48,13 @@ class TestContinuousFeed:
         buf.cmd_BUFFER_FEED(gcmd)
         assert buf.state == STATE_MANUAL_FEED
 
-        # BUFFER_STOP changes state so pending chunk callback aborts
+        # BUFFER_STOP changes state so pending chunk timer aborts
         buf.cmd_BUFFER_STOP(MockGcmd("BUFFER_STOP"))
         assert buf.motor_direction == STOP
 
-        # Pending callback should see wrong state and not issue more chunks
+        # Due timer should see wrong state and not issue more chunks
         chunks_before = len(force_move.moves)
-        reactor.flush_callbacks()
+        reactor.advance_time(1.0)
         assert len(force_move.moves) == chunks_before
 
     def test_feed_continuous_custom_speed(self, buf, force_move, reactor):
@@ -97,5 +97,5 @@ class TestContinuousRetract:
         assert buf.motor_direction == STOP
 
         chunks_before = len(force_move.moves)
-        reactor.flush_callbacks()
+        reactor.advance_time(1.0)
         assert len(force_move.moves) == chunks_before

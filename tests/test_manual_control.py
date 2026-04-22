@@ -78,19 +78,19 @@ class TestButtonHoldFeedsContinuously:
             self, buf, buttons, reactor, force_move):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
-        # First chunk issued and a continuation is pending in the reactor.
+        # First chunk issued and a continuation timer is armed.
         assert len(force_move.moves) == 1
-        assert len(reactor._pending_callbacks) > 0
+        assert any(wake != reactor.NEVER
+                   for _cb, wake in reactor._timers)
 
     def test_feed_button_held_produces_multiple_chunks(
             self, buf, buttons, reactor, force_move):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
         assert buf.state == STATE_MANUAL_FEED
-        # Fire three reactor ticks; each should issue another chunk.
+        # Advance past each chunk's wake time; each should issue a new chunk.
         for _ in range(3):
-            cb = reactor._pending_callbacks.pop(0)
-            cb(reactor._monotonic)
+            reactor.advance_time(1.0)
         assert len(force_move.moves) == 4
         # All chunks feed forward.
         assert all(m[1] > 0 for m in force_move.moves)
@@ -101,8 +101,7 @@ class TestButtonHoldFeedsContinuously:
         buttons.callbacks["PE5"](10.0, 1)
         assert buf.state == STATE_MANUAL_RETRACT
         for _ in range(3):
-            cb = reactor._pending_callbacks.pop(0)
-            cb(reactor._monotonic)
+            reactor.advance_time(1.0)
         assert len(force_move.moves) == 4
         assert all(m[1] < 0 for m in force_move.moves)
 
@@ -111,10 +110,10 @@ class TestButtonHoldFeedsContinuously:
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
         buttons.callbacks["PE4"](10.5, 0)
-        # After release, any pending chunk callback should see state != MANUAL
-        # and not issue another move.
+        # After release, any due chunk timer should see state != MANUAL and
+        # not issue another move.
         chunks_before = len(force_move.moves)
-        reactor.flush_callbacks()
+        reactor.advance_time(1.0)
         assert len(force_move.moves) == chunks_before
 
 

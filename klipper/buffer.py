@@ -212,6 +212,7 @@ class Buffer:
         self._manual_chunk_dist = self.manual_move_distance
         self._continuous_feed_direction = STOP
         self._continuous_feed_speed = 0.0
+        self._continuous_chunk_timer = None
         self._retract_until_clear = False
 
         # Print state tracking
@@ -912,15 +913,28 @@ class Buffer:
         self._manual_feed_full_start = 0.0
         self._continuous_feed_direction = direction
         self._continuous_feed_speed = speed
-        self._do_continuous_chunk(self.reactor.monotonic())
+        next_wake = self._do_continuous_chunk(self.reactor.monotonic())
+        if self._continuous_chunk_timer is None:
+            self._continuous_chunk_timer = self.reactor.register_timer(
+                self._do_continuous_chunk, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._continuous_chunk_timer, next_wake)
 
     def _do_continuous_chunk(self, eventtime):
-        """Issue one chunk of a continuous feed, schedule the next."""
+        """Issue one chunk of a continuous feed; return the next waketime.
+
+        Scheduled via a reactor timer so chunks are paced by real-time
+        chunk duration. Queuing faster than real-time (e.g. via
+        reactor.register_callback) overflows the MCU step queue and
+        triggers "Rescheduled timer in the past" shutdowns when the
+        button is held long enough.
+        """
         # Abort if state changed (stop, disable, error, button release)
         if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
-            return
+            return self.reactor.NEVER
         if self.force_move is None:
-            return
+            return self.reactor.NEVER
         stepper = self.extruder_stepper.stepper
         dist = self._manual_chunk_dist
         if self._continuous_feed_direction == BACK:
@@ -932,12 +946,11 @@ class Buffer:
         except Exception as e:
             logging.warning("buffer[%s]: continuous feed chunk failed: %s"
                             % (self.short_name, e))
-            return
-        # Schedule next chunk — reactor processes sensor callbacks between
-        self.reactor.register_callback(self._continuous_chunk_cb)
-
-    def _continuous_chunk_cb(self, eventtime):
-        self._do_continuous_chunk(eventtime)
+            return self.reactor.NEVER
+        # Fire again just before this chunk finishes so motion stays
+        # continuous without racing ahead of the MCU.
+        chunk_time = self._manual_chunk_dist / self._continuous_feed_speed
+        return self.reactor.monotonic() + chunk_time * 0.9
 
     def _stop_manual(self):
         """Stop any pending manual move state."""
