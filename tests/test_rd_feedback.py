@@ -169,3 +169,91 @@ class TestFaultEscalation:
         enabled_buf._update_rotation_distance(10.0)
         assert enabled_buf._safety_escalated is False
         assert enabled_buf._rd_multiplier == 1.0
+
+
+class TestFlushBeforeSetRotationDistance:
+    """Regression for MCU 'Rescheduled timer in the past' shutdown:
+    set_rotation_distance must be preceded by flush_step_generation,
+    matching upstream Klipper's cmd_SET_E_ROTATION_DISTANCE."""
+
+    def test_repeat_same_multiplier_skips_set(self, enabled_buf, stepper):
+        baseline = len(stepper.rd_log)
+        enabled_buf._apply_multiplier(1.0)
+        enabled_buf._apply_multiplier(1.0)
+        enabled_buf._apply_multiplier(1.0)
+        assert len(stepper.rd_log) == baseline
+
+    def test_each_change_flushes_before_set(
+            self, enabled_buf, stepper, printer):
+        toolhead = printer.toolhead
+        flushes_before = toolhead.flush_count
+        sets_before = len(stepper.rd_log)
+        enabled_buf._apply_multiplier(enabled_buf.multiplier_high)
+        enabled_buf._apply_multiplier(enabled_buf.fault_multiplier_high)
+        assert len(stepper.rd_log) == sets_before + 2
+        assert toolhead.flush_count == flushes_before + 2
+
+
+class TestUnsyncRestoresBaseRotationDistance:
+    """After _unsync, the stepper's rotation_distance must be restored
+    to _base_rd so any subsequent force_move.manual_move computes the
+    right number of steps.  Without this, BUFFER_FEED/BUFFER_RETRACT
+    issued after leaving a non-MIDDLE zone would move the wrong amount
+    of filament (last zone's multiplier would apply)."""
+
+    def test_unsync_from_empty_restores_base(
+            self, enabled_buf, stepper, printer):
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(
+            base_rd / enabled_buf.multiplier_high)
+
+        flushes_before = printer.toolhead.flush_count
+        enabled_buf._unsync()
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        assert enabled_buf._rd_multiplier == 1.0
+        # flush must have fired at least once before the restore set
+        assert printer.toolhead.flush_count >= flushes_before + 1
+
+    def test_unsync_from_full_restores_base(self, enabled_buf, stepper):
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(
+            base_rd / enabled_buf.multiplier_low)
+        enabled_buf._unsync()
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+
+    def test_unsync_from_fault_escalation_restores_base(
+            self, enabled_buf, stepper, reactor):
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf, empty=True)
+        reactor._monotonic = 1.0
+        enabled_buf._update_rotation_distance(1.0)
+        reactor._monotonic = 1.0 + enabled_buf.fault_escalation_time + 0.1
+        enabled_buf._update_rotation_distance(reactor._monotonic)
+        assert enabled_buf._rd_multiplier == pytest.approx(
+            enabled_buf.fault_multiplier_high)
+
+        enabled_buf._unsync()
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+
+    def test_resync_after_unsync_in_empty_reapplies_multiplier(
+            self, enabled_buf, stepper, reactor):
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(
+            base_rd / enabled_buf.multiplier_high)
+
+        enabled_buf._unsync()
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+
+        # Re-sync still in EMPTY — next control tick must re-apply
+        # the zone multiplier (dedupe must NOT suppress the write).
+        enabled_buf._sync()
+        reactor._monotonic = 2.0
+        enabled_buf._update_rotation_distance(2.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(
+            base_rd / enabled_buf.multiplier_high)
