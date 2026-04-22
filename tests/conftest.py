@@ -239,14 +239,22 @@ class MockStepper:
 
 
 class MockExtruderStepper:
-    """Mock for kinematics.extruder.ExtruderStepper."""
+    """Mock for kinematics.extruder.ExtruderStepper.
 
-    def __init__(self):
+    Real Klipper's ExtruderStepper.sync_to_extruder() calls
+    toolhead.flush_step_generation() before rebinding the trapq.
+    The mock mirrors that so buffer.py's flushing invariants are
+    exercised faithfully by tests."""
+
+    def __init__(self, toolhead=None):
         self.stepper = MockStepper()
         self.motion_queue = None
         self._synced_to = None
+        self._toolhead = toolhead
 
     def sync_to_extruder(self, extruder_name):
+        if self._toolhead is not None:
+            self._toolhead.flush_step_generation()
         self._synced_to = extruder_name
         self.motion_queue = extruder_name
 
@@ -257,8 +265,8 @@ class MockExtruderStepper:
 class MockPrinterExtruderStepper:
     """Mock for extras.extruder_stepper.PrinterExtruderStepper."""
 
-    def __init__(self):
-        self.extruder_stepper = MockExtruderStepper()
+    def __init__(self, toolhead=None):
+        self.extruder_stepper = MockExtruderStepper(toolhead=toolhead)
 
     def get_status(self, eventtime):
         return self.extruder_stepper.get_status(eventtime)
@@ -342,7 +350,7 @@ class MockPrinter:
         self.print_stats = MockPrintStats()
         self.pause_resume = MockPauseResume()
         self.toolhead = MockToolhead()
-        self.printer_es = MockPrinterExtruderStepper()
+        self.printer_es = MockPrinterExtruderStepper(toolhead=self.toolhead)
         self.force_move = MockForceMove()
         self.event_handlers = {}
 

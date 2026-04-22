@@ -457,8 +457,12 @@ class Buffer:
         if self._synced_to is None:
             return
         try:
+            # ExtruderStepper.sync_to_extruder(None) flushes step
+            # generation internally before unbinding the trapq, so
+            # we don't need a separate flush here — after this call
+            # the stepper has no trapq and is no longer generating
+            # steps, so changing step_dist is safe.
             self.extruder_stepper.sync_to_extruder(None)
-            self.toolhead.flush_step_generation()
             self.extruder_stepper.stepper.set_rotation_distance(self._base_rd)
         except Exception as e:
             logging.warning("buffer[%s]: unsync failed: %s"
