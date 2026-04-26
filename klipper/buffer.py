@@ -426,8 +426,8 @@ class Buffer:
             if (self.extruder_name is not None
                     and extruder_name != self.extruder_name):
                 if self.debug:
-                    self.gcode.respond_info(
-                        "Buffer[%s] debug: skip sync (active=%s, "
+                    logging.info(
+                        "buffer[%s] debug: skip sync (active=%s, "
                         "bound=%s)" % (self.short_name, extruder_name,
                                        self.extruder_name))
                 return
@@ -438,19 +438,32 @@ class Buffer:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
             if self.debug:
-                self.gcode.respond_info(
-                    "Buffer[%s] debug: synced to %s"
-                    % (self.short_name, extruder_name))
+                logging.info("buffer[%s] debug: synced to %s"
+                             % (self.short_name, extruder_name))
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
 
     def _unsync(self):
-        """Unsync the buffer stepper from the extruder."""
+        """Unsync the buffer stepper from the extruder.
+
+        Restores the stepper's rotation_distance to the baseline so
+        subsequent manual moves (BUFFER_FEED, BUFFER_RETRACT, safety
+        retract, fill chunks) use the correct mm->step conversion
+        regardless of which zone the buffer was in when we unsynced.
+        Without this, force_move.manual_move would use the last applied
+        zone multiplier and move the wrong amount of filament.
+        """
         if self._synced_to is None:
             return
         try:
+            # ExtruderStepper.sync_to_extruder(None) flushes step
+            # generation internally before unbinding the trapq, so
+            # we don't need a separate flush here — after this call
+            # the stepper has no trapq and is no longer generating
+            # steps, so changing step_dist is safe.
             self.extruder_stepper.sync_to_extruder(None)
+            self.extruder_stepper.stepper.set_rotation_distance(self._base_rd)
         except Exception as e:
             logging.warning("buffer[%s]: unsync failed: %s"
                             % (self.short_name, e))
@@ -460,8 +473,7 @@ class Buffer:
         self._safety_zone_start = 0.0
         self._safety_escalated = False
         if self.debug:
-            self.gcode.respond_info("Buffer[%s] debug: unsynced"
-                                    % self.short_name)
+            logging.info("buffer[%s] debug: unsynced" % self.short_name)
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -530,16 +542,26 @@ class Buffer:
         return 1.0
 
     def _apply_multiplier(self, multiplier):
-        """Set the buffer stepper's rotation_distance based on multiplier."""
+        """Set the buffer stepper's rotation_distance based on multiplier.
+
+        Flushes step generation before mutating step_dist, matching
+        upstream Klipper's cmd_SET_E_ROTATION_DISTANCE pattern.  Without
+        the flush, already-queued steps computed under the old step_dist
+        can end up scheduled before the new ones, causing the MCU to
+        shutdown with "Rescheduled timer in the past".
+        """
         if multiplier <= 0.0:
             multiplier = 0.01
+        if abs(multiplier - self._rd_multiplier) < 1e-9:
+            return
         self._rd_multiplier = multiplier
         new_rd = self._base_rd / multiplier
+        self.toolhead.flush_step_generation()
         self.extruder_stepper.stepper.set_rotation_distance(new_rd)
         if self.debug:
-            self.gcode.respond_info(
-                "Buffer debug: rd_mult=%.4f rd=%.4f zone=%s"
-                % (multiplier, new_rd, self._current_zone))
+            logging.info(
+                "buffer[%s] debug: rd_mult=%.4f rd=%.4f zone=%s"
+                % (self.short_name, multiplier, new_rd, self._current_zone))
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -561,9 +583,8 @@ class Buffer:
         entered = zone != self._current_zone
         if entered:
             if self.debug:
-                self.gcode.respond_info(
-                    "Buffer debug: zone %s -> %s"
-                    % (self._current_zone, zone))
+                logging.info("buffer[%s] debug: zone %s -> %s"
+                             % (self.short_name, self._current_zone, zone))
             self._prev_zone = self._current_zone
         self._current_zone = zone
 

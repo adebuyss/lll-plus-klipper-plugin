@@ -42,7 +42,8 @@ def _make_printer_with_extruders(extruder_names=("extruder",),
     for name in stepper_names:
         key = "extruder_stepper %s" % name
         if key not in printer._objects:
-            printer.add_object(key, MockPrinterExtruderStepper())
+            printer.add_object(key, MockPrinterExtruderStepper(
+                toolhead=printer.toolhead))
     # Default toolhead already has MockExtruder(name="extruder").
     # Nothing to do unless a test later calls toolhead.set_extruder().
     return printer
