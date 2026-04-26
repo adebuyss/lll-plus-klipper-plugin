@@ -92,7 +92,11 @@ class Buffer:
         # this extruder is the active one (enables multi-extruder setups).
         # When None, the buffer follows whatever extruder is currently
         # active and re-syncs on tool changes (single-buffer default).
-        self.extruder_name = config.get("extruder", None)
+        # Named 'bound_extruder' (not 'extruder') because Mainsail and some
+        # Fluidd panels treat any config section whose settings expose an
+        # 'extruder' field as part of that extruder's dashboard card and
+        # would render buffer state inside the main Extruder panel.
+        self.extruder_name = config.get("bound_extruder", None)
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
         # Absolute rotation_distance multipliers, matching AFC_buffer.py.
@@ -129,6 +133,16 @@ class Buffer:
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
+        # Minimum interval between actually-applied rotation_distance
+        # changes. Each apply does flush_step_generation() which drains
+        # the entire step pipeline (XYZ + extruder) for ~1-10 ms; during
+        # printing, rapid zone oscillation (e.g. MIDDLE <-> EMPTY_MIDDLE)
+        # would flush on every transition. With apply_dwell > 0, the
+        # first transition applies immediately and any further changes
+        # within the dwell window are coalesced into a single deferred
+        # apply (HVAC short-cycle protection pattern). Fault escalation
+        # bypasses the dwell. apply_dwell=0 disables coalescing.
+        self.apply_dwell = config.getfloat("apply_dwell", 0.5, minval=0.0)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
@@ -160,6 +174,12 @@ class Buffer:
         self._rd_multiplier = 1.0
         self._synced_to = None  # extruder name when synced, None when not
         self._last_active_extruder = None  # tracked for tool-change detection
+
+        # Apply-dwell coalescing state. -inf so the first apply is never
+        # gated; resets to -inf on _unsync so a fresh sync isn't gated.
+        self._last_apply_time = -float("inf")
+        self._pending_multiplier = None
+        self._dwell_timer = None  # reactor timer handle, lazily registered
 
         # State
         self.state = STATE_DISABLED
@@ -422,8 +442,8 @@ class Buffer:
             if (self.extruder_name is not None
                     and extruder_name != self.extruder_name):
                 if self.debug:
-                    self.gcode.respond_info(
-                        "Buffer[%s] debug: skip sync (active=%s, "
+                    logging.info(
+                        "buffer[%s] debug: skip sync (active=%s, "
                         "bound=%s)" % (self.short_name, extruder_name,
                                        self.extruder_name))
                 return
@@ -434,19 +454,32 @@ class Buffer:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
             if self.debug:
-                self.gcode.respond_info(
-                    "Buffer[%s] debug: synced to %s"
-                    % (self.short_name, extruder_name))
+                logging.info("buffer[%s] debug: synced to %s"
+                             % (self.short_name, extruder_name))
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
 
     def _unsync(self):
-        """Unsync the buffer stepper from the extruder."""
+        """Unsync the buffer stepper from the extruder.
+
+        Restores the stepper's rotation_distance to the baseline so
+        subsequent manual moves (BUFFER_FEED, BUFFER_RETRACT, safety
+        retract, fill chunks) use the correct mm->step conversion
+        regardless of which zone the buffer was in when we unsynced.
+        Without this, force_move.manual_move would use the last applied
+        zone multiplier and move the wrong amount of filament.
+        """
         if self._synced_to is None:
             return
         try:
+            # ExtruderStepper.sync_to_extruder(None) flushes step
+            # generation internally before unbinding the trapq, so
+            # we don't need a separate flush here — after this call
+            # the stepper has no trapq and is no longer generating
+            # steps, so changing step_dist is safe.
             self.extruder_stepper.sync_to_extruder(None)
+            self.extruder_stepper.stepper.set_rotation_distance(self._base_rd)
         except Exception as e:
             logging.warning("buffer[%s]: unsync failed: %s"
                             % (self.short_name, e))
@@ -455,9 +488,17 @@ class Buffer:
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
         self._safety_escalated = False
+        # Cancel any pending dwell-deferred apply: we're no longer driving
+        # this stepper, and a stale pending value would fire after resync
+        # with whatever rd was set during the unsynced interval.
+        self._pending_multiplier = None
+        if self._dwell_timer is not None:
+            self.reactor.update_timer(
+                self._dwell_timer, self.reactor.NEVER)
+        # Reset apply-time so a fresh sync isn't gated.
+        self._last_apply_time = -float("inf")
         if self.debug:
-            self.gcode.respond_info("Buffer[%s] debug: unsynced"
-                                    % self.short_name)
+            logging.info("buffer[%s] debug: unsynced" % self.short_name)
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -525,17 +566,69 @@ class Buffer:
             return self.multiplier_low
         return 1.0
 
-    def _apply_multiplier(self, multiplier):
-        """Set the buffer stepper's rotation_distance based on multiplier."""
+    def _apply_multiplier(self, multiplier, eventtime=None, force=False):
+        """Set the buffer stepper's rotation_distance based on multiplier.
+
+        Flushes step generation before mutating step_dist, matching
+        upstream Klipper's cmd_SET_E_ROTATION_DISTANCE pattern.  Without
+        the flush, already-queued steps computed under the old step_dist
+        can end up scheduled before the new ones, causing the MCU to
+        shutdown with "Rescheduled timer in the past".
+
+        Subsequent changes within apply_dwell of the last apply are
+        coalesced: the latest intended multiplier is stored as
+        _pending_multiplier and applied by a deferred reactor timer.
+        force=True bypasses dwell (used for fault escalation).
+        """
         if multiplier <= 0.0:
             multiplier = 0.01
+        if abs(multiplier - self._rd_multiplier) < 1e-9:
+            # Already at target — discard any stale pending value.
+            self._pending_multiplier = None
+            return
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        if not force and self.apply_dwell > 0.0:
+            elapsed = eventtime - self._last_apply_time
+            if elapsed < self.apply_dwell:
+                # Only arm the timer on the first defer in this window;
+                # subsequent defers just refresh _pending_multiplier so
+                # the latest intent wins (no need to re-update the wake,
+                # it doesn't move within a window).
+                if self._pending_multiplier is None:
+                    wake = self._last_apply_time + self.apply_dwell
+                    if self._dwell_timer is None:
+                        self._dwell_timer = self.reactor.register_timer(
+                            self._dwell_timer_cb, wake)
+                    else:
+                        self.reactor.update_timer(self._dwell_timer, wake)
+                self._pending_multiplier = multiplier
+                return
+        self._do_apply(eventtime, multiplier)
+
+    def _do_apply(self, eventtime, multiplier):
+        """Unconditionally flush, set rotation_distance, and stamp time."""
         self._rd_multiplier = multiplier
         new_rd = self._base_rd / multiplier
+        self.toolhead.flush_step_generation()
         self.extruder_stepper.stepper.set_rotation_distance(new_rd)
+        self._last_apply_time = eventtime
+        self._pending_multiplier = None
         if self.debug:
-            self.gcode.respond_info(
-                "Buffer debug: rd_mult=%.4f rd=%.4f zone=%s"
-                % (multiplier, new_rd, self._current_zone))
+            logging.info(
+                "buffer[%s] debug: rd_mult=%.4f rd=%.4f zone=%s"
+                % (self.short_name, multiplier, new_rd, self._current_zone))
+
+    def _dwell_timer_cb(self, eventtime):
+        """Fire the deferred apply after the dwell window expires."""
+        pending = self._pending_multiplier
+        if pending is None or self._synced_to is None:
+            return self.reactor.NEVER
+        if abs(pending - self._rd_multiplier) >= 1e-9:
+            self._do_apply(eventtime, pending)
+        else:
+            self._pending_multiplier = None
+        return self.reactor.NEVER
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -557,9 +650,8 @@ class Buffer:
         entered = zone != self._current_zone
         if entered:
             if self.debug:
-                self.gcode.respond_info(
-                    "Buffer debug: zone %s -> %s"
-                    % (self._current_zone, zone))
+                logging.info("buffer[%s] debug: zone %s -> %s"
+                             % (self.short_name, self._current_zone, zone))
             self._prev_zone = self._current_zone
         self._current_zone = zone
 
@@ -613,7 +705,8 @@ class Buffer:
                     multiplier = self.fault_multiplier_high
 
         if self._synced_to is not None:
-            self._apply_multiplier(multiplier)
+            self._apply_multiplier(multiplier, eventtime,
+                                   force=self._safety_escalated)
 
     # --- Initial fill ---
 
@@ -817,7 +910,7 @@ class Buffer:
                 return
             if self.state == STATE_ERROR:
                 return
-            self._start_manual_feed(eventtime)
+            self._start_continuous_feed(FORWARD, self.manual_speed)
         else:
             # Release
             self._cancel_error_clear_hold()
@@ -836,7 +929,7 @@ class Buffer:
                 return
             if self.state == STATE_ERROR:
                 return
-            self._start_manual_retract(eventtime)
+            self._start_continuous_feed(BACK, self.manual_speed)
         else:
             self._cancel_error_clear_hold()
             if self.state == STATE_MANUAL_RETRACT:
@@ -895,38 +988,6 @@ class Buffer:
         return self.reactor.NEVER
 
     # --- Manual feed/retract ---
-
-    def _start_manual_feed(self, eventtime):
-        """Begin manual forward feed (button or command)."""
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_FEED
-        self.motor_direction = FORWARD
-        self._manual_feed_full_start = 0.0
-        self._do_manual_chunk(FORWARD)
-
-    def _start_manual_retract(self, eventtime):
-        """Begin manual retract (button or command)."""
-        self._cancel_fill()
-        self._unsync()
-        self.state = STATE_MANUAL_RETRACT
-        self.motor_direction = BACK
-        self._do_manual_chunk(BACK)
-
-    def _do_manual_chunk(self, direction):
-        """Issue a single manual move chunk."""
-        if self.force_move is None:
-            return
-        stepper = self.extruder_stepper.stepper
-        dist = self._manual_chunk_dist
-        if direction == BACK:
-            dist = -dist
-        try:
-            self.force_move.manual_move(
-                stepper, dist, self.manual_speed, self.manual_accel)
-        except Exception as e:
-            logging.warning("buffer[%s]: manual move failed: %s"
-                            % (self.short_name, e))
 
     def _start_continuous_feed(self, direction, speed):
         """Feed/retract continuously via chunked moves until stopped.

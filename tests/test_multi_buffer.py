@@ -42,7 +42,8 @@ def _make_printer_with_extruders(extruder_names=("extruder",),
     for name in stepper_names:
         key = "extruder_stepper %s" % name
         if key not in printer._objects:
-            printer.add_object(key, MockPrinterExtruderStepper())
+            printer.add_object(key, MockPrinterExtruderStepper(
+                toolhead=printer.toolhead))
     # Default toolhead already has MockExtruder(name="extruder").
     # Nothing to do unless a test later calls toolhead.set_extruder().
     return printer
@@ -55,7 +56,7 @@ def _make_buffer(printer, section_name, stepper_name="buffer_stepper",
     values["_name"] = section_name
     values["stepper"] = stepper_name
     if extruder is not None:
-        values["extruder"] = extruder
+        values["bound_extruder"] = extruder
     # Each buffer needs distinct sensor pins to avoid collisions when
     # multiple buffers are registered in one printer.  The MockButtons
     # mock doesn't validate, but we still give each one a unique set to
