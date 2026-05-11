@@ -66,6 +66,10 @@ _DEPRECATED_PARAMS = [
     ("full_zone_retract_length", 0.0, "minval", 0.0),
     ("min_extrusion_velocity", 0.05, "minval", 0.0),
     ("forward_timeout", 60.0, "minval", 0.0),
+    ("apply_dwell", 0.5, "minval", 0.0),
+    ("fault_multiplier_low", 0.36, "minval", 0.0),
+    ("fault_multiplier_high", 1.65, "minval", 1.0),
+    ("fault_escalation_time", 5.0, "above", 0.0),
 ]
 
 
@@ -102,23 +106,11 @@ class Buffer:
         # Absolute rotation_distance multipliers, matching AFC_buffer.py.
         # _low is applied in the FULL safety zone (under-feed to drain
         # the loop); _high is applied in the EMPTY safety zone (over-feed
-        # to fill it).  The fault_* variants are the escalated values
-        # used after fault_escalation_time seconds in the same zone.
-        # AFC defaults: 0.9 / 1.1 normal, 0.36 / 1.65 fault.
+        # to fill it).  AFC defaults: 0.9 / 1.1.
         self.multiplier_low = config.getfloat(
             "multiplier_low", 0.9, minval=0.0, maxval=1.0)
         self.multiplier_high = config.getfloat(
             "multiplier_high", 1.1, minval=1.0)
-        self.fault_multiplier_low = config.getfloat(
-            "fault_multiplier_low",
-            (self.multiplier_low * 2.0) / 5.0,
-            minval=0.0, maxval=self.multiplier_low)
-        self.fault_multiplier_high = config.getfloat(
-            "fault_multiplier_high",
-            self.multiplier_high * 1.5,
-            minval=self.multiplier_high)
-        self.fault_escalation_time = config.getfloat("fault_escalation_time",
-                                                     5.0, above=0.0)
         self.empty_safety_timeout = config.getfloat("empty_safety_timeout",
                                                     30.0, above=0.0)
         self.full_safety_timeout = config.getfloat("full_safety_timeout",
@@ -133,16 +125,6 @@ class Buffer:
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
-        # Minimum interval between actually-applied rotation_distance
-        # changes. Each apply does flush_step_generation() which drains
-        # the entire step pipeline (XYZ + extruder) for ~1-10 ms; during
-        # printing, rapid zone oscillation (e.g. MIDDLE <-> EMPTY_MIDDLE)
-        # would flush on every transition. With apply_dwell > 0, the
-        # first transition applies immediately and any further changes
-        # within the dwell window are coalesced into a single deferred
-        # apply (HVAC short-cycle protection pattern). Fault escalation
-        # bypasses the dwell. apply_dwell=0 disables coalescing.
-        self.apply_dwell = config.getfloat("apply_dwell", 0.5, minval=0.0)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
@@ -174,12 +156,6 @@ class Buffer:
         self._rd_multiplier = 1.0
         self._synced_to = None  # extruder name when synced, None when not
         self._last_active_extruder = None  # tracked for tool-change detection
-
-        # Apply-dwell coalescing state. -inf so the first apply is never
-        # gated; resets to -inf on _unsync so a fresh sync isn't gated.
-        self._last_apply_time = -float("inf")
-        self._pending_multiplier = None
-        self._dwell_timer = None  # reactor timer handle, lazily registered
 
         # State
         self.state = STATE_DISABLED
@@ -216,7 +192,6 @@ class Buffer:
 
         # Safety timeout tracking
         self._safety_zone_start = 0.0  # when we entered EMPTY or FULL
-        self._safety_escalated = False
 
         # Initial fill
         self._initial_fill_until = 0.0
@@ -487,16 +462,6 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
-        # Cancel any pending dwell-deferred apply: we're no longer driving
-        # this stepper, and a stale pending value would fire after resync
-        # with whatever rd was set during the unsynced interval.
-        self._pending_multiplier = None
-        if self._dwell_timer is not None:
-            self.reactor.update_timer(
-                self._dwell_timer, self.reactor.NEVER)
-        # Reset apply-time so a fresh sync isn't gated.
-        self._last_apply_time = -float("inf")
         if self.debug:
             logging.info("buffer[%s] debug: unsynced" % self.short_name)
 
@@ -566,69 +531,26 @@ class Buffer:
             return self.multiplier_low
         return 1.0
 
-    def _apply_multiplier(self, multiplier, eventtime=None, force=False):
+    def _apply_multiplier(self, multiplier):
         """Set the buffer stepper's rotation_distance based on multiplier.
 
-        Flushes step generation before mutating step_dist, matching
-        upstream Klipper's cmd_SET_E_ROTATION_DISTANCE pattern.  Without
-        the flush, already-queued steps computed under the old step_dist
-        can end up scheduled before the new ones, causing the MCU to
-        shutdown with "Rescheduled timer in the past".
-
-        Subsequent changes within apply_dwell of the last apply are
-        coalesced: the latest intended multiplier is stored as
-        _pending_multiplier and applied by a deferred reactor timer.
-        force=True bypasses dwell (used for fault escalation).
+        No flush_step_generation() — the buffer stepper's queued depth
+        is small enough that mutating step_dist mid-flight is acceptable
+        on hardware without USB-jitter induced timer-skew.  Earlier
+        defensive flushes were costing 1-10 ms pipeline drains per zone
+        transition and showed up as visible XYZ stalls during prints.
         """
         if multiplier <= 0.0:
             multiplier = 0.01
         if abs(multiplier - self._rd_multiplier) < 1e-9:
-            # Already at target — discard any stale pending value.
-            self._pending_multiplier = None
             return
-        if eventtime is None:
-            eventtime = self.reactor.monotonic()
-        if not force and self.apply_dwell > 0.0:
-            elapsed = eventtime - self._last_apply_time
-            if elapsed < self.apply_dwell:
-                # Only arm the timer on the first defer in this window;
-                # subsequent defers just refresh _pending_multiplier so
-                # the latest intent wins (no need to re-update the wake,
-                # it doesn't move within a window).
-                if self._pending_multiplier is None:
-                    wake = self._last_apply_time + self.apply_dwell
-                    if self._dwell_timer is None:
-                        self._dwell_timer = self.reactor.register_timer(
-                            self._dwell_timer_cb, wake)
-                    else:
-                        self.reactor.update_timer(self._dwell_timer, wake)
-                self._pending_multiplier = multiplier
-                return
-        self._do_apply(eventtime, multiplier)
-
-    def _do_apply(self, eventtime, multiplier):
-        """Unconditionally flush, set rotation_distance, and stamp time."""
         self._rd_multiplier = multiplier
         new_rd = self._base_rd / multiplier
-        self.toolhead.flush_step_generation()
         self.extruder_stepper.stepper.set_rotation_distance(new_rd)
-        self._last_apply_time = eventtime
-        self._pending_multiplier = None
         if self.debug:
             logging.info(
                 "buffer[%s] debug: rd_mult=%.4f rd=%.4f zone=%s"
                 % (self.short_name, multiplier, new_rd, self._current_zone))
-
-    def _dwell_timer_cb(self, eventtime):
-        """Fire the deferred apply after the dwell window expires."""
-        pending = self._pending_multiplier
-        if pending is None or self._synced_to is None:
-            return self.reactor.NEVER
-        if abs(pending - self._rd_multiplier) >= 1e-9:
-            self._do_apply(eventtime, pending)
-        else:
-            self._pending_multiplier = None
-        return self.reactor.NEVER
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -672,14 +594,11 @@ class Buffer:
         if zone in (ZONE_EMPTY, ZONE_FULL):
             if entered:
                 self._safety_zone_start = eventtime
-                self._safety_escalated = False
             elif (self._safety_zone_start <= 0.0
                     and self._is_printing()):
                 self._safety_zone_start = eventtime
-                self._safety_escalated = False
         else:
             self._safety_zone_start = 0.0
-            self._safety_escalated = False
 
         # Clear initial fill once filament reaches middle or beyond
         if (self._initial_fill_until > 0.0
@@ -689,24 +608,8 @@ class Buffer:
 
         # Compute and apply multiplier
         multiplier = self._zone_to_multiplier(zone)
-
-        # Fault escalation: if in safety zone too long, jump to the
-        # absolute fault multiplier.  Once escalated, the stronger
-        # value persists until the zone clears.
-        if self._safety_zone_start > 0.0:
-            if (not self._safety_escalated
-                    and eventtime - self._safety_zone_start
-                    >= self.fault_escalation_time):
-                self._safety_escalated = True
-            if self._safety_escalated:
-                if zone == ZONE_FULL:
-                    multiplier = self.fault_multiplier_low
-                elif zone == ZONE_EMPTY:
-                    multiplier = self.fault_multiplier_high
-
         if self._synced_to is not None:
-            self._apply_multiplier(multiplier, eventtime,
-                                   force=self._safety_escalated)
+            self._apply_multiplier(multiplier)
 
     # --- Initial fill ---
 
@@ -891,7 +794,6 @@ class Buffer:
             logging.warning("buffer[%s]: safety retract failed: %s"
                             % (self.short_name, e))
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
         # Do NOT re-sync here — the retract move is still in the MCU's
         # step buffer.  The next control timer cycle will re-sync via
         # _update_rotation_distance -> _sync() once the move completes.
@@ -1055,7 +957,6 @@ class Buffer:
         self.state = STATE_STOPPED if self.auto_enabled else STATE_IDLE
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
         if self.auto_enabled:
             self._sync()
 
@@ -1093,8 +994,6 @@ class Buffer:
             "drift_gain": self.drift_gain,
             "multiplier_low": self.multiplier_low,
             "multiplier_high": self.multiplier_high,
-            "fault_multiplier_low": self.fault_multiplier_low,
-            "fault_multiplier_high": self.fault_multiplier_high,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -1123,7 +1022,6 @@ class Buffer:
             "  Manual speed: %.1f mm/s  chunk: %.1f mm\n"
             "  Drift gain: %.3f\n"
             "  Multiplier low/high: %.3f / %.3f\n"
-            "  Fault multiplier low/high: %.3f / %.3f\n"
             "  Printing: %s"
             % (
                 status["name"],
@@ -1145,8 +1043,6 @@ class Buffer:
                 status["drift_gain"],
                 status["multiplier_low"],
                 status["multiplier_high"],
-                status["fault_multiplier_low"],
-                status["fault_multiplier_high"],
                 status["is_printing"],
             )
         )
@@ -1159,7 +1055,6 @@ class Buffer:
         self.state = STATE_STOPPED
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
         self._sync()
         gcmd.respond_info("Buffer: automatic control enabled")
 

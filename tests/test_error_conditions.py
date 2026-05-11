@@ -113,7 +113,6 @@ class TestUnsyncClearsSafetyTimer:
 
         enabled_buf._unsync()
         assert enabled_buf._safety_zone_start == 0.0
-        assert enabled_buf._safety_escalated is False
 
 
 class TestClearError:
