@@ -11,6 +11,9 @@ from conftest import (
 
 class TestEmptySafetyTimeout:
     def test_empty_timeout_triggers_error(self, enabled_buf, reactor):
+        # No extruder rate set, so _recovery_decision returns ENTER for
+        # EMPTY at manual_speed.  Recovery preserves _safety_zone_start
+        # so the cumulative empty_safety_timeout still escalates.
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, empty=True)
         t = 1.0
@@ -103,14 +106,10 @@ class TestErrorBlocking:
 
 
 class TestUnsyncClearsSafetyTimer:
-    def test_unsync_clears_safety_timer(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, empty=True)
-        t = 1.0
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-        assert enabled_buf._safety_zone_start > 0.0
-        assert enabled_buf._synced_to is not None
-
+    def test_unsync_clears_safety_timer(self, enabled_buf):
+        """Explicit _unsync (not the recovery-internal one) must clear
+        the safety arming so a subsequent re-sync starts fresh."""
+        enabled_buf._safety_zone_start = 1.0
         enabled_buf._unsync()
         assert enabled_buf._safety_zone_start == 0.0
 

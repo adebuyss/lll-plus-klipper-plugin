@@ -9,16 +9,17 @@ digraph buffer_state_machine {
     compound=true
 
     // ===== Rotation distance feedback zones =====
-    // The buffer stepper is synced to the extruder via shared trapq.
-    // Each zone sets a rotation_distance multiplier:
-    //   rd_new = base_rd / multiplier
+    // Buffer stepper is synced to the extruder via shared trapq.
+    // EMPTY_MIDDLE / MIDDLE / FULL_MIDDLE apply a rotation_distance
+    // multiplier (rd_new = base_rd / multiplier).  ZONE_EMPTY and
+    // ZONE_FULL go through the unsync-and-recover path instead — at
+    // the extremes we stop chasing with rotation_distance.
 
     subgraph cluster_empty {
-        label="EMPTY\nmult = 1 + safety_gain" labeljust=c fontsize=11 penwidth=2
+        label="EMPTY\nunsync + recovery" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        e_safety  [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 1.05 → deliver MORE</FONT>> fillcolor="#f4cccc"]
-        e_escal   [label=<SYNCED<BR/><FONT POINT-SIZE="8">ESCALATED ×1.5</FONT>> fillcolor="#e06666"]
+        e_recover [label=<UNSYNCED<BR/><FONT POINT-SIZE="8">chunked active fill</FONT><BR/><FONT POINT-SIZE="8">manual_speed or rate × 1.2</FONT>> fillcolor="#f4cccc"]
     }
 
     subgraph cluster_empty_middle {
@@ -43,44 +44,49 @@ digraph buffer_state_machine {
     }
 
     subgraph cluster_full {
-        label="FULL\nmult = 1 − safety_gain" labeljust=c fontsize=11 penwidth=2
+        label="FULL\nunsync + recovery" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        f_safety [label=<SYNCED<BR/><FONT POINT-SIZE="8">mult 0.95 → deliver LESS</FONT>> fillcolor="#f4cccc"]
-        f_escal  [label=<SYNCED<BR/><FONT POINT-SIZE="8">ESCALATED ×1.5</FONT>> fillcolor="#e06666"]
+        f_recover [label=<UNSYNCED<BR/><FONT POINT-SIZE="8">passive drain</FONT><BR/><FONT POINT-SIZE="8">(needs forward extruder)</FONT>> fillcolor="#f4cccc"]
+        f_defer  [label=<SYNCED<BR/><FONT POINT-SIZE="8">DEFER (extruder idle\nor retracting)</FONT>> fillcolor="#fce5cd"]
         f_retract [label=<RETRACT<BR/><FONT POINT-SIZE="8">unsync + force_move</FONT>> fillcolor="#cc0000" fontcolor=white]
     }
 
     ERROR [fillcolor="#f4cccc" label="ERROR"]
 
-    // ===== Within-zone transitions (timing) =====
+    // ===== Within-zone transitions =====
 
-    e_safety -> e_escal  [label="fault_escalation\n_time elapsed"]
-    e_escal  -> ERROR    [label="empty_safety\n_timeout" color="#cc0000"]
-
-    f_safety -> f_escal  [label="fault_escalation\n_time elapsed"]
-    f_escal  -> f_retract [label="full_safety\n_timeout" color="#cc0000"]
+    f_defer    -> f_retract [label="full_safety\n_timeout" color="#cc0000"]
+    e_recover  -> ERROR     [label="extreme_recovery\n_timeout or\nempty_safety_timeout" color="#cc0000"]
 
     // ===== Cross-zone transitions (sensor changes) =====
+    // Recovery is entered on extreme-zone edges and exited at MIDDLE
+    // (callback-driven via sensor edges; no waiting on the 0.5 s
+    // control_interval tick).
 
-    e_safety -> em_drift  [label="empty\nclears" style=dashed]
-    e_safety -> m_neutral [label="middle\ntriggers" style=dashed]
+    e_recover -> m_neutral [label="recovery exits at\nMIDDLE → resync at 1.0" style=dashed]
+    e_recover -> em_drift  [label="leaves EMPTY but\nnot at MIDDLE yet" style=dashed]
 
-    em_drift -> e_safety  [label="empty\ntriggers" style=dashed]
-    em_drift -> m_neutral [label="middle\ntriggers" style=dashed]
+    em_drift -> e_recover  [label="empty triggers\n(forward / idle\n/ retracting)" style=dashed]
+    em_drift -> m_neutral  [label="middle\ntriggers" style=dashed]
 
     m_neutral -> em_drift [label="middle\nclears" style=dashed]
     m_neutral -> fm_drift [label="full\ntriggers" style=dashed]
 
     fm_drift -> m_neutral [label="full\nclears" style=dashed]
-    fm_drift -> f_safety  [label="middle\nclears" style=dashed]
+    fm_drift -> f_recover [label="middle clears\n(extruder forward)" style=dashed]
+    fm_drift -> f_defer   [label="middle clears\n(extruder idle/back)" style=dashed]
 
-    f_safety -> fm_drift  [label="middle\ntriggers" style=dashed]
-    f_safety -> m_neutral [label="full clears +\nmiddle triggers" style=dashed]
+    f_recover -> m_neutral [label="recovery exits at\nMIDDLE → resync at 1.0" style=dashed]
+    f_recover -> fm_drift  [label="leaves FULL but\nnot at MIDDLE yet" style=dashed]
+    f_recover -> f_defer   [label="extruder stops/\nreverses mid-recovery" style=dashed]
+
+    f_defer  -> f_recover  [label="extruder begins\nforward consumption" style=dashed]
+    f_defer  -> m_neutral  [label="full clears +\nmiddle triggers" style=dashed]
 
     f_retract -> m_neutral [label="re-sync after\nretract" style=dashed]
 
     // ===== Sensor conflict =====
 
-    e_safety -> ERROR [label="empty+full\nconflict" color="#cc0000" style=bold]
+    e_recover -> ERROR [label="empty+full\nconflict" color="#cc0000" style=bold]
 }

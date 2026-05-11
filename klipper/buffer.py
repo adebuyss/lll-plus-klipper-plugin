@@ -23,6 +23,23 @@ STATE_ERROR = "error"
 STATE_MANUAL_FEED = "manual_feed"
 STATE_MANUAL_RETRACT = "manual_retract"
 
+# Recovery fill speed margin: when the active extruder is consuming
+# faster than the configured manual_speed, the EMPTY recovery uses
+# extruder_rate * RECOVERY_OVERHEAD as the chunk feed rate so the
+# buffer fills faster than the extruder drains it.
+RECOVERY_OVERHEAD = 1.2
+# Cap recovery fill speed at this multiple of manual_speed to avoid
+# runaway from a transient extruder-rate measurement glitch.
+RECOVERY_SPEED_CAP_FACTOR = 4.0
+# Below this absolute extruder rate we consider the extruder idle
+# (units: mm/s).  Used by _recovery_decision to distinguish
+# forward / idle / retracting.
+EXTRUDER_RATE_IDLE_EPS = 0.05
+
+# Extreme-zone recovery action codes returned by _recovery_decision.
+RECOVERY_ENTER = "enter"
+RECOVERY_DEFER = "defer"
+
 # Sensor zone identifiers (kept for diagnostics in BUFFER_STATUS)
 ZONE_EMPTY = "empty"
 ZONE_FULL = "full"
@@ -70,6 +87,8 @@ _DEPRECATED_PARAMS = [
     ("fault_multiplier_low", 0.36, "minval", 0.0),
     ("fault_multiplier_high", 1.65, "minval", 1.0),
     ("fault_escalation_time", 5.0, "above", 0.0),
+    ("multiplier_low", 0.9, "minval", 0.0),
+    ("multiplier_high", 1.1, "minval", 1.0),
 ]
 
 
@@ -103,22 +122,14 @@ class Buffer:
         self.extruder_name = config.get("bound_extruder", None)
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
-        # Absolute rotation_distance multipliers, matching AFC_buffer.py.
-        # _low is applied in the FULL safety zone (under-feed to drain
-        # the loop); _high is applied in the EMPTY safety zone (over-feed
-        # to fill it).  AFC defaults: 0.9 / 1.1.
-        self.multiplier_low = config.getfloat(
-            "multiplier_low", 0.9, minval=0.0, maxval=1.0)
-        self.multiplier_high = config.getfloat(
-            "multiplier_high", 1.1, minval=1.0)
         self.empty_safety_timeout = config.getfloat("empty_safety_timeout",
                                                     30.0, above=0.0)
         self.full_safety_timeout = config.getfloat("full_safety_timeout",
                                                    10.0, above=0.0)
         self.error_clear_hold_time = config.getfloat("error_clear_hold_time",
                                                      2.0, above=0.0)
-        self.manual_speed = config.getfloat("manual_speed", 15.0, above=0.0)
-        self.manual_accel = config.getfloat("manual_accel", 100.0, above=0.0)
+        self.manual_speed = config.getfloat("manual_speed", 40.0, above=0.0)
+        self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
@@ -127,6 +138,12 @@ class Buffer:
                                                 above=0.05)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
+        # Per-attempt cap on EMPTY-zone unsync-and-recover.  If the
+        # buffer has not exited the EMPTY range within this many seconds
+        # of chunked manual feeding, bail out and let the cumulative
+        # empty_safety_timeout escalate to an error.
+        self.extreme_recovery_timeout = config.getfloat(
+            "extreme_recovery_timeout", 10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
             "manual_feed_full_timeout", 3.0, above=0.0)
         # Sensor pin names
@@ -211,6 +228,23 @@ class Buffer:
 
         # Print state tracking
         self._print_stats = None
+
+        # Extreme-zone unsync-and-recover state.  When non-None, the
+        # buffer is unsynced and either passively waiting for FULL to
+        # drain (zone == ZONE_FULL) or actively chunked-feeding to
+        # refill EMPTY (zone == ZONE_EMPTY).  See _enter_extreme_recovery.
+        self._extreme_recovery_active = None
+        self._recovery_fill_speed = None
+        self._recovery_started_at = 0.0
+        # Cached (eventtime, position) for _estimated_extruder_rate.
+        self._last_extruder_position_sample = None
+        # Cached most-recent computed rate; returned by
+        # _estimated_extruder_rate when called twice within the same
+        # eventtime (dt too small to derive a fresh rate).
+        self._last_computed_extruder_rate = 0.0
+        # Recovery exit deferred to a reactor callback so we don't
+        # toggle sync state from inside the chunk callback.
+        self._recovery_exit_pending = False
 
         # Timer handles
         self._control_timer = None
@@ -416,11 +450,8 @@ class Buffer:
             # If bound to a specific extruder, only sync when it's active.
             if (self.extruder_name is not None
                     and extruder_name != self.extruder_name):
-                if self.debug:
-                    logging.info(
-                        "buffer[%s] debug: skip sync (active=%s, "
-                        "bound=%s)" % (self.short_name, extruder_name,
-                                       self.extruder_name))
+                self._dlog(None, "skip sync (active=%s, bound=%s)",
+                           extruder_name, self.extruder_name)
                 return
             self.extruder_stepper.sync_to_extruder(extruder_name)
             self._synced_to = extruder_name
@@ -428,9 +459,7 @@ class Buffer:
             if self.state == STATE_STOPPED:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
-            if self.debug:
-                logging.info("buffer[%s] debug: synced to %s"
-                             % (self.short_name, extruder_name))
+            self._dlog(None, "synced to %s", extruder_name)
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
@@ -445,6 +474,15 @@ class Buffer:
         Without this, force_move.manual_move would use the last applied
         zone multiplier and move the wrong amount of filament.
         """
+        # Recovery cleanup invariant: every code path that ends a sync
+        # session must clear extreme-recovery state too.  Any caller of
+        # _unsync (BUFFER_RETRACT, _do_safety_retract, _do_initial_fill,
+        # tool-change, error path) cleanly aborts an in-flight recovery
+        # this way.  _enter_extreme_recovery calls _unsync first, then
+        # re-arms recovery state, so this reset doesn't fight it.
+        self._extreme_recovery_active = None
+        self._recovery_fill_speed = None
+        self._recovery_started_at = 0.0
         if self._synced_to is None:
             return
         try:
@@ -462,8 +500,7 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
-        if self.debug:
-            logging.info("buffer[%s] debug: unsynced" % self.short_name)
+        self._dlog(None, "unsynced")
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -513,23 +550,227 @@ class Buffer:
         return ZONE_EMPTY_MIDDLE
 
     def _zone_to_multiplier(self, zone):
-        """Map a sensor zone to a rotation_distance multiplier.
+        """Map a non-extreme sensor zone to a rotation_distance multiplier.
 
         multiplier > 1.0 -> smaller rd -> more steps/mm -> deliver MORE
         multiplier < 1.0 -> larger rd  -> fewer steps/mm -> deliver LESS
         Formula: rd_new = base_rd / multiplier (matches AFC convention)
+
+        The extreme zones (ZONE_FULL, ZONE_EMPTY) intentionally return
+        1.0 here because they are handled by the unsync-and-recover
+        path in _update_rotation_distance — at the extremes we stop
+        chasing with rotation_distance entirely.
         """
-        if zone == ZONE_MIDDLE:
-            return 1.0
         if zone == ZONE_EMPTY_MIDDLE:
             return 1.0 + self.drift_gain
-        if zone == ZONE_EMPTY:
-            return self.multiplier_high
         if zone == ZONE_FULL_MIDDLE:
             return 1.0 - self.drift_gain
-        if zone == ZONE_FULL:
-            return self.multiplier_low
         return 1.0
+
+    def _dlog(self, eventtime, fmt, *args):
+        """Debug log with reactor-eventtime prefix for cross-correlation.
+
+        Embeds the reactor monotonic eventtime so klippy.log lines line
+        up with toolhead/MCU events when chasing mid-print regressions.
+        Pass None when eventtime is not in scope; the helper falls back
+        to reactor.monotonic() (cheap but a syscall, so prefer to pass
+        the existing eventtime on hot paths).
+        """
+        if not self.debug:
+            return
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        logging.info("buffer[%s] t=%.3f debug: " + fmt,
+                     self.short_name, eventtime, *args)
+
+    # --- Extruder rate sampling + recovery decision ---
+
+    def _estimated_extruder_rate(self, eventtime):
+        """Signed mm/s of the active extruder's commanded position.
+
+        Sampled by reading the active extruder's stepper commanded
+        position across consecutive eventtimes; the slope is the rate.
+        Used to decide whether unsync-and-recover is safe (FULL needs
+        forward consumption to drain; EMPTY recovery picks a chunk
+        speed that keeps ahead of the extruder).
+
+        Returns 0.0 (treated as "idle") on any failure to sample.
+        """
+        if self.toolhead is None:
+            return 0.0
+        try:
+            extruder = self.toolhead.get_extruder()
+            es = extruder.extruder_stepper.stepper
+            pos = es.get_commanded_position()
+        except Exception:
+            return 0.0
+        sample = self._last_extruder_position_sample
+        if sample is None:
+            self._last_extruder_position_sample = (eventtime, pos)
+            return 0.0
+        last_t, last_pos = sample
+        dt = eventtime - last_t
+        if dt < 1e-3:
+            # Two calls inside the same reactor tick — dt is too small
+            # to compute a fresh rate.  Reuse the cached value rather
+            # than collapsing to 0, which would otherwise discard a
+            # just-computed rate (e.g. _do_recovery_fill_chunk
+            # re-evaluates immediately after _enter_extreme_recovery).
+            return self._last_computed_extruder_rate
+        rate = (pos - last_pos) / dt
+        # Only refresh the sample when dt is significant — tiny dt
+        # produces noisy rates we'd rather smooth over.
+        if dt > 0.1:
+            self._last_extruder_position_sample = (eventtime, pos)
+        self._last_computed_extruder_rate = rate
+        return rate
+
+    def _recovery_decision(self, eventtime, zone):
+        """Decide whether to enter extreme-zone recovery, and at what speed.
+
+        Returns (action, fill_speed) where action is RECOVERY_ENTER or
+        RECOVERY_DEFER and fill_speed is the chunk feed rate to use
+        (only meaningful for EMPTY recovery).
+
+        FULL: enter only if the extruder is actively consuming forward;
+        an idle or retracting extruder cannot drain the buffer, so we
+        defer and let the existing full_safety_timeout escape via
+        _do_safety_retract.
+
+        EMPTY: always enter.  fill_speed = max(manual_speed,
+        rate * RECOVERY_OVERHEAD), capped at manual_speed *
+        RECOVERY_SPEED_CAP_FACTOR to guard against transient rate
+        spikes.  An idle/retracting extruder is safe at manual_speed
+        because nothing is fighting the chunked feed.
+        """
+        rate = self._estimated_extruder_rate(eventtime)
+        if zone == ZONE_FULL:
+            if rate <= EXTRUDER_RATE_IDLE_EPS:
+                self._dlog(eventtime,
+                           "recovery decision DEFER zone=FULL rate=%.2f",
+                           rate)
+                return (RECOVERY_DEFER, 0.0)
+            return (RECOVERY_ENTER, 0.0)
+        # ZONE_EMPTY
+        target = self.manual_speed
+        if rate > self.manual_speed / RECOVERY_OVERHEAD:
+            target = rate * RECOVERY_OVERHEAD
+        cap = self.manual_speed * RECOVERY_SPEED_CAP_FACTOR
+        fill_speed = min(target, cap)
+        return (RECOVERY_ENTER, fill_speed)
+
+    def _recovery_still_safe(self, eventtime):
+        """Re-check whether the active recovery is still appropriate.
+
+        Called from the chunk callback (EMPTY) and from the apply path
+        (FULL) so a mid-recovery direction flip aborts cleanly:
+        - FULL recovery becomes unsafe if the extruder stops or retracts
+          (passive drain assumption breaks).
+        - EMPTY recovery stays "safe" regardless of direction (worst
+          case is we over-feed slightly while the extruder also feeds
+          the buffer from the toolhead side; we log it and continue).
+        """
+        if self._extreme_recovery_active is None:
+            return False
+        if self._extreme_recovery_active == ZONE_FULL:
+            rate = self._estimated_extruder_rate(eventtime)
+            if rate <= EXTRUDER_RATE_IDLE_EPS:
+                return False
+        return True
+
+    # --- Extreme-zone recovery ---
+
+    def _enter_extreme_recovery(self, eventtime, zone, fill_speed):
+        """Unsync the buffer and start the appropriate recovery path."""
+        if self._extreme_recovery_active == zone:
+            return
+        # Preserve the cumulative safety-zone arming across the unsync;
+        # otherwise full_safety_timeout / empty_safety_timeout would
+        # never escalate to _do_safety_retract / _handle_error because
+        # _unsync wipes _safety_zone_start.
+        saved_safety_start = self._safety_zone_start
+        # Unsync first; it clears any prior recovery state via the
+        # cleanup invariant.  Then arm fresh recovery state.
+        self._unsync()
+        self._safety_zone_start = saved_safety_start
+        self._extreme_recovery_active = zone
+        self._recovery_fill_speed = fill_speed
+        self._recovery_started_at = eventtime
+        self._dlog(eventtime,
+                   "recovery enter zone=%s fill_speed=%.2f", zone, fill_speed)
+        if zone == ZONE_EMPTY and self.force_move is not None:
+            # Kick off chunked fill immediately; subsequent chunks are
+            # scheduled callback-to-callback (no waiting on the 0.5s
+            # control_interval tick).
+            self._do_recovery_fill_chunk(eventtime)
+        # FULL recovery is passive — nothing more to do here.  Sensor
+        # edge callbacks will detect the zone exit and call
+        # _exit_extreme_recovery via _update_rotation_distance.
+
+    def _do_recovery_fill_chunk(self, eventtime):
+        """Issue one EMPTY-recovery fill chunk, schedule the next."""
+        if self._extreme_recovery_active != ZONE_EMPTY:
+            return
+        if not self.material_present:
+            self._dlog(eventtime,
+                       "recovery aborting EMPTY chunk: material gone")
+            self._exit_extreme_recovery(eventtime, "material-gone")
+            return
+        # Per-attempt timeout
+        if (eventtime - self._recovery_started_at
+                >= self.extreme_recovery_timeout):
+            self._dlog(eventtime,
+                       "recovery EMPTY timeout after %.1fs",
+                       self.extreme_recovery_timeout)
+            self._extreme_recovery_active = None
+            self._recovery_fill_speed = None
+            self._recovery_started_at = 0.0
+            self._handle_error(
+                "EMPTY recovery exceeded %.0fs"
+                % self.extreme_recovery_timeout)
+            return
+        # Zone-based exit: any zone outside the EMPTY range means we're
+        # back into something the normal multiplier path can handle.
+        zone = self._compute_zone()
+        if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
+            self._exit_extreme_recovery(eventtime, "reached-middle")
+            return
+        # Re-evaluate fill speed against current extruder rate so a
+        # mid-recovery print-speed change adjusts the next chunk.
+        _action, new_speed = self._recovery_decision(eventtime, ZONE_EMPTY)
+        self._recovery_fill_speed = new_speed
+        try:
+            self.force_move.manual_move(
+                self.extruder_stepper.stepper,
+                self._manual_chunk_dist,
+                new_speed,
+                self.manual_accel)
+        except Exception as e:
+            logging.warning(
+                "buffer[%s]: recovery fill chunk failed: %s"
+                % (self.short_name, e))
+            self._exit_extreme_recovery(eventtime, "chunk-failed")
+            return
+        self.reactor.register_callback(self._recovery_fill_cb)
+
+    def _recovery_fill_cb(self, eventtime):
+        self._do_recovery_fill_chunk(eventtime)
+
+    def _exit_extreme_recovery(self, eventtime, reason):
+        """Clear recovery state and resync the buffer stepper."""
+        if self._extreme_recovery_active is None:
+            return
+        prev_zone = self._extreme_recovery_active
+        self._extreme_recovery_active = None
+        self._recovery_fill_speed = None
+        self._recovery_started_at = 0.0
+        self._dlog(eventtime,
+                   "recovery exit reason=%s prev=%s zone=%s",
+                   reason, prev_zone, self._current_zone)
+        # Re-sync directly so we don't wait for the next control tick.
+        if self.auto_enabled and self.state not in (
+                STATE_DISABLED, STATE_ERROR):
+            self._sync()
 
     def _apply_multiplier(self, multiplier):
         """Set the buffer stepper's rotation_distance based on multiplier.
@@ -547,10 +788,8 @@ class Buffer:
         self._rd_multiplier = multiplier
         new_rd = self._base_rd / multiplier
         self.extruder_stepper.stepper.set_rotation_distance(new_rd)
-        if self.debug:
-            logging.info(
-                "buffer[%s] debug: rd_mult=%.4f rd=%.4f zone=%s"
-                % (self.short_name, multiplier, new_rd, self._current_zone))
+        self._dlog(None, "rd_mult=%.4f rd=%.4f zone=%s",
+                   multiplier, new_rd, self._current_zone)
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -571,14 +810,17 @@ class Buffer:
         # Track zone transitions
         entered = zone != self._current_zone
         if entered:
-            if self.debug:
-                logging.info("buffer[%s] debug: zone %s -> %s"
-                             % (self.short_name, self._current_zone, zone))
+            self._dlog(eventtime, "zone %s -> %s",
+                       self._current_zone, zone)
             self._prev_zone = self._current_zone
         self._current_zone = zone
 
-        # Ensure we're synced when auto-enabled
-        if self._synced_to is None and self._initial_fill_until <= 0.0:
+        # Ensure we're synced when auto-enabled.  Skip during extreme
+        # recovery — the recovery owns the unsynced state and will
+        # resync via _exit_extreme_recovery when the zone returns.
+        if (self._synced_to is None
+                and self._initial_fill_until <= 0.0
+                and self._extreme_recovery_active is None):
             self._sync()
 
         # Safety timeout tracking.  Edge-based arming on zone entry
@@ -606,7 +848,30 @@ class Buffer:
             self._initial_fill_until = 0.0
             self._sync()
 
-        # Compute and apply multiplier
+        # Mid-recovery handling: detect exit conditions before deciding
+        # what (if anything) to apply.
+        if self._extreme_recovery_active is not None:
+            if not self._recovery_still_safe(eventtime):
+                self._exit_extreme_recovery(
+                    eventtime, "no-longer-safe")
+            elif zone == ZONE_MIDDLE:
+                self._exit_extreme_recovery(
+                    eventtime, "reached-middle")
+            if self._extreme_recovery_active is not None:
+                # Still recovering — leave _rd_multiplier alone.
+                return
+
+        # Extreme zones go through unsync-and-recover, not multiplier.
+        if zone in (ZONE_FULL, ZONE_EMPTY) and self._synced_to is not None:
+            action, fill_speed = self._recovery_decision(eventtime, zone)
+            if action == RECOVERY_ENTER:
+                self._enter_extreme_recovery(eventtime, zone, fill_speed)
+                return
+            # DEFER: leave _rd_multiplier alone; the safety timeout
+            # path is the eventual escape.
+            return
+
+        # Non-extreme zones: apply the drift-gain multiplier as usual.
         multiplier = self._zone_to_multiplier(zone)
         if self._synced_to is not None:
             self._apply_multiplier(multiplier)
@@ -992,8 +1257,7 @@ class Buffer:
             "manual_speed": self.manual_speed,
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
-            "multiplier_low": self.multiplier_low,
-            "multiplier_high": self.multiplier_high,
+            "extreme_recovery_active": self._extreme_recovery_active,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -1021,7 +1285,7 @@ class Buffer:
             "  Synced to: %s\n"
             "  Manual speed: %.1f mm/s  chunk: %.1f mm\n"
             "  Drift gain: %.3f\n"
-            "  Multiplier low/high: %.3f / %.3f\n"
+            "  Recovery active: %s\n"
             "  Printing: %s"
             % (
                 status["name"],
@@ -1041,8 +1305,7 @@ class Buffer:
                 status["manual_speed"],
                 status["manual_move_distance"],
                 status["drift_gain"],
-                status["multiplier_low"],
-                status["multiplier_high"],
+                status["extreme_recovery_active"] or "none",
                 status["is_printing"],
             )
         )

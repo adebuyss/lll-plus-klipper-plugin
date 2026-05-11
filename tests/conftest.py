@@ -273,21 +273,68 @@ class MockPrinterExtruderStepper:
 
 
 class MockExtruder:
-    """Mock for kinematics.extruder.PrinterExtruder."""
+    """Mock for kinematics.extruder.PrinterExtruder.
+
+    The buffer's _estimated_extruder_rate samples
+    extruder.extruder_stepper.stepper.get_commanded_position() across
+    eventtime samples to derive a signed mm/s rate. Tests can drive
+    this either by setting `_position` directly between sensor ticks
+    or by calling `set_rate(mm_per_s, t0)` to have the position
+    auto-advance with eventtime queries.
+    """
 
     def __init__(self, name="extruder"):
         self._name = name
+        self.extruder_stepper = _MockMainExtruderStepper()
 
     def get_name(self):
         return self._name
+
+    def set_rate(self, mm_per_s, t0=0.0):
+        """Configure auto-advancing position: pos(t) = mm_per_s * (t - t0)."""
+        self.extruder_stepper.stepper.set_rate(mm_per_s, t0)
+
+
+class _MockMainExtruderStepper:
+    """Stepper-host wrapper so extruder.extruder_stepper.stepper resolves."""
+
+    def __init__(self):
+        self.stepper = _MockExtrusionStepper()
+
+
+class _MockExtrusionStepper:
+    """Position source for the active extruder. Either a static value the
+    test sets via _position, or an auto-advancing value driven by set_rate."""
+
+    def __init__(self):
+        self._position = 0.0
+        self._rate = None  # (mm_per_s, t0) when auto-advancing
+        self._eventtime_provider = None
+
+    def set_rate(self, mm_per_s, t0=0.0):
+        self._rate = (mm_per_s, t0)
+
+    def get_commanded_position(self):
+        if self._rate is None or self._eventtime_provider is None:
+            return self._position
+        eventtime = self._eventtime_provider()
+        rate, t0 = self._rate
+        return rate * (eventtime - t0)
 
 
 class MockToolhead:
     """Mock for toolhead.ToolHead."""
 
-    def __init__(self):
+    def __init__(self, reactor=None):
+        self._reactor = reactor
         self._extruder = MockExtruder()
+        self._wire_extruder(self._extruder)
         self.flush_count = 0
+
+    def _wire_extruder(self, extruder):
+        if self._reactor is not None:
+            extruder.extruder_stepper.stepper._eventtime_provider = (
+                self._reactor.monotonic)
 
     def get_extruder(self):
         return self._extruder
@@ -295,6 +342,7 @@ class MockToolhead:
     def set_extruder(self, extruder):
         """Test helper: swap the active extruder."""
         self._extruder = extruder
+        self._wire_extruder(extruder)
 
     def flush_step_generation(self):
         self.flush_count += 1
@@ -349,7 +397,7 @@ class MockPrinter:
         self.buttons = MockButtons()
         self.print_stats = MockPrintStats()
         self.pause_resume = MockPauseResume()
-        self.toolhead = MockToolhead()
+        self.toolhead = MockToolhead(reactor=self.reactor)
         self.printer_es = MockPrinterExtruderStepper(toolhead=self.toolhead)
         self.force_move = MockForceMove()
         self.event_handlers = {}

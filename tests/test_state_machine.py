@@ -38,19 +38,34 @@ class TestMiddleZone:
 
 
 class TestEmptyZone:
-    def test_empty_increases_multiplier(self, enabled_buf):
+    def test_empty_enters_recovery_and_unsyncs(self, enabled_buf):
+        # Forward extruder rate so EMPTY recovery is ENTERed.
+        enabled_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
         set_sensors(enabled_buf, empty=True)
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_EMPTY
-        assert enabled_buf._rd_multiplier > 1.0
+        # Recovery owns the unsynced state; rd_multiplier is left at 1.0
+        # (recovery does not chase with rotation_distance).
+        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        assert enabled_buf._synced_to is None
 
 
 class TestFullZone:
-    def test_full_decreases_multiplier(self, enabled_buf):
+    def test_full_enters_recovery_when_extruder_consuming(
+            self, enabled_buf, reactor):
+        # Forward extruder rate so FULL recovery is ENTERed.  Two-step
+        # update so the rate sampler has a prior reference (it returns
+        # 0.0 on its first call regardless of the underlying rate).
+        enabled_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
         set_sensors(enabled_buf, full=True)
+        enabled_buf._update_rotation_distance(0.0)
+        # First call seeds the rate sample → DEFER, no recovery yet.
+        assert enabled_buf._extreme_recovery_active is None
+        reactor._monotonic = 1.0
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_FULL
-        assert enabled_buf._rd_multiplier < 1.0
+        assert enabled_buf._extreme_recovery_active == ZONE_FULL
+        assert enabled_buf._synced_to is None
 
 
 class TestEmptyMiddleZone:
@@ -59,8 +74,10 @@ class TestEmptyMiddleZone:
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_EMPTY_MIDDLE
         assert enabled_buf._rd_multiplier > 1.0
-        # drift correction is gentler than the safety zone correction
-        assert enabled_buf._rd_multiplier < enabled_buf.multiplier_high
+        # drift correction is gentler than full extreme — capped at
+        # 1.0 + drift_gain (no escalation in the near-edge zone).
+        assert enabled_buf._rd_multiplier == pytest.approx(
+            1.0 + enabled_buf.drift_gain)
 
 
 class TestFullMiddleZone:
@@ -69,8 +86,8 @@ class TestFullMiddleZone:
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
         assert enabled_buf._rd_multiplier < 1.0
-        # drift correction is gentler than the safety zone correction
-        assert enabled_buf._rd_multiplier > enabled_buf.multiplier_low
+        assert enabled_buf._rd_multiplier == pytest.approx(
+            1.0 - enabled_buf.drift_gain)
 
 
 class TestSensorConflict:
@@ -106,6 +123,8 @@ class TestGuardConditions:
 
 class TestZoneTransitions:
     def test_middle_to_empty_to_middle(self, enabled_buf):
+        # Forward extruder rate so EMPTY recovery is ENTERed.
+        enabled_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
         set_sensors(enabled_buf, middle=True)
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._current_zone == ZONE_MIDDLE
@@ -114,11 +133,14 @@ class TestZoneTransitions:
         set_sensors(enabled_buf, empty=True)
         enabled_buf._update_rotation_distance(2.0)
         assert enabled_buf._current_zone == ZONE_EMPTY
-        assert enabled_buf._rd_multiplier > 1.0
+        # Recovery owns this; buffer is unsynced, no multiplier change.
+        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
 
         set_sensors(enabled_buf, middle=True)
         enabled_buf._update_rotation_distance(3.0)
         assert enabled_buf._current_zone == ZONE_MIDDLE
+        # Returning to MIDDLE exits recovery and re-syncs at 1.0.
+        assert enabled_buf._extreme_recovery_active is None
         assert enabled_buf._rd_multiplier == 1.0
 
     def test_full_to_full_middle_to_middle(self, enabled_buf):
