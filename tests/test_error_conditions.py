@@ -76,13 +76,33 @@ class TestSensorConflict:
     def test_conflict_triggers_error(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        # First tick: deferred (might be transient out-of-order MCU
+        # report).  Control-timer promotes a persistent conflict to a
+        # hard error once it survives control_interval.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
     def test_error_stops_motor(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.motor_direction == "stop"
+
+    def test_transient_conflict_does_not_error(self, enabled_buf):
+        # First sensor flip leaves empty+full both true momentarily;
+        # the next flip resolves it.  Buffer must not crash the print.
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf.state != STATE_ERROR
+        # Resolve the transient — empty inactive, normal FULL_MIDDLE.
+        set_sensors(enabled_buf, empty=False, middle=True, full=True)
+        enabled_buf._update_rotation_distance(1.05)
+        # _conflict_since cleared, state stable.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
+        assert enabled_buf.state != STATE_ERROR
+        assert enabled_buf._conflict_since == 0.0
 
 
 class TestErrorBlocking:

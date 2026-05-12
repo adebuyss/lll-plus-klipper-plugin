@@ -47,6 +47,9 @@ class TestErrorBlocksGcodeCommands:
     def test_error_via_sensor_blocks_feed(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        # Conflict deferred initially; control-timer promotes persistent
+        # conflict to an error after control_interval.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         enabled_buf.cmd_BUFFER_FEED(MockGcmd("BUFFER_FEED"))
         assert enabled_buf.state == STATE_ERROR

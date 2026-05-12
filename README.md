@@ -124,6 +124,7 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `manual_speed`         | 40.0    | Speed (mm/s) for manual feed/retract and recovery fill chunks    |
 | `manual_accel`         | 1500.0  | Acceleration (mm/s^2) for manual feed/retract                    |
 | `manual_move_distance` | 10.0    | Distance (mm) per manual / safety-retract chunk                  |
+| `recovery_move_distance` | 5.0   | Distance (mm) per EMPTY-recovery fill chunk (smaller → less overshoot toward FULL) |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
 | `manual_feed_full_timeout` | 3.0 | Seconds full sensor must hold before auto-stopping manual feed   |

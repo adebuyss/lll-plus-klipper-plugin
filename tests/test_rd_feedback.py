@@ -117,6 +117,10 @@ class TestSensorCallbackUpdatesMultiplier:
         # Trigger empty first, then full
         trigger_sensor(buttons, "PE0", True, 1.0)
         trigger_sensor(buttons, "PE2", True, 1.0)
+        # Initial conflict is deferred (could be transient out-of-order
+        # MCU report).  Persistent conflict promoted by control timer.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
@@ -512,5 +516,196 @@ class TestRecoveryExitOnSkipMiddle:
         printing_buf._update_rotation_distance(2.0)
         assert printing_buf._extreme_recovery_active is None
         assert printing_buf._synced_to is not None
+
+
+class TestRecoveryMoveDistance:
+    """The new recovery_move_distance config drives EMPTY-recovery chunk
+    size, independent of manual_move_distance."""
+
+    def test_default_is_5mm(self, enabled_buf):
+        assert enabled_buf.recovery_move_distance == 5.0
+
+    def test_recovery_chunk_uses_recovery_distance(
+            self, printing_buf, reactor, force_move):
+        # Override to a distinctive value so the assertion can't pass
+        # by coincidence with manual_move_distance.
+        printing_buf.recovery_move_distance = 2.5
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # First chunk fires inline from _enter_extreme_recovery.
+        assert force_move.moves[-1][1] == pytest.approx(2.5)
+
+    def test_recovery_distance_independent_of_manual(
+            self, printing_buf, reactor, force_move):
+        printing_buf.manual_move_distance = 12.0
+        printing_buf._manual_chunk_dist = 12.0
+        printing_buf.recovery_move_distance = 3.0
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert force_move.moves[-1][1] == pytest.approx(3.0)
+
+    def test_status_exposes_recovery_distance(self, enabled_buf):
+        status = enabled_buf.get_status(0.0)
+        assert "recovery_move_distance" in status
+        assert status["recovery_move_distance"] == 5.0
+
+
+class TestRecoveryWatchdog:
+    """Per-attempt EMPTY-recovery cap enforced from the control timer,
+    so it fires even when the chunk-callback chain stalls."""
+
+    def test_watchdog_fires_when_chunks_stop(
+            self, printing_buf, reactor):
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+
+        # Simulate the chunk chain having gone silent: don't fire any
+        # more _do_recovery_fill_chunk calls.  Drive control timer past
+        # extreme_recovery_timeout — watchdog should fault.
+        reactor._monotonic = (
+            1.0 + printing_buf.extreme_recovery_timeout + 0.1)
+        printing_buf._control_timer_cb(reactor._monotonic)
+        assert printing_buf.state == STATE_ERROR
+        assert "watchdog" in printing_buf.error_msg.lower()
+
+    def test_watchdog_skipped_for_full_recovery(
+            self, printing_buf, reactor):
+        # FULL recovery's escape is full_safety_timeout ->
+        # _do_safety_retract (the recoverable path), not _handle_error.
+        # The EMPTY-only watchdog must not promote a FULL stall to an
+        # error.
+        _seed_rate(printing_buf, reactor, printing_buf.manual_speed)
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, middle=False, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+
+        # Advance past extreme_recovery_timeout — watchdog must NOT fire
+        # (FULL recovery is excluded from the watchdog scope).
+        reactor._monotonic = (
+            1.0 + printing_buf.extreme_recovery_timeout + 0.1)
+        printing_buf._control_timer_cb(reactor._monotonic)
+        assert printing_buf.state != STATE_ERROR
+
+
+class TestSafetyZoneStartInvariantDuringRecovery:
+    """_safety_zone_start must not be re-armed by zone bouncing inside
+    the same recovery cycle.  Cumulative cap measures from recovery
+    entry, not the latest empty/full re-entry."""
+
+    def test_empty_bounce_does_not_reset_safety_start(
+            self, printing_buf, reactor):
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        start_before = printing_buf._safety_zone_start
+        assert start_before > 0.0
+
+        # Bounce out to empty_middle and back to empty.
+        set_sensors(printing_buf, empty=False)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        # _safety_zone_start should NOT have been cleared (recovery in
+        # flight; cumulative cap keeps counting).
+        assert printing_buf._safety_zone_start == start_before
+
+        set_sensors(printing_buf, empty=True)
+        reactor._monotonic = 3.0
+        printing_buf._update_rotation_distance(3.0)
+        # Re-entry into empty during the same recovery cycle must not
+        # reset the cumulative clock.
+        assert printing_buf._safety_zone_start == start_before
+
+
+class TestSensorConflictDebounce:
+    """Out-of-order callbacks within one MCU report can produce a
+    transient empty+full state.  That should defer, not error.  A
+    persistent conflict (real wiring fault) escalates via the control
+    timer."""
+
+    def test_transient_conflict_then_resolved(self, enabled_buf):
+        # Force the transient state, then resolve it before
+        # control_interval elapses.
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf.state != STATE_ERROR
+        assert enabled_buf._conflict_since == 1.0
+        set_sensors(enabled_buf, empty=False, middle=True, full=True)
+        enabled_buf._update_rotation_distance(1.05)
+        assert enabled_buf._conflict_since == 0.0
+        enabled_buf._control_timer_cb(1.5)
+        assert enabled_buf.state != STATE_ERROR
+
+    def test_persistent_conflict_escalates(self, enabled_buf):
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        # Conflict survives past control_interval.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
+        assert enabled_buf.state == STATE_ERROR
+
+
+class TestRecoveryChunkSelfPaced:
+    """The chunk-callback chain is timer-paced (not register_callback)
+    so it's not at the mercy of reactor-iteration latency under
+    mid-print toolhead load."""
+
+    def test_chunk_registers_pacing_timer(
+            self, printing_buf, reactor, force_move):
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # Timer handle must be registered after the first chunk.
+        assert printing_buf._recovery_fill_timer is not None
+        # No register_callback queued for the chunk chain (we now use
+        # update_timer instead).  At least one move was issued.
+        assert len(force_move.moves) >= 1
+
+
+class TestDlogThrottle:
+    """Zone-transition and rd_mult logs should collapse rapid same-key
+    repeats so klippy.log isn't drowned by sensor chatter."""
+
+    def test_throttle_suppresses_repeats(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        # 5 hits within the 0.25s window — first one emits, the rest
+        # are dropped.
+        for i in range(5):
+            buf._dlog_throttled(1.0 + i * 0.01, "key", 0.25, "hello %d", i)
+        emitted = [r.getMessage() for r in caplog.records
+                   if "hello" in r.getMessage()]
+        assert len(emitted) == 1
+        assert "hello 0" in emitted[0]
+
+    def test_throttle_releases_after_window(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        buf._dlog_throttled(1.0, "key", 0.25, "first")
+        # Three suppressed within window.
+        for i in range(3):
+            buf._dlog_throttled(1.05 + i * 0.01, "key", 0.25, "drop %d", i)
+        # Past the window — emits the new line AND a "suppressed" summary.
+        buf._dlog_throttled(2.0, "key", 0.25, "after")
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("first" in m for m in msgs)
+        assert any("after" in m for m in msgs)
+        assert any("suppressed 3" in m for m in msgs)
+
+    def test_different_keys_dont_interfere(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        buf._dlog_throttled(1.0, "key_a", 0.25, "A")
+        buf._dlog_throttled(1.001, "key_b", 0.25, "B")
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(m.endswith("A") for m in msgs)
+        assert any(m.endswith("B") for m in msgs)
 
 
