@@ -133,6 +133,12 @@ class Buffer:
         self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
+        # Chunk size for active EMPTY-zone recovery feeds.  Independent
+        # from manual_move_distance: recovery wants smaller chunks so
+        # the buffer lands in the MIDDLE band without overshooting to
+        # FULL, while manual feed is fine with the larger 10 mm chunk.
+        self.recovery_move_distance = config.getfloat(
+            "recovery_move_distance", 5.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
@@ -240,6 +246,12 @@ class Buffer:
         self._extreme_recovery_active = None
         self._recovery_fill_speed = None
         self._recovery_started_at = 0.0
+        # Stall-watchdog instrumentation for EMPTY recovery: chunk
+        # counter (logged at exit) and the eventtime of the last issued
+        # chunk (control-timer uses this to detect a chain stall and
+        # kick a fresh chunk).
+        self._recovery_chunk_count = 0
+        self._last_recovery_chunk_at = 0.0
         # Cached (eventtime, position) for _estimated_extruder_rate.
         self._last_extruder_position_sample = None
         # Cached most-recent computed rate; returned by
@@ -247,8 +259,23 @@ class Buffer:
         # eventtime (dt too small to derive a fresh rate).
         self._last_computed_extruder_rate = 0.0
 
+        # Transient sensor-conflict deferral: timestamp of the first
+        # tick where empty+full were both true.  Cleared on the next
+        # clean zone read.  Promoted to a hard error from the control
+        # timer if it persists past control_interval (i.e. a real
+        # wiring fault, not just out-of-order callbacks within one MCU
+        # report).
+        self._conflict_since = 0.0
+
+        # Per-key debug-log throttle: key -> (last_eventtime, suppressed_count)
+        self._dlog_throttle = {}
+
         # Timer handles
         self._control_timer = None
+        # EMPTY-recovery chunk-loop timer.  Self-paced so the chain is
+        # not at the mercy of register_callback latency under mid-print
+        # toolhead load.
+        self._recovery_fill_timer = None
 
         # Register events
         self.printer.register_event_handler("klippy:ready",
@@ -496,6 +523,9 @@ class Buffer:
         self._extreme_recovery_active = None
         self._recovery_fill_speed = None
         self._recovery_started_at = 0.0
+        self._recovery_chunk_count = 0
+        self._last_recovery_chunk_at = 0.0
+        self._cancel_recovery_fill_timer()
         # Note: the cached extruder-rate sample is NOT reset here —
         # _enter_extreme_recovery routes through _unsync and the
         # recovery decision needs the fresh rate.  Tool-change paths
@@ -618,6 +648,35 @@ class Buffer:
         logging.info("buffer[%s] t=%.3f debug: " + fmt,
                      self.short_name, eventtime, *args)
 
+    def _dlog_throttled(self, eventtime, key, window, fmt, *args):
+        """Throttled debug log: collapse repeated same-key entries inside
+        `window` seconds.  On the first call after the gap, emit the
+        line plus a "(N suppressed)" summary if any were dropped.
+
+        Used to tame rd_mult / zone-transition chatter when filament
+        oscillates at a sensor boundary; bouncing 30+ times per second
+        between two adjacent zones would otherwise drown other Klipper
+        log messages.  Each distinct key throttles independently so a
+        genuinely new edge breaks through immediately.
+        """
+        if not self.debug:
+            return
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        last = self._dlog_throttle.get(key)
+        if last is not None:
+            last_t, count = last
+            if eventtime - last_t < window:
+                self._dlog_throttle[key] = (last_t, count + 1)
+                return
+            if count > 0:
+                logging.info(
+                    "buffer[%s] t=%.3f debug: (suppressed %d %s repeats)",
+                    self.short_name, eventtime, count, key)
+        self._dlog_throttle[key] = (eventtime, 0)
+        logging.info("buffer[%s] t=%.3f debug: " + fmt,
+                     self.short_name, eventtime, *args)
+
     # --- Extruder rate sampling + recovery decision ---
 
     def _estimated_extruder_rate(self, eventtime):
@@ -731,12 +790,13 @@ class Buffer:
         self._extreme_recovery_active = zone
         self._recovery_fill_speed = fill_speed
         self._recovery_started_at = eventtime
+        self._recovery_chunk_count = 0
+        self._last_recovery_chunk_at = eventtime
         self._dlog(eventtime,
                    "recovery enter zone=%s fill_speed=%.2f", zone, fill_speed)
         if zone == ZONE_EMPTY and self.force_move is not None:
             # Kick off chunked fill immediately; subsequent chunks are
-            # scheduled callback-to-callback (no waiting on the 0.5s
-            # control_interval tick).
+            # paced by _recovery_fill_timer.
             self._do_recovery_fill_chunk(eventtime)
         # FULL recovery is passive — nothing more to do here.  Sensor
         # edge callbacks will detect the zone exit and call
@@ -745,21 +805,31 @@ class Buffer:
     def _do_recovery_fill_chunk(self, eventtime):
         """Issue one EMPTY-recovery fill chunk, schedule the next."""
         if self._extreme_recovery_active != ZONE_EMPTY:
+            # Chain ended via some other path (exit, unsync, error).
+            # Log so this silent return isn't invisible in the log when
+            # diagnosing chunk-chain regressions.
+            self._dlog(eventtime,
+                       "recovery chunk skipped (active=%s) — chain ending",
+                       self._extreme_recovery_active)
+            self._cancel_recovery_fill_timer()
             return
         if not self.material_present:
             self._dlog(eventtime,
                        "recovery aborting EMPTY chunk: material gone")
             self._exit_extreme_recovery(eventtime, "material-gone")
             return
-        # Per-attempt timeout
+        # Per-attempt timeout (also enforced from _control_timer_cb as a
+        # safety net when chunk pacing slows).
         if (eventtime - self._recovery_started_at
                 >= self.extreme_recovery_timeout):
             self._dlog(eventtime,
-                       "recovery EMPTY timeout after %.1fs",
-                       self.extreme_recovery_timeout)
+                       "recovery EMPTY timeout after %.1fs (chunks=%d)",
+                       self.extreme_recovery_timeout,
+                       self._recovery_chunk_count)
             self._extreme_recovery_active = None
             self._recovery_fill_speed = None
             self._recovery_started_at = 0.0
+            self._cancel_recovery_fill_timer()
             self._handle_error(
                 "EMPTY recovery exceeded %.0fs"
                 % self.extreme_recovery_timeout)
@@ -777,7 +847,7 @@ class Buffer:
         try:
             self.force_move.manual_move(
                 self.extruder_stepper.stepper,
-                self._manual_chunk_dist,
+                self.recovery_move_distance,
                 new_speed,
                 self.manual_accel)
         except Exception as e:
@@ -786,22 +856,58 @@ class Buffer:
                 % (self.short_name, e))
             self._exit_extreme_recovery(eventtime, "chunk-failed")
             return
-        self.reactor.register_callback(self._recovery_fill_cb)
+        # Track chunk pacing for the control-timer stall watchdog.
+        self._recovery_chunk_count += 1
+        self._last_recovery_chunk_at = eventtime
+        # Self-pace the chunk loop via a short timer rather than
+        # register_callback (which fires next reactor iteration and is
+        # vulnerable to mid-print scheduling jitter — the chain can
+        # space out under toolhead load and starve the per-attempt
+        # timeout check inside this function).  Schedule the next
+        # chunk just before the previous one finishes physically.
+        nominal_period = self.recovery_move_distance / max(new_speed, 1.0)
+        next_wake = eventtime + max(nominal_period * 0.5, 0.05)
+        if self._recovery_fill_timer is None:
+            self._recovery_fill_timer = self.reactor.register_timer(
+                self._recovery_fill_timer_cb, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._recovery_fill_timer, next_wake)
 
-    def _recovery_fill_cb(self, eventtime):
-        self._do_recovery_fill_chunk(eventtime)
+    def _recovery_fill_timer_cb(self, eventtime):
+        """Pacing timer for the EMPTY recovery chunk loop.
+
+        Returning NEVER while _do_recovery_fill_chunk reschedules via
+        update_timer keeps a single registered timer alive for the
+        lifetime of the buffer (cheap) rather than churning handles.
+        """
+        if self._extreme_recovery_active == ZONE_EMPTY:
+            self._do_recovery_fill_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_recovery_fill_timer(self):
+        if self._recovery_fill_timer is not None:
+            self.reactor.update_timer(
+                self._recovery_fill_timer, self.reactor.NEVER)
 
     def _exit_extreme_recovery(self, eventtime, reason):
         """Clear recovery state and resync the buffer stepper."""
         if self._extreme_recovery_active is None:
             return
         prev_zone = self._extreme_recovery_active
+        elapsed = (eventtime - self._recovery_started_at
+                   if self._recovery_started_at > 0.0 else 0.0)
+        chunks = self._recovery_chunk_count
         self._extreme_recovery_active = None
         self._recovery_fill_speed = None
         self._recovery_started_at = 0.0
+        self._recovery_chunk_count = 0
+        self._last_recovery_chunk_at = 0.0
+        self._cancel_recovery_fill_timer()
         self._dlog(eventtime,
-                   "recovery exit reason=%s prev=%s zone=%s",
-                   reason, prev_zone, self._current_zone)
+                   "recovery exit reason=%s prev=%s zone=%s "
+                   "chunks=%d elapsed=%.2fs",
+                   reason, prev_zone, self._current_zone, chunks, elapsed)
         # Re-sync directly so we don't wait for the next control tick.
         if self.auto_enabled and self.state not in (
                 STATE_DISABLED, STATE_ERROR):
@@ -823,8 +929,14 @@ class Buffer:
         self._rd_multiplier = multiplier
         new_rd = self._base_rd / multiplier
         self.extruder_stepper.stepper.set_rotation_distance(new_rd)
-        self._dlog(None, "rd_mult=%.4f rd=%.4f zone=%s",
-                   multiplier, new_rd, self._current_zone)
+        # Throttled — sensor bouncing at the middle/full_middle (or
+        # middle/empty_middle) boundary toggles this every few ms and
+        # would otherwise drown other Klipper logs.  Per-zone key so a
+        # genuine transition to a new zone still emits immediately.
+        self._dlog_throttled(
+            None, "rd_mult zone=%s" % self._current_zone, 0.25,
+            "rd_mult=%.4f rd=%.4f zone=%s",
+            multiplier, new_rd, self._current_zone)
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -838,15 +950,32 @@ class Buffer:
             return
         zone = self._compute_zone()
         if zone is None:
-            self._handle_error(
-                "Sensor conflict: empty and full both triggered")
+            # Transient empty+full conflict: Klipper's buttons module
+            # dispatches edge callbacks serially across one MCU report,
+            # so a fast EMPTY->FULL transit can arrive as
+            # "full=True (set first) before empty=False (set next)" —
+            # _compute_zone sees both true and returns None.  Treat as
+            # a deferral; the next callback resolves it.  Only escalate
+            # if the conflict persists past control_interval (the
+            # control timer promotes it to _handle_error).
+            if self._conflict_since <= 0.0:
+                self._conflict_since = eventtime
+            self._dlog(eventtime,
+                       "transient sensor conflict — deferring")
             return
+        self._conflict_since = 0.0
 
         # Track zone transitions
         entered = zone != self._current_zone
         if entered:
-            self._dlog(eventtime, "zone %s -> %s",
-                       self._current_zone, zone)
+            # Throttled — adjacent-zone bouncing at a sensor boundary
+            # otherwise produces 40+ log lines per second.  The key
+            # encodes both endpoints so a true new edge (e.g.
+            # full_middle -> full) breaks through immediately.
+            self._dlog_throttled(
+                eventtime,
+                "zone %s->%s" % (self._current_zone, zone), 0.25,
+                "zone %s -> %s", self._current_zone, zone)
             self._prev_zone = self._current_zone
         self._current_zone = zone
 
@@ -869,13 +998,25 @@ class Buffer:
         # the timer counts only post-print-start time, exactly as
         # be70969 intended.
         if zone in (ZONE_EMPTY, ZONE_FULL):
-            if entered:
+            in_active_recovery = self._extreme_recovery_active == zone
+            if entered and not in_active_recovery:
+                # Fresh entry to a safety zone — start the cumulative
+                # clock.  Skip during active same-zone recovery so a
+                # bounce out and back into the zone (e.g. empty <->
+                # empty_middle while chunks pump) doesn't reset the
+                # cap that's already counting from recovery_started_at.
                 self._safety_zone_start = eventtime
             elif (self._safety_zone_start <= 0.0
-                    and self._is_printing()):
+                    and self._is_printing()
+                    and not in_active_recovery):
                 self._safety_zone_start = eventtime
         else:
-            self._safety_zone_start = 0.0
+            # Only clear when no recovery is in flight — empty <->
+            # empty_middle bouncing during recovery should not reset
+            # the cumulative cap (the recovery's per-attempt cap is
+            # measured from _recovery_started_at independently).
+            if self._extreme_recovery_active is None:
+                self._safety_zone_start = 0.0
 
         # Clear initial fill once filament reaches middle or beyond
         if (self._initial_fill_until > 0.0
@@ -1058,6 +1199,56 @@ class Buffer:
         if self.state in (STATE_MANUAL_RETRACT,
                           STATE_ERROR, STATE_DISABLED):
             return eventtime + self.control_interval
+
+        # Persistent sensor conflict escalation.  _update_rotation_distance
+        # defers a transient empty+full conflict (out-of-order callbacks
+        # in one MCU report); if the conflict survives past
+        # control_interval it's a real wiring fault and must error.
+        if (self._conflict_since > 0.0
+                and eventtime - self._conflict_since
+                >= self.control_interval):
+            self._conflict_since = 0.0
+            self._handle_error(
+                "Sensor conflict: empty and full both triggered")
+            return eventtime + self.control_interval
+
+        # Per-attempt EMPTY-recovery watchdog.  Enforced here too so the
+        # cap fires when the chunk-callback chain stalls under mid-print
+        # toolhead load (the per-attempt check inside
+        # _do_recovery_fill_chunk only ticks when chunks fire).  FULL
+        # recovery is intentionally excluded — its escape is the
+        # cumulative full_safety_timeout below, which routes to the
+        # recoverable _do_safety_retract path, not the print-faulting
+        # _handle_error path.
+        if (self._extreme_recovery_active == ZONE_EMPTY
+                and self._recovery_started_at > 0.0):
+            recovery_elapsed = eventtime - self._recovery_started_at
+            if recovery_elapsed >= self.extreme_recovery_timeout:
+                chunks = self._recovery_chunk_count
+                self._extreme_recovery_active = None
+                self._recovery_fill_speed = None
+                self._recovery_started_at = 0.0
+                self._recovery_chunk_count = 0
+                self._last_recovery_chunk_at = 0.0
+                self._cancel_recovery_fill_timer()
+                self._handle_error(
+                    "EMPTY recovery exceeded %.0fs (watchdog, chunks=%d)"
+                    % (self.extreme_recovery_timeout, chunks))
+                return eventtime + self.control_interval
+            # Chunk-chain stall kick: if EMPTY recovery is armed but no
+            # chunk has fired in over a second, the chain has stopped
+            # without taking a logged exit path.  Force a fresh chunk
+            # call so the loop either resumes or hits the per-attempt
+            # cap above on the next control-timer tick.
+            if (self._last_recovery_chunk_at > 0.0
+                    and eventtime - self._last_recovery_chunk_at > 1.0):
+                logging.warning(
+                    "buffer[%s]: recovery chunk chain stalled "
+                    "(%.2fs since last chunk, count=%d) — kicking"
+                    % (self.short_name,
+                       eventtime - self._last_recovery_chunk_at,
+                       self._recovery_chunk_count))
+                self._do_recovery_fill_chunk(eventtime)
 
         # Safety timeout check — only tick while printing.  When the
         # extruder is idle, the multiplier has no moves to act on, so
@@ -1309,8 +1500,10 @@ class Buffer:
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
             "manual_move_distance": self.manual_move_distance,
+            "recovery_move_distance": self.recovery_move_distance,
             "drift_gain": self.drift_gain,
             "extreme_recovery_active": self._extreme_recovery_active,
+            "recovery_chunk_count": self._recovery_chunk_count,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -1336,7 +1529,8 @@ class Buffer:
             "  Zone: %s (prev: %s)\n"
             "  RD multiplier: %.4f (base: %.4f)\n"
             "  Synced to: %s\n"
-            "  Manual speed: %.1f mm/s  chunk: %.1f mm\n"
+            "  Manual speed: %.1f mm/s  chunk: %.1f mm  "
+            "recovery_chunk: %.1f mm\n"
             "  Drift gain: %.3f\n"
             "  Recovery active: %s\n"
             "  Printing: %s"
@@ -1357,6 +1551,7 @@ class Buffer:
                 status["synced_to"] or "none",
                 status["manual_speed"],
                 status["manual_move_distance"],
+                status["recovery_move_distance"],
                 status["drift_gain"],
                 status["extreme_recovery_active"] or "none",
                 status["is_printing"],

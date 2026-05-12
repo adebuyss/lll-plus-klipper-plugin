@@ -91,6 +91,10 @@ class TestSensorConflict:
     def test_empty_and_full_triggers_error(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        # Conflict is deferred at first (could be transient).  Persistent
+        # conflict escalates via the control timer after control_interval.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
