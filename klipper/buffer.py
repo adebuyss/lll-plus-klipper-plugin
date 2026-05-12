@@ -31,9 +31,10 @@ RECOVERY_OVERHEAD = 1.2
 # Cap recovery fill speed at this multiple of manual_speed to avoid
 # runaway from a transient extruder-rate measurement glitch.
 RECOVERY_SPEED_CAP_FACTOR = 4.0
-# Below this absolute extruder rate we consider the extruder idle
-# (units: mm/s).  Used by _recovery_decision to distinguish
-# forward / idle / retracting.
+# At or below this signed extruder rate (mm/s) we treat the extruder
+# as not consuming forward — covers both idle (rate ~= 0) and retract
+# (rate < 0).  Used by _recovery_decision: FULL recovery only enters
+# when rate > EPS, since passive drain assumes forward consumption.
 EXTRUDER_RATE_IDLE_EPS = 0.05
 
 # Extreme-zone recovery action codes returned by _recovery_decision.
@@ -138,10 +139,13 @@ class Buffer:
                                                 above=0.05)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
-        # Per-attempt cap on EMPTY-zone unsync-and-recover.  If the
-        # buffer has not exited the EMPTY range within this many seconds
-        # of chunked manual feeding, bail out and let the cumulative
-        # empty_safety_timeout escalate to an error.
+        # Per-attempt cap on EMPTY-zone unsync-and-recover.  If chunked
+        # recovery has not pulled the buffer out of the EMPTY range
+        # within this many seconds, _do_recovery_fill_chunk escalates
+        # directly to _handle_error.  empty_safety_timeout is the
+        # cumulative cap for cases where recovery is gated off while
+        # _safety_zone_start is armed (printing-in-EMPTY but
+        # _synced_to is None, e.g. mid-resync window).
         self.extreme_recovery_timeout = config.getfloat(
             "extreme_recovery_timeout", 10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
@@ -242,9 +246,6 @@ class Buffer:
         # _estimated_extruder_rate when called twice within the same
         # eventtime (dt too small to derive a fresh rate).
         self._last_computed_extruder_rate = 0.0
-        # Recovery exit deferred to a reactor callback so we don't
-        # toggle sync state from inside the chunk callback.
-        self._recovery_exit_pending = False
 
         # Timer handles
         self._control_timer = None
@@ -308,6 +309,18 @@ class Buffer:
         # follow the extruder until the user enables the buffer.
         try:
             self.extruder_stepper.sync_to_extruder(None)
+        except Exception:
+            pass
+        # Prime the extruder-rate sample so the very first recovery
+        # decision can compute a real slope instead of returning 0 on
+        # a None-sample.  Cost is one get_commanded_position() now;
+        # the saved (eventtime, pos) tuple becomes the baseline for
+        # the first _estimated_extruder_rate call.
+        try:
+            extruder = self.toolhead.get_extruder()
+            pos = extruder.extruder_stepper.stepper.get_commanded_position()
+            self._last_extruder_position_sample = (
+                self.reactor.monotonic(), pos)
         except Exception:
             pass
         # Record the currently active extruder so the control timer can
@@ -483,6 +496,11 @@ class Buffer:
         self._extreme_recovery_active = None
         self._recovery_fill_speed = None
         self._recovery_started_at = 0.0
+        # Note: the cached extruder-rate sample is NOT reset here —
+        # _enter_extreme_recovery routes through _unsync and the
+        # recovery decision needs the fresh rate.  Tool-change paths
+        # reset the cache in _handle_extruder_change instead, which is
+        # the only place the active extruder identity actually changes.
         if self._synced_to is None:
             return
         try:
@@ -513,6 +531,23 @@ class Buffer:
             return
         if not self.auto_enabled:
             return
+        # The active extruder identity is changing — drop the cached
+        # (eventtime, position) sample from the OLD extruder's stepper
+        # and the most-recent computed rate.  Without this, the next
+        # _estimated_extruder_rate call would compute a discontinuous
+        # delta against the new extruder's commanded position and
+        # produce a wildly wrong slope (often huge or large-negative).
+        # Re-prime against the new extruder so the next call has a
+        # usable baseline.
+        self._last_extruder_position_sample = None
+        self._last_computed_extruder_rate = 0.0
+        try:
+            new_ext = self.toolhead.get_extruder()
+            pos = new_ext.extruder_stepper.stepper.get_commanded_position()
+            self._last_extruder_position_sample = (
+                self.reactor.monotonic(), pos)
+        except Exception:
+            pass
         if self.extruder_name is not None:
             if new_extruder_name == self.extruder_name:
                 if self._synced_to is None:
@@ -849,12 +884,23 @@ class Buffer:
             self._sync()
 
         # Mid-recovery handling: detect exit conditions before deciding
-        # what (if anything) to apply.
+        # what (if anything) to apply.  Exit on "out of the recovery's
+        # own zone band" — EMPTY recovery exits once we leave the EMPTY
+        # range (anything from MIDDLE onward), FULL recovery exits once
+        # we leave the FULL range (anything to MIDDLE or below).  This
+        # mirrors _do_recovery_fill_chunk's exit gate so both paths
+        # agree, and covers a fast transition that skips MIDDLE between
+        # sensor callbacks.
         if self._extreme_recovery_active is not None:
+            active_zone = self._extreme_recovery_active
+            if active_zone == ZONE_EMPTY:
+                left_band = zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)
+            else:  # ZONE_FULL
+                left_band = zone not in (ZONE_FULL, ZONE_FULL_MIDDLE)
             if not self._recovery_still_safe(eventtime):
                 self._exit_extreme_recovery(
                     eventtime, "no-longer-safe")
-            elif zone == ZONE_MIDDLE:
+            elif left_band:
                 self._exit_extreme_recovery(
                     eventtime, "reached-middle")
             if self._extreme_recovery_active is not None:
@@ -862,7 +908,14 @@ class Buffer:
                 return
 
         # Extreme zones go through unsync-and-recover, not multiplier.
-        if zone in (ZONE_FULL, ZONE_EMPTY) and self._synced_to is not None:
+        # Only enter recovery while actually printing — outside a print
+        # the user may be loading/unloading or manually drawing
+        # filament, and surprise active motion (EMPTY) or auto-unsync
+        # (FULL) is unwanted.  This matches the safety-timeout policy
+        # which also only ticks while printing.
+        if (zone in (ZONE_FULL, ZONE_EMPTY)
+                and self._synced_to is not None
+                and self._is_printing()):
             action, fill_speed = self._recovery_decision(eventtime, zone)
             if action == RECOVERY_ENTER:
                 self._enter_extreme_recovery(eventtime, zone, fill_speed)

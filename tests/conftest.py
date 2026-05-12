@@ -506,6 +506,19 @@ def enabled_buf(buf, printer):
 
 
 @pytest.fixture
+def printing_buf(enabled_buf):
+    """enabled_buf with _print_stats.state flipped to 'printing'.
+
+    Recovery entry is gated on _is_printing() to avoid surprise motion
+    outside a print (user loading/unloading filament).  Tests that
+    exercise the recovery path use this fixture instead of plain
+    enabled_buf.
+    """
+    enabled_buf._print_stats.state = "printing"
+    return enabled_buf
+
+
+@pytest.fixture
 def buttons(printer):
     return printer.buttons
 

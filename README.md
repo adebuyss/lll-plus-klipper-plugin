@@ -118,9 +118,9 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | Parameter              | Default | Description                                                      |
 |------------------------|---------|------------------------------------------------------------------|
 | `drift_gain`           | 0.02    | Multiplier offset in EMPTY_MIDDLE / FULL_MIDDLE zones            |
-| `empty_safety_timeout` | 30.0    | Seconds in EMPTY zone before raising an error                    |
+| `empty_safety_timeout` | 30.0    | Cumulative cap while EMPTY-armed but recovery has not entered     |
 | `full_safety_timeout`  | 10.0    | Seconds in FULL zone before forced retract                       |
-| `extreme_recovery_timeout` | 10.0 | Per-attempt cap on the chunked EMPTY recovery feed              |
+| `extreme_recovery_timeout` | 10.0 | Per-attempt cap on the EMPTY recovery feed (hard error on exceed) |
 | `manual_speed`         | 40.0    | Speed (mm/s) for manual feed/retract and recovery fill chunks    |
 | `manual_accel`         | 1500.0  | Acceleration (mm/s^2) for manual feed/retract                    |
 | `manual_move_distance` | 10.0    | Distance (mm) per manual / safety-retract chunk                  |
@@ -181,7 +181,7 @@ The MIDDLE zone is the target equilibrium. When the middle sensor alone is activ
 When the buffer hits ZONE_EMPTY or ZONE_FULL the plugin no longer chases with `rotation_distance`. It unsyncs the buffer stepper and uses a recovery strategy until the buffer drifts back into MIDDLE, then re-syncs at multiplier 1.0:
 
 - **FULL** is recovered passively. The buffer stepper stops feeding, and the active extruder consuming filament drains the loop back toward MIDDLE. If the extruder is **idle or retracting** at the time, recovery is deferred (the passive-drain assumption requires forward consumption); the existing `full_safety_timeout` then escalates to a forced retract via `_do_safety_retract` as a fallback.
-- **EMPTY** is recovered actively. The buffer stepper is unsynced and chunked manual feeds push filament until the buffer reaches MIDDLE. Chunk speed defaults to `manual_speed` but is bumped to `extruder_rate * 1.2` (capped at `manual_speed * 4`) when the extruder is consuming faster than the configured manual speed. The per-attempt cap is `extreme_recovery_timeout`; the cumulative cap remains `empty_safety_timeout`.
+- **EMPTY** is recovered actively while printing. The buffer stepper is unsynced and chunked manual feeds push filament until the buffer reaches MIDDLE or beyond. Chunk speed defaults to `manual_speed` but is bumped to `extruder_rate * 1.2` (capped at `manual_speed * 4`) when the extruder is consuming faster than the configured manual speed. If recovery cannot exit EMPTY within `extreme_recovery_timeout` seconds, the buffer raises a hard error. `empty_safety_timeout` is the cumulative cap for the case where recovery never starts (e.g. EMPTY entered while not printing).
 
 ### Why no `multiplier_high` / `multiplier_low`?
 

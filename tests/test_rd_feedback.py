@@ -153,34 +153,34 @@ class TestUnsyncRestoresBaseRotationDistance:
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
         assert enabled_buf._rd_multiplier == 1.0
 
-    def test_recovery_entry_unsyncs_and_restores_base(self, enabled_buf,
+    def test_recovery_entry_unsyncs_and_restores_base(self, printing_buf,
                                                       stepper):
         """Entering EMPTY recovery should leave the stepper at base_rd
         (the recovery's internal _unsync restores it)."""
-        base_rd = enabled_buf._base_rd
-        enabled_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
-        assert enabled_buf._synced_to is None
+        base_rd = printing_buf._base_rd
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        assert printing_buf._synced_to is None
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
     def test_recovery_exit_resyncs_at_one(
-            self, enabled_buf, stepper, reactor):
+            self, printing_buf, stepper, reactor):
         """When zone returns to MIDDLE, recovery exits and resyncs at 1.0."""
-        base_rd = enabled_buf._base_rd
-        enabled_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        base_rd = printing_buf._base_rd
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
 
         # Zone progresses to MIDDLE — recovery exits, resyncs at 1.0.
-        set_sensors(enabled_buf, middle=True)
+        set_sensors(printing_buf, middle=True)
         reactor._monotonic = 2.0
-        enabled_buf._update_rotation_distance(2.0)
-        assert enabled_buf._extreme_recovery_active is None
-        assert enabled_buf._synced_to is not None
-        assert enabled_buf._rd_multiplier == 1.0
+        printing_buf._update_rotation_distance(2.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._synced_to is not None
+        assert printing_buf._rd_multiplier == 1.0
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
 
@@ -199,32 +199,32 @@ class TestRecoveryDecisionFull:
     the buffer cannot drain passively, so we DEFER and let
     full_safety_timeout fire _do_safety_retract instead."""
 
-    def test_full_forward_extruder_enters(self, enabled_buf, reactor):
-        _seed_rate(enabled_buf, reactor, 5.0)
+    def test_full_forward_extruder_enters(self, printing_buf, reactor):
+        _seed_rate(printing_buf, reactor, 5.0)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_FULL
-        assert enabled_buf._synced_to is None
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        assert printing_buf._synced_to is None
 
-    def test_full_idle_extruder_defers(self, enabled_buf, reactor):
+    def test_full_idle_extruder_defers(self, printing_buf, reactor):
         # Rate stays 0 — no set_rate call, no extruder activity.
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active is None
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active is None
         # Buffer remains synced; safety_zone_start is armed for the
         # cumulative full_safety_timeout escape.
-        assert enabled_buf._synced_to is not None
-        assert enabled_buf._safety_zone_start == 1.0
+        assert printing_buf._synced_to is not None
+        assert printing_buf._safety_zone_start == 1.0
 
-    def test_full_retracting_extruder_defers(self, enabled_buf, reactor):
-        _seed_rate(enabled_buf, reactor, -5.0)  # negative rate = retract
+    def test_full_retracting_extruder_defers(self, printing_buf, reactor):
+        _seed_rate(printing_buf, reactor, -5.0)  # negative rate = retract
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active is None
-        assert enabled_buf._synced_to is not None
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._synced_to is not None
 
     def test_full_safety_retract_fallback_after_defer(
             self, enabled_buf, reactor, force_move):
@@ -254,74 +254,74 @@ class TestRecoveryDecisionEmpty:
     fill_speed varies based on whether the extruder rate exceeds the
     configured manual_speed."""
 
-    def test_empty_idle_uses_manual_speed(self, enabled_buf, reactor,
+    def test_empty_idle_uses_manual_speed(self, printing_buf, reactor,
                                           force_move):
         # Idle extruder; first chunk should fire at manual_speed.
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         # The first chunk fires inline from _enter_extreme_recovery.
         assert len(force_move.moves) >= 1
         last = force_move.moves[-1]
         assert last[1] > 0  # forward feed
-        assert last[2] == pytest.approx(enabled_buf.manual_speed)
+        assert last[2] == pytest.approx(printing_buf.manual_speed)
 
     def test_empty_slow_extruder_uses_manual_speed(
-            self, enabled_buf, reactor, force_move):
+            self, printing_buf, reactor, force_move):
         # Slow extruder (well below manual_speed / 1.2) — recovery
         # should still pick manual_speed as the chunk rate.
-        slow_rate = enabled_buf.manual_speed / 4.0
-        _seed_rate(enabled_buf, reactor, slow_rate)
+        slow_rate = printing_buf.manual_speed / 4.0
+        _seed_rate(printing_buf, reactor, slow_rate)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         last = force_move.moves[-1]
-        assert last[2] == pytest.approx(enabled_buf.manual_speed)
+        assert last[2] == pytest.approx(printing_buf.manual_speed)
 
     def test_empty_fast_extruder_bumps_speed(
-            self, enabled_buf, reactor, force_move):
+            self, printing_buf, reactor, force_move):
         # Extruder faster than manual_speed / 1.2; chunk should fire at
         # rate * RECOVERY_OVERHEAD (1.2x) so we keep ahead of the drain.
-        fast_rate = enabled_buf.manual_speed * 2.0  # well over the threshold
-        _seed_rate(enabled_buf, reactor, fast_rate)
+        fast_rate = printing_buf.manual_speed * 2.0  # over the threshold
+        _seed_rate(printing_buf, reactor, fast_rate)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         last = force_move.moves[-1]
         # 1.2 = RECOVERY_OVERHEAD constant in buffer.py.
         assert last[2] == pytest.approx(fast_rate * 1.2)
 
-    def test_empty_fill_speed_capped(self, enabled_buf, reactor,
+    def test_empty_fill_speed_capped(self, printing_buf, reactor,
                                      force_move):
         # Pathological extruder rate (e.g. measurement glitch). The
         # cap is manual_speed * 4 (RECOVERY_SPEED_CAP_FACTOR).
-        crazy_rate = enabled_buf.manual_speed * 100.0
-        _seed_rate(enabled_buf, reactor, crazy_rate)
+        crazy_rate = printing_buf.manual_speed * 100.0
+        _seed_rate(printing_buf, reactor, crazy_rate)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
         last = force_move.moves[-1]
-        assert last[2] == pytest.approx(enabled_buf.manual_speed * 4.0)
+        assert last[2] == pytest.approx(printing_buf.manual_speed * 4.0)
 
     def test_empty_recovery_exits_when_zone_reaches_middle(
-            self, enabled_buf, reactor, force_move):
+            self, printing_buf, reactor, force_move):
         # After fill chunks land filament at middle, recovery exits
         # and re-syncs at multiplier 1.0.
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
 
         # Simulate the next chunk callback finding zone == MIDDLE.
-        set_sensors(enabled_buf, middle=True)
+        set_sensors(printing_buf, middle=True)
         reactor._monotonic = 1.5
-        enabled_buf._do_recovery_fill_chunk(1.5)
-        assert enabled_buf._extreme_recovery_active is None
-        assert enabled_buf._synced_to is not None
-        assert enabled_buf._rd_multiplier == 1.0
+        printing_buf._do_recovery_fill_chunk(1.5)
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._synced_to is not None
+        assert printing_buf._rd_multiplier == 1.0
 
 
 class TestRecoveryFillSpeedReevaluated:
@@ -329,26 +329,26 @@ class TestRecoveryFillSpeedReevaluated:
     and adjusts the next chunk's fill speed.  A mid-recovery print-speed
     change should bump the fill rate accordingly."""
 
-    def test_chunk_recomputes_fill_speed(self, enabled_buf, reactor,
+    def test_chunk_recomputes_fill_speed(self, printing_buf, reactor,
                                           force_move):
         # Start at slow extruder rate -> recovery enters at manual_speed.
-        slow = enabled_buf.manual_speed / 4.0
-        _seed_rate(enabled_buf, reactor, slow)
+        slow = printing_buf.manual_speed / 4.0
+        _seed_rate(printing_buf, reactor, slow)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
         assert force_move.moves[-1][2] == pytest.approx(
-            enabled_buf.manual_speed)
+            printing_buf.manual_speed)
 
         # Print speed jumps mid-recovery; re-seed sample so next call
         # observes the new rate.
-        fast = enabled_buf.manual_speed * 3.0
-        enabled_buf.toolhead.get_extruder().set_rate(fast, t0=1.0)
+        fast = printing_buf.manual_speed * 3.0
+        printing_buf.toolhead.get_extruder().set_rate(fast, t0=1.0)
         # Force a fresh sample reference at t=1.0
-        enabled_buf._last_extruder_position_sample = (1.0, 0.0)
+        printing_buf._last_extruder_position_sample = (1.0, 0.0)
         reactor._monotonic = 2.0
         # Next chunk should observe the bumped rate and feed faster.
-        enabled_buf._do_recovery_fill_chunk(2.0)
+        printing_buf._do_recovery_fill_chunk(2.0)
         assert force_move.moves[-1][2] == pytest.approx(fast * 1.2)
 
 
@@ -356,18 +356,19 @@ class TestRecoveryTimeout:
     """Per-attempt EMPTY recovery cap: extreme_recovery_timeout."""
 
     def test_empty_recovery_timeout_triggers_error(
-            self, enabled_buf, reactor):
+            self, printing_buf, reactor):
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
 
         # Advance past the per-attempt timeout and fire a chunk callback
         # while still in EMPTY — timeout branch should call _handle_error.
-        reactor._monotonic = 1.0 + enabled_buf.extreme_recovery_timeout + 0.5
-        enabled_buf._do_recovery_fill_chunk(reactor._monotonic)
-        assert enabled_buf.state == STATE_ERROR
-        assert "EMPTY recovery" in enabled_buf.error_msg
+        reactor._monotonic = (
+            1.0 + printing_buf.extreme_recovery_timeout + 0.5)
+        printing_buf._do_recovery_fill_chunk(reactor._monotonic)
+        assert printing_buf.state == STATE_ERROR
+        assert "EMPTY recovery" in printing_buf.error_msg
 
 
 class TestMaterialRunoutAbortsRecovery:
@@ -375,17 +376,17 @@ class TestMaterialRunoutAbortsRecovery:
     fill aborts immediately — pushing more filament against an empty
     feed path serves no purpose."""
 
-    def test_runout_aborts_empty_recovery(self, enabled_buf, reactor):
+    def test_runout_aborts_empty_recovery(self, printing_buf, reactor):
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._extreme_recovery_active == ZONE_EMPTY
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
 
         # Material removed mid-recovery.
-        enabled_buf.material_present = False
+        printing_buf.material_present = False
         reactor._monotonic = 1.5
-        enabled_buf._do_recovery_fill_chunk(1.5)
-        assert enabled_buf._extreme_recovery_active is None
+        printing_buf._do_recovery_fill_chunk(1.5)
+        assert printing_buf._extreme_recovery_active is None
 
 
 class TestExtremeMultipliersNoLongerApplied:
@@ -394,16 +395,122 @@ class TestExtremeMultipliersNoLongerApplied:
     ZONE_EMPTY.  Recovery owns those zones now."""
 
     def test_extreme_zones_leave_rd_at_base(
-            self, enabled_buf, stepper, reactor):
-        base_rd = enabled_buf._base_rd
+            self, printing_buf, stepper, reactor):
+        base_rd = printing_buf._base_rd
         # Sync, observe initial rd
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
         # Enter EMPTY (recovery enters and unsyncs, restoring base_rd)
         reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        assert printing_buf._rd_multiplier == 1.0
+
+
+class TestRecoveryGatedOnPrinting:
+    """Recovery must not enter while the printer is not printing —
+    surprise motion during manual loading/unloading was the bug."""
+
+    def test_empty_does_not_enter_recovery_when_not_printing(
+            self, enabled_buf, reactor, force_move):
+        # enabled_buf has _print_stats.state == "standby" by default
+        # (the printing_buf fixture is what flips it to "printing").
+        assert enabled_buf._print_stats.state != "printing"
+        reactor._monotonic = 1.0
         set_sensors(enabled_buf, empty=True)
         enabled_buf._update_rotation_distance(1.0)
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
-        assert enabled_buf._rd_multiplier == 1.0
+        assert enabled_buf._extreme_recovery_active is None
+        # No chunked feed should have fired.
+        assert force_move.moves == []
+
+    def test_full_does_not_enter_recovery_when_not_printing(
+            self, enabled_buf, reactor):
+        # Forward extruder rate would normally cause FULL recovery to
+        # ENTER and unsync; the printing gate must block it.
+        _seed_rate(enabled_buf, reactor, 5.0)
+        reactor._monotonic = 1.0
+        set_sensors(enabled_buf, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._extreme_recovery_active is None
+        assert enabled_buf._synced_to is not None
+
+
+class TestRateSamplePrimedAtReady:
+    """The first call to _estimated_extruder_rate after startup must
+    return a real slope, not 0 — _handle_ready primes the sample."""
+
+    def test_sample_is_primed_after_handle_ready(self, enabled_buf):
+        # The buf fixture fires klippy:ready, which should have called
+        # _handle_ready and primed _last_extruder_position_sample.
+        assert enabled_buf._last_extruder_position_sample is not None
+
+    def test_first_recovery_decision_sees_nonzero_rate(
+            self, printing_buf, reactor, force_move):
+        # Configure the extruder so a fresh rate read returns > the
+        # bump threshold (manual_speed / 1.2).  With the primed sample
+        # from _handle_ready, the FIRST recovery decision must compute
+        # a real slope and bump the fill_speed accordingly.
+        fast = printing_buf.manual_speed * 2.0
+        # Reset sample baseline to a known (t=0, pos=0) so the rate
+        # computed at t=1.0 reflects the configured rate.
+        printing_buf._last_extruder_position_sample = (0.0, 0.0)
+        printing_buf.toolhead.get_extruder().set_rate(fast, t0=0.0)
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        last = force_move.moves[-1]
+        # Did NOT collapse to manual_speed — the rate was observed.
+        assert last[2] == pytest.approx(fast * 1.2)
+
+
+class TestToolChangeResetsRateCache:
+    """The active-extruder identity is the only thing that invalidates
+    the cached (eventtime, position) sample.  _handle_extruder_change
+    must clear the cache and re-prime against the new extruder so the
+    next _estimated_extruder_rate call doesn't compute a discontinuous
+    delta against the old extruder's position."""
+
+    def test_handle_extruder_change_reprimes_sample(
+            self, printing_buf, reactor):
+        from conftest import MockExtruder
+        _seed_rate(printing_buf, reactor, 5.0)
+        sample_before = printing_buf._last_extruder_position_sample
+        assert sample_before is not None
+
+        # Swap the active extruder identity to a fresh one.  The new
+        # extruder's position starts at 0; the old one's was advancing.
+        new_ext = MockExtruder(name="extruder1")
+        printing_buf.toolhead.set_extruder(new_ext)
+        reactor._monotonic = 2.0
+        printing_buf._handle_extruder_change("extruder1")
+
+        # Sample must have been re-primed (non-None, but distinct from
+        # the pre-swap sample tuple).
+        assert printing_buf._last_extruder_position_sample is not None
+        assert (printing_buf._last_extruder_position_sample
+                != sample_before)
+        assert printing_buf._last_computed_extruder_rate == 0.0
+
+
+class TestRecoveryExitOnSkipMiddle:
+    """A fast EMPTY -> FULL_MIDDLE transition (skipping MIDDLE between
+    sensor callbacks) must still exit recovery — the sensor-driven
+    exit gate is "left the EMPTY band", not "reached MIDDLE exactly"."""
+
+    def test_empty_recovery_exits_at_full_middle(
+            self, printing_buf, reactor):
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+
+        # Zone jumps straight to FULL_MIDDLE without a MIDDLE pass.
+        set_sensors(printing_buf, middle=True, full=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._synced_to is not None
 
 
