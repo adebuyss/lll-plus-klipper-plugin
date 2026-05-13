@@ -48,6 +48,16 @@ ZONE_FULL_MIDDLE = "full_middle"
 ZONE_MIDDLE = "middle"
 ZONE_EMPTY_MIDDLE = "empty_middle"
 
+# Sidecar trapq throttle: never queue a new chunk while the previous one
+# is still physically executing.  Only one chunk in flight at a time so
+# every chunk decision (sensor zone, material presence, fill speed) is
+# made against fresh state instead of committing to motion ahead of
+# the MCU's actual execution.  EMPTY -> middle therefore completes in
+# the minimum number of chunks (typically 1-2 at the default 5 mm).
+# Small lead time on the next-chunk timer so it fires just after the
+# MCU has finished the previous chunk rather than racing it.
+SIDECAR_CHUNK_MARGIN = 0.002
+
 # State machine transitions:
 #   DISABLED -> IDLE          on klippy:ready
 #   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
@@ -91,6 +101,27 @@ _DEPRECATED_PARAMS = [
     ("multiplier_low", 0.9, "minval", 0.0),
     ("multiplier_high", 1.1, "minval", 1.0),
 ]
+
+
+def _calc_move_time(dist, speed, accel):
+    """Compute (axis_r, accel_t, cruise_t, cruise_v) for a 1-D move.
+
+    Mirror of klippy/extras/force_move.calc_move_time so the sidecar
+    helper does not depend on a private upstream API.
+    """
+    axis_r = 1.0
+    if dist < 0.0:
+        axis_r = -1.0
+        dist = -dist
+    if not accel or not dist:
+        return axis_r, 0.0, dist / max(speed, 1e-9), speed
+    max_cruise_v2 = dist * accel
+    if max_cruise_v2 < speed * speed:
+        speed = max_cruise_v2 ** 0.5
+    accel_t = speed / accel
+    accel_decel_d = accel_t * speed
+    cruise_t = (dist - accel_decel_d) / speed
+    return axis_r, accel_t, cruise_t, speed
 
 
 class Buffer:
@@ -276,6 +307,14 @@ class Buffer:
         # not at the mercy of register_callback latency under mid-print
         # toolhead load.
         self._recovery_fill_timer = None
+        # Per-site chunk-loop timers.  Each chunk site (initial fill,
+        # continuous manual feed/retract, retract-until-clear) schedules
+        # its next attempt at the previous chunk's completion time via
+        # _sidecar_next_chunk_eventtime so the loop is paced exactly to
+        # MCU execution rather than running ahead.
+        self._fill_timer = None
+        self._continuous_timer = None
+        self._retract_clear_timer = None
 
         # Register events
         self.printer.register_event_handler("klippy:ready",
@@ -327,6 +366,34 @@ class Buffer:
         printer_es = self.printer.lookup_object(es_key)
         self.extruder_stepper = printer_es.extruder_stepper
         self.force_move = self.printer.lookup_object("force_move")
+        # Sidecar trapq: replaces force_move.manual_move for buffer-stepper
+        # chunked motion so chunks no longer dwell the main toolhead.
+        # MCU resolution is separate from the chelper try block so test
+        # environments without chelper still wire the throttle through
+        # the mock MCU.
+        try:
+            self._sidecar_mcu = self.extruder_stepper.stepper.get_mcu()
+        except Exception:
+            self._sidecar_mcu = None
+        self._sidecar_next_cmd_time = 0.0
+        self.sidecar_moves = []
+        self._sidecar_trapq = None
+        self._sidecar_trapq_append = None
+        self._sidecar_trapq_finalize = None
+        self._sidecar_stepper_kinematics = None
+        try:
+            import chelper
+            ffi_main, ffi_lib = chelper.get_ffi()
+            self._sidecar_trapq = ffi_main.gc(
+                ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
+            self._sidecar_trapq_append = ffi_lib.trapq_append
+            self._sidecar_trapq_finalize = ffi_lib.trapq_finalize_moves
+            self._sidecar_stepper_kinematics = ffi_main.gc(
+                ffi_lib.cartesian_stepper_alloc(b"x"), ffi_lib.free)
+        except Exception as e:
+            logging.warning(
+                "buffer[%s]: sidecar trapq unavailable (%s); chunks will "
+                "be recorded but not scheduled" % (self.short_name, e))
         # Capture baseline rotation_distance
         self._base_rd = (
             self.extruder_stepper.stepper.get_rotation_distance()[0])
@@ -436,6 +503,7 @@ class Buffer:
     def _cancel_fill(self):
         """Cancel any in-progress initial fill loop."""
         self._initial_fill_until = 0.0
+        self._cancel_fill_timer()
 
     def _material_callback(self, eventtime, state):
         was_present = self.material_present
@@ -549,6 +617,114 @@ class Buffer:
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
         self._dlog(None, "unsynced")
+
+    # --- Sidecar trapq helper ---
+
+    def _sidecar_move(self, dist, speed, accel):
+        """Queue one buffer-stepper chunk on the sidecar trapq.
+
+        Replaces force_move.manual_move at every chunk site so the
+        buffer stepper's motion no longer dwells the main toolhead.
+        Returns True if queued, False if the throttle deferred — only
+        one chunk is allowed in flight at a time so the loop is always
+        making decisions against fresh sensor state.  Callers must
+        only invoke this while self._synced_to is None; relies on
+        Klipper's single-threaded reactor execution model.
+        """
+        if self.extruder_stepper is None:
+            return False
+        stepper = self.extruder_stepper.stepper
+
+        # Throttle: refuse to queue while the previous chunk is still
+        # physically executing.  _sidecar_next_cmd_time is the tail of
+        # our queued motion in MCU print_time domain; est_print_time is
+        # what the MCU is executing right now.
+        if self._sidecar_mcu is not None:
+            try:
+                eventtime = self.reactor.monotonic()
+                est_print_time = self._sidecar_mcu.estimated_print_time(
+                    eventtime)
+                if self._sidecar_next_cmd_time > est_print_time:
+                    return False
+            except Exception as e:
+                logging.warning(
+                    "buffer[%s]: sidecar throttle check failed: %s"
+                    % (self.short_name, e))
+
+        axis_r, accel_t, cruise_t, cruise_v = _calc_move_time(
+            dist, speed, accel)
+        move_duration = accel_t + cruise_t + accel_t
+
+        # Anchor to the toolhead's tail so the very first chunk after
+        # init (or after a long _unsync period) does not try to schedule
+        # at sidecar-time-zero while the real toolhead has been running.
+        try:
+            toolhead_tail = self.toolhead.get_last_move_time()
+        except Exception:
+            toolhead_tail = 0.0
+        print_time = max(self._sidecar_next_cmd_time, toolhead_tail)
+
+        # Test-mode fast path: chelper unavailable.  Still advance
+        # _sidecar_next_cmd_time so the throttle is exercisable in
+        # unit tests, and still flush so flush-count assertions pass.
+        if self._sidecar_trapq is None:
+            try:
+                self.toolhead.flush_step_generation()
+            except Exception:
+                pass
+            self._sidecar_next_cmd_time = print_time + move_duration
+            self._record_sidecar_move(stepper, dist, speed, accel)
+            return True
+
+        # Real path: queue on the sidecar trapq, generate steps directly.
+        self.toolhead.flush_step_generation()
+        prev_sk = stepper.set_stepper_kinematics(
+            self._sidecar_stepper_kinematics)
+        prev_trapq = stepper.set_trapq(self._sidecar_trapq)
+        stepper.set_position((0., 0., 0.))
+        self._sidecar_trapq_append(
+            self._sidecar_trapq, print_time,
+            accel_t, cruise_t, accel_t,
+            0., 0., 0.,
+            axis_r, 0., 0.,
+            0., cruise_v, accel)
+        print_time += move_duration
+        self._sidecar_next_cmd_time = print_time
+        stepper.generate_steps(print_time)
+        self._sidecar_trapq_finalize(
+            self._sidecar_trapq,
+            print_time + 99999.9, print_time + 99999.9)
+        stepper.set_trapq(prev_trapq)
+        stepper.set_stepper_kinematics(prev_sk)
+        # Report queue activity for MCU backpressure tracking.  CRITICAL:
+        # this does NOT advance toolhead.print_time, unlike
+        # toolhead.dwell() — that leak is exactly what this helper
+        # exists to avoid.
+        try:
+            self.toolhead.note_mcu_movequeue_activity(print_time)
+        except Exception:
+            pass
+        self._record_sidecar_move(stepper, dist, speed, accel)
+        return True
+
+    def _record_sidecar_move(self, stepper, dist, speed, accel):
+        self.sidecar_moves.append((stepper, dist, speed, accel))
+        if len(self.sidecar_moves) > 1024:
+            del self.sidecar_moves[:512]
+
+    def _sidecar_next_chunk_eventtime(self):
+        """Eventtime at which the previous chunk finishes (plus a small
+        margin).  Used by every chunk site to schedule the next attempt
+        exactly at chunk completion."""
+        eventtime = self.reactor.monotonic()
+        if self._sidecar_mcu is None:
+            return eventtime + SIDECAR_CHUNK_MARGIN
+        try:
+            est = self._sidecar_mcu.estimated_print_time(eventtime)
+            wait = self._sidecar_next_cmd_time - est
+        except Exception:
+            wait = 0.0
+        return eventtime + max(0.0, wait) + SIDECAR_CHUNK_MARGIN
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -845,28 +1021,22 @@ class Buffer:
         _action, new_speed = self._recovery_decision(eventtime, ZONE_EMPTY)
         self._recovery_fill_speed = new_speed
         try:
-            self.force_move.manual_move(
-                self.extruder_stepper.stepper,
-                self.recovery_move_distance,
-                new_speed,
-                self.manual_accel)
+            queued = self._sidecar_move(
+                self.recovery_move_distance, new_speed, self.manual_accel)
         except Exception as e:
             logging.warning(
                 "buffer[%s]: recovery fill chunk failed: %s"
                 % (self.short_name, e))
             self._exit_extreme_recovery(eventtime, "chunk-failed")
             return
-        # Track chunk pacing for the control-timer stall watchdog.
-        self._recovery_chunk_count += 1
-        self._last_recovery_chunk_at = eventtime
-        # Self-pace the chunk loop via a short timer rather than
-        # register_callback (which fires next reactor iteration and is
-        # vulnerable to mid-print scheduling jitter — the chain can
-        # space out under toolhead load and starve the per-attempt
-        # timeout check inside this function).  Schedule the next
-        # chunk just before the previous one finishes physically.
-        nominal_period = self.recovery_move_distance / max(new_speed, 1.0)
-        next_wake = eventtime + max(nominal_period * 0.5, 0.05)
+        if queued:
+            # Track chunk pacing for the control-timer stall watchdog.
+            self._recovery_chunk_count += 1
+            self._last_recovery_chunk_at = eventtime
+        # Schedule next attempt for chunk-completion eventtime — wake
+        # exactly when the previous chunk finishes so the loop is paced
+        # against the MCU rather than running ahead of it.
+        next_wake = self._sidecar_next_chunk_eventtime()
         if self._recovery_fill_timer is None:
             self._recovery_fill_timer = self.reactor.register_timer(
                 self._recovery_fill_timer_cb, next_wake)
@@ -1022,6 +1192,7 @@ class Buffer:
         if (self._initial_fill_until > 0.0
                 and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self._sync()
 
         # Mid-recovery handling: detect exit conditions before deciding
@@ -1092,6 +1263,7 @@ class Buffer:
         # Abort: timeout expired
         if self._initial_fill_until > 0.0 and eventtime >= self._initial_fill_until:
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self.motor_direction = STOP
             logging.info("buffer[%s]: initial fill timeout"
                          % self.short_name)
@@ -1104,31 +1276,43 @@ class Buffer:
         zone = self._compute_zone()
         if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
             self._sync()
             return
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
+            self._cancel_fill_timer()
             return
         # Issue one chunk
         try:
-            self.force_move.manual_move(
-                self.extruder_stepper.stepper, self._manual_chunk_dist,
-                self.manual_speed, self.manual_accel)
+            self._sidecar_move(
+                self._manual_chunk_dist, self.manual_speed, self.manual_accel)
         except Exception as e:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self._sync()
             return
-        # Schedule next chunk — reactor will process sensor callbacks
-        # between this return and the next _fill_chunk_cb invocation
-        self.reactor.register_callback(self._fill_chunk_cb)
+        # Schedule next attempt at chunk-completion eventtime — paces the
+        # loop against MCU execution rather than reactor-tick latency.
+        next_wake = self._sidecar_next_chunk_eventtime()
+        if self._fill_timer is None:
+            self._fill_timer = self.reactor.register_timer(
+                self._fill_chunk_cb, next_wake)
+        else:
+            self.reactor.update_timer(self._fill_timer, next_wake)
 
     def _fill_chunk_cb(self, eventtime):
-        """Reactor callback: continue the fill if still active."""
+        """Timer callback: continue the fill if still active."""
         self._do_fill_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_fill_timer(self):
+        if self._fill_timer is not None:
+            self.reactor.update_timer(self._fill_timer, self.reactor.NEVER)
 
     # --- Control timer ---
 
@@ -1282,7 +1466,7 @@ class Buffer:
     def _do_safety_retract(self, eventtime):
         """Forced retract when full zone times out.
 
-        Unsyncs, issues a retract via force_move, then leaves the
+        Unsyncs, issues a retract on the sidecar trapq, then leaves the
         stepper unsynced.  The next control timer cycle will re-sync
         via _update_rotation_distance once the retract has completed
         and print_time has advanced past the move.
@@ -1291,17 +1475,25 @@ class Buffer:
                      % self.short_name)
         self.gcode.respond_info(
             "Buffer: full zone timeout - retracting")
-        stepper = self.extruder_stepper.stepper
         self._unsync()
         self.state = STATE_RETRACTING
         self.motor_direction = BACK
         try:
-            self.force_move.manual_move(
-                stepper, -self._manual_chunk_dist,
-                self.manual_speed, self.manual_accel)
+            queued = self._sidecar_move(
+                -self._manual_chunk_dist, self.manual_speed,
+                self.manual_accel)
         except Exception as e:
             logging.warning("buffer[%s]: safety retract failed: %s"
                             % (self.short_name, e))
+            return
+        if not queued:
+            # Previous chunk still in flight (rare — safety retract is a
+            # single shot driven by the control timer).  Leave
+            # _safety_zone_start armed so the next control tick retries.
+            logging.warning(
+                "buffer[%s]: safety retract throttled; "
+                "control timer will retry" % self.short_name)
+            return
         self._safety_zone_start = 0.0
         # Do NOT re-sync here — the retract move is still in the MCU's
         # step buffer.  The next control timer cycle will re-sync via
@@ -1422,31 +1614,43 @@ class Buffer:
         """Issue one chunk of a continuous feed, schedule the next."""
         # Abort if state changed (stop, disable, error, button release)
         if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
+            self._cancel_continuous_timer()
             return
         if self.force_move is None:
+            self._cancel_continuous_timer()
             return
-        stepper = self.extruder_stepper.stepper
         dist = self._manual_chunk_dist
         if self._continuous_feed_direction == BACK:
             dist = -dist
         try:
-            self.force_move.manual_move(
-                stepper, dist, self._continuous_feed_speed,
-                self.manual_accel)
+            self._sidecar_move(
+                dist, self._continuous_feed_speed, self.manual_accel)
         except Exception as e:
             logging.warning("buffer[%s]: continuous feed chunk failed: %s"
                             % (self.short_name, e))
             return
-        # Schedule next chunk — reactor processes sensor callbacks between
-        self.reactor.register_callback(self._continuous_chunk_cb)
+        # Schedule next attempt at chunk-completion eventtime.
+        next_wake = self._sidecar_next_chunk_eventtime()
+        if self._continuous_timer is None:
+            self._continuous_timer = self.reactor.register_timer(
+                self._continuous_chunk_cb, next_wake)
+        else:
+            self.reactor.update_timer(self._continuous_timer, next_wake)
 
     def _continuous_chunk_cb(self, eventtime):
         self._do_continuous_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_continuous_timer(self):
+        if self._continuous_timer is not None:
+            self.reactor.update_timer(
+                self._continuous_timer, self.reactor.NEVER)
 
     def _stop_manual(self):
         """Stop any pending manual move state."""
         self.motor_direction = STOP
         self._manual_feed_full_start = 0.0
+        self._cancel_continuous_timer()
 
     # --- Error handling ---
 
@@ -1591,10 +1795,8 @@ class Buffer:
             self.state = STATE_MANUAL_FEED
             self.motor_direction = FORWARD
             self._manual_feed_full_start = 0.0
-            stepper = self.extruder_stepper.stepper
             try:
-                self.force_move.manual_move(stepper, dist, speed,
-                                            self.manual_accel)
+                self._sidecar_move(dist, speed, self.manual_accel)
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_FEED failed: %s"
                                 % (self.short_name, e))
@@ -1620,10 +1822,8 @@ class Buffer:
             self._unsync()
             self.state = STATE_MANUAL_RETRACT
             self.motor_direction = BACK
-            stepper = self.extruder_stepper.stepper
             try:
-                self.force_move.manual_move(stepper, -dist, speed,
-                                            self.manual_accel)
+                self._sidecar_move(-dist, speed, self.manual_accel)
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_RETRACT failed: %s"
                                 % (self.short_name, e))
@@ -1658,13 +1858,16 @@ class Buffer:
     def _do_retract_until_clear_chunk(self, eventtime):
         """Issue one retract chunk, check material switch, schedule next."""
         if not self._retract_until_clear:
+            self._cancel_retract_clear_timer()
             return
         if self.state != STATE_MANUAL_RETRACT:
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
         if not self.material_present:
             # Filament has cleared the switch
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             self._stop_manual()
             self.state = STATE_IDLE
             self.auto_enabled = False
@@ -1673,26 +1876,41 @@ class Buffer:
             return
         if self.force_move is None:
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
-        stepper = self.extruder_stepper.stepper
         try:
-            self.force_move.manual_move(
-                stepper, -self._manual_chunk_dist,
-                self._continuous_feed_speed, self.manual_accel)
+            self._sidecar_move(
+                -self._manual_chunk_dist, self._continuous_feed_speed,
+                self.manual_accel)
         except Exception as e:
             logging.warning(
                 "buffer[%s]: retract_until_clear chunk failed: %s"
                 % (self.short_name, e))
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
-        self.reactor.register_callback(self._retract_until_clear_cb)
+        # Schedule next attempt at chunk-completion eventtime.
+        next_wake = self._sidecar_next_chunk_eventtime()
+        if self._retract_clear_timer is None:
+            self._retract_clear_timer = self.reactor.register_timer(
+                self._retract_until_clear_cb, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._retract_clear_timer, next_wake)
 
     def _retract_until_clear_cb(self, eventtime):
         self._do_retract_until_clear_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_retract_clear_timer(self):
+        if self._retract_clear_timer is not None:
+            self.reactor.update_timer(
+                self._retract_clear_timer, self.reactor.NEVER)
 
     def cmd_BUFFER_STOP(self, gcmd):
         self._cancel_fill()
         self._retract_until_clear = False
+        self._cancel_retract_clear_timer()
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED

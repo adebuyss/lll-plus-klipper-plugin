@@ -43,7 +43,7 @@ class TestEmptySafetyTimeout:
 
 class TestFullSafetyTimeout:
     def test_full_timeout_triggers_retract(self, enabled_buf, reactor,
-                                           force_move):
+                                           sidecar_moves):
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, full=True)
         t = 1.0
@@ -54,11 +54,11 @@ class TestFullSafetyTimeout:
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
         # Should have done a safety retract via force_move
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # negative dist = retract
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # negative dist = retract
 
     def test_no_retract_when_not_printing(self, enabled_buf, reactor,
-                                           force_move):
+                                           sidecar_moves):
         """Safety retract must not fire when the extruder is idle."""
         enabled_buf._print_stats.state = "standby"
         set_sensors(enabled_buf, full=True)
@@ -69,7 +69,7 @@ class TestFullSafetyTimeout:
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) == 0
+        assert len(sidecar_moves) == 0
 
 
 class TestSensorConflict:

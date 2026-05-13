@@ -16,12 +16,12 @@ from conftest import (
 
 
 class TestFeedButton:
-    def test_press_starts_feeding(self, buf, buttons, reactor, force_move):
+    def test_press_starts_feeding(self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
         assert buf.state == STATE_MANUAL_FEED
         assert buf.motor_direction == FORWARD
-        assert len(force_move.moves) > 0
+        assert len(sidecar_moves) > 0
 
     def test_release_stops(self, buf, buttons, reactor):
         reactor._monotonic = 10.0
@@ -50,13 +50,13 @@ class TestFeedButton:
 
 
 class TestRetractButton:
-    def test_press_starts_retracting(self, buf, buttons, reactor, force_move):
+    def test_press_starts_retracting(self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE5"](10.0, 1)
         assert buf.state == STATE_MANUAL_RETRACT
         assert buf.motor_direction == BACK
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # negative dist
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # negative dist
 
     def test_release_stops(self, buf, buttons, reactor):
         reactor._monotonic = 10.0
@@ -75,47 +75,46 @@ class TestButtonHoldFeedsContinuously:
     """Holding a manual button should keep chunks scheduling until release."""
 
     def test_feed_button_schedules_continuation(
-            self, buf, buttons, reactor, force_move):
+            self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
-        # First chunk issued and a continuation is pending in the reactor.
-        assert len(force_move.moves) == 1
-        assert len(reactor._pending_callbacks) > 0
+        # First chunk issued and a continuation timer is scheduled.
+        assert len(sidecar_moves) == 1
+        assert buf._continuous_timer is not None
 
     def test_feed_button_held_produces_multiple_chunks(
-            self, buf, buttons, reactor, force_move):
+            self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
         assert buf.state == STATE_MANUAL_FEED
-        # Fire three reactor ticks; each should issue another chunk.
+        # Advance past each chunk's completion so the timer fires the
+        # next chunk and the sidecar throttle releases.
         for _ in range(3):
-            cb = reactor._pending_callbacks.pop(0)
-            cb(reactor._monotonic)
-        assert len(force_move.moves) == 4
+            reactor.advance_time(0.5)
+        assert len(sidecar_moves) == 4
         # All chunks feed forward.
-        assert all(m[1] > 0 for m in force_move.moves)
+        assert all(m[1] > 0 for m in sidecar_moves)
 
     def test_retract_button_held_produces_multiple_chunks(
-            self, buf, buttons, reactor, force_move):
+            self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE5"](10.0, 1)
         assert buf.state == STATE_MANUAL_RETRACT
         for _ in range(3):
-            cb = reactor._pending_callbacks.pop(0)
-            cb(reactor._monotonic)
-        assert len(force_move.moves) == 4
-        assert all(m[1] < 0 for m in force_move.moves)
+            reactor.advance_time(0.5)
+        assert len(sidecar_moves) == 4
+        assert all(m[1] < 0 for m in sidecar_moves)
 
     def test_feed_button_release_stops_loop(
-            self, buf, buttons, reactor, force_move):
+            self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
         buttons.callbacks["PE4"](10.5, 0)
         # After release, any pending chunk callback should see state != MANUAL
         # and not issue another move.
-        chunks_before = len(force_move.moves)
+        chunks_before = len(sidecar_moves)
         reactor.flush_callbacks()
-        assert len(force_move.moves) == chunks_before
+        assert len(sidecar_moves) == chunks_before
 
 
 class TestButtonReleaseRestoresState:

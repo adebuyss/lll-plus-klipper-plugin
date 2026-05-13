@@ -70,15 +70,29 @@ class MockReactor:
     def _fire_timers(self):
         for i, (cb, wake) in enumerate(list(self._timers)):
             if self._monotonic >= wake:
+                # Snapshot the timer state pre-callback so we can detect
+                # whether cb modified it via update_timer.  Klipper's
+                # convention allows a cb to either return its next wake
+                # time OR reschedule itself via update_timer (returning
+                # NEVER).  Honour update_timer's value if present;
+                # otherwise use the return value.
+                pre_wake = self._timers[i][1]
                 next_wake = cb(self._monotonic)
-                if next_wake is not None:
+                post_wake = self._timers[i][1]
+                if post_wake != pre_wake:
+                    pass  # cb already rescheduled via update_timer
+                elif next_wake is not None:
                     self._timers[i] = (cb, next_wake)
+
+    def flush_callbacks(self):
+        """Fire pending register_callback callbacks AND any timers
+        whose wake is at or before the current monotonic.  Mirrors how
+        production drains the reactor between scheduled tasks."""
+        self._fire_callbacks()
+        self._fire_timers()
 
     def register_callback(self, callback):
         self._pending_callbacks.append(callback)
-
-    def flush_callbacks(self):
-        self._fire_callbacks()
 
     def register_timer(self, callback, waketime):
         handle = len(self._timers)
@@ -226,9 +240,12 @@ class MockConfig:
 class MockStepper:
     """Mock for PrinterStepper — tracks rotation_distance changes."""
 
-    def __init__(self, rotation_distance=19.2357):
+    def __init__(self, rotation_distance=19.2357, mcu=None):
         self._rotation_distance = rotation_distance
         self.rd_log = []  # track all set_rotation_distance calls
+        self._trapq = None
+        self._sk = None
+        self._mcu = mcu
 
     def get_rotation_distance(self):
         return (self._rotation_distance, False)
@@ -236,6 +253,25 @@ class MockStepper:
     def set_rotation_distance(self, rd):
         self._rotation_distance = rd
         self.rd_log.append(rd)
+
+    def get_mcu(self):
+        return self._mcu
+
+    def set_trapq(self, t):
+        prev = self._trapq
+        self._trapq = t
+        return prev
+
+    def set_stepper_kinematics(self, sk):
+        prev = self._sk
+        self._sk = sk
+        return prev
+
+    def set_position(self, pos):
+        pass
+
+    def generate_steps(self, t):
+        pass
 
 
 class MockExtruderStepper:
@@ -247,7 +283,8 @@ class MockExtruderStepper:
     exercised faithfully by tests."""
 
     def __init__(self, toolhead=None):
-        self.stepper = MockStepper()
+        mcu = toolhead.get_mcu() if toolhead is not None else None
+        self.stepper = MockStepper(mcu=mcu)
         self.motion_queue = None
         self._synced_to = None
         self._toolhead = toolhead
@@ -322,14 +359,44 @@ class _MockExtrusionStepper:
         return rate * (eventtime - t0)
 
 
+class MockMcu:
+    """Minimal MCU mock — estimated_print_time + test override.
+
+    The buffer's sidecar throttle queries mcu.estimated_print_time to
+    decide whether the previous chunk has finished.  By default the
+    mock returns the current eventtime so the throttle never fires in
+    unit tests; tests that exercise the throttle pin a fixed value
+    via set_estimated_print_time().
+    """
+
+    def __init__(self, reactor=None):
+        self._reactor = reactor
+        self._est_override = None
+
+    def estimated_print_time(self, eventtime):
+        if self._est_override is not None:
+            return self._est_override
+        return eventtime
+
+    def set_estimated_print_time(self, value):
+        self._est_override = value
+
+    def clear_estimated_print_time(self):
+        self._est_override = None
+
+
 class MockToolhead:
     """Mock for toolhead.ToolHead."""
 
     def __init__(self, reactor=None):
         self._reactor = reactor
+        self._mcu = MockMcu(reactor=reactor)
         self._extruder = MockExtruder()
         self._wire_extruder(self._extruder)
         self.flush_count = 0
+        self.dwell_calls = []
+        self._last_move_time = 0.0
+        self.note_mcu_movequeue_activity_calls = []
 
     def _wire_extruder(self, extruder):
         if self._reactor is not None:
@@ -344,14 +411,23 @@ class MockToolhead:
         self._extruder = extruder
         self._wire_extruder(extruder)
 
+    def get_mcu(self):
+        return self._mcu
+
     def flush_step_generation(self):
         self.flush_count += 1
 
     def get_last_move_time(self):
-        return 0.0
+        return self._last_move_time
 
     def dwell(self, delay):
-        pass
+        self.dwell_calls.append(delay)
+        self._last_move_time += max(0.0, delay)
+
+    def note_mcu_movequeue_activity(self, mq_time, set_step_gen_time=False):
+        self.note_mcu_movequeue_activity_calls.append(mq_time)
+        # Does NOT advance _last_move_time.  That distinction is the
+        # whole point of moving buffer chunks off the main timeline.
 
 
 class MockForceMove:
@@ -536,6 +612,15 @@ def gcode(printer):
 @pytest.fixture
 def force_move(printer):
     return printer.force_move
+
+
+@pytest.fixture
+def sidecar_moves(buf):
+    """Buffer chunks queued via the sidecar trapq.  This replaces
+    force_move.moves after the refactor that moved chunk motion off
+    the main toolhead timeline.  Tuple shape: (stepper, dist, speed,
+    accel) — same as the previous force_move.moves entries."""
+    return buf.sidecar_moves
 
 
 @pytest.fixture
