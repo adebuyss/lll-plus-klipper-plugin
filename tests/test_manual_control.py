@@ -78,9 +78,9 @@ class TestButtonHoldFeedsContinuously:
             self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
-        # First chunk issued and a continuation timer is scheduled.
+        # First chunk issued and a continuation callback is queued.
         assert len(sidecar_moves) == 1
-        assert buf._continuous_timer is not None
+        assert len(reactor._pending_callbacks) >= 1
 
     def test_feed_button_held_produces_multiple_chunks(
             self, buf, buttons, reactor, sidecar_moves):

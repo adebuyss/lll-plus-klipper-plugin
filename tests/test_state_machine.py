@@ -38,41 +38,40 @@ class TestMiddleZone:
 
 
 class TestEmptyZone:
-    def test_empty_enters_recovery_and_unsyncs(self, printing_buf):
-        # Forward extruder rate so EMPTY recovery is ENTERed.
-        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+    def test_empty_enters_vactual_recovery(self, printing_buf):
+        # EMPTY recovery writes VACTUAL; the stepper stays nominally
+        # synced (TMC ignores STEP/DIR while VACTUAL != 0).
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._current_zone == ZONE_EMPTY
-        # Recovery owns the unsynced state; rd_multiplier is left at 1.0
-        # (recovery does not chase with rotation_distance).
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        assert printing_buf._synced_to is None
+        # Stepper stays synced — that's the whole point of the
+        # VACTUAL refactor: no unsync needed during recovery.
+        assert printing_buf._synced_to is not None
 
 
 class TestFullZone:
-    def test_full_enters_recovery_when_extruder_consuming(
-            self, printing_buf, reactor):
-        # Forward extruder rate so FULL recovery is ENTERed.  The
-        # _handle_ready prime captured (t=0, pos=0); advance time so
-        # _estimated_extruder_rate sees a real slope on the first call.
-        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+    def test_full_enters_vactual_recovery(self, printing_buf, reactor):
+        # FULL recovery enters unconditionally — slow reverse VACTUAL
+        # drains regardless of extruder direction (no "defer if idle"
+        # branch any more).
         set_sensors(printing_buf, full=True)
         reactor._monotonic = 1.0
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._current_zone == ZONE_FULL
         assert printing_buf._extreme_recovery_active == ZONE_FULL
-        assert printing_buf._synced_to is None
+        assert printing_buf._synced_to is not None
 
 
 class TestEmptyMiddleZone:
     def test_empty_middle_slight_increase(self, enabled_buf):
-        set_sensors(enabled_buf)  # all off
+        # Non-extreme zone application is hysteresis-gated: requires
+        # the same zone to be seen across >200ms before commit.
+        set_sensors(enabled_buf)  # all off -> EMPTY_MIDDLE
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._update_rotation_distance(1.3)
         assert enabled_buf._current_zone == ZONE_EMPTY_MIDDLE
         assert enabled_buf._rd_multiplier > 1.0
-        # drift correction is gentler than full extreme — capped at
-        # 1.0 + drift_gain (no escalation in the near-edge zone).
         assert enabled_buf._rd_multiplier == pytest.approx(
             1.0 + enabled_buf.drift_gain)
 
@@ -81,6 +80,7 @@ class TestFullMiddleZone:
     def test_full_middle_slight_decrease(self, enabled_buf):
         set_sensors(enabled_buf, full=True, middle=True)
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._update_rotation_distance(1.3)
         assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
         assert enabled_buf._rd_multiplier < 1.0
         assert enabled_buf._rd_multiplier == pytest.approx(

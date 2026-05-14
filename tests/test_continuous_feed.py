@@ -21,8 +21,9 @@ class TestContinuousFeed:
         assert buf.motor_direction == FORWARD
         assert len(sidecar_moves) > 0
         assert sidecar_moves[-1][1] > 0  # positive distance
-        # A continuation timer should be scheduled
-        assert buf._continuous_timer is not None
+        # Chain continuation: pending reactor callback queued for the
+        # next chunk.  The chain self-terminates when state changes.
+        assert len(reactor._pending_callbacks) >= 1
 
     def test_feed_continuous_stops_on_full(self, buf, sidecar_moves, reactor):
         reactor._monotonic = 1.0
