@@ -67,23 +67,23 @@ class TestBufferDisable:
 
 
 class TestBufferFeed:
-    def test_feeds_forward(self, buf, force_move):
+    def test_feeds_forward(self, buf, sidecar_moves):
         gcmd = MockGcmd("BUFFER_FEED")
         buf.cmd_BUFFER_FEED(gcmd)
         assert buf.motor_direction == FORWARD
         assert buf.state == STATE_MANUAL_FEED
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] > 0  # positive dist
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] > 0  # positive dist
 
-    def test_feeds_at_custom_speed(self, buf, force_move):
+    def test_feeds_at_custom_speed(self, buf, sidecar_moves):
         gcmd = MockGcmd("BUFFER_FEED", {"SPEED": 20.0})
         buf.cmd_BUFFER_FEED(gcmd)
-        assert force_move.moves[-1][2] == 20.0  # speed
+        assert sidecar_moves[-1][2] == 20.0  # speed
 
-    def test_custom_distance(self, buf, force_move):
+    def test_custom_distance(self, buf, sidecar_moves):
         gcmd = MockGcmd("BUFFER_FEED", {"DIST": 100.0})
         buf.cmd_BUFFER_FEED(gcmd)
-        assert force_move.moves[-1][1] == 100.0
+        assert sidecar_moves[-1][1] == 100.0
 
     def test_blocked_in_error(self, buf):
         buf.state = STATE_ERROR
@@ -93,12 +93,12 @@ class TestBufferFeed:
 
 
 class TestBufferRetract:
-    def test_retracts(self, buf, force_move):
+    def test_retracts(self, buf, sidecar_moves):
         gcmd = MockGcmd("BUFFER_RETRACT")
         buf.cmd_BUFFER_RETRACT(gcmd)
         assert buf.motor_direction == BACK
         assert buf.state == STATE_MANUAL_RETRACT
-        assert force_move.moves[-1][1] < 0  # negative dist
+        assert sidecar_moves[-1][1] < 0  # negative dist
 
     def test_blocked_in_error(self, buf):
         buf.state = STATE_ERROR

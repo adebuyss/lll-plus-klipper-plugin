@@ -231,7 +231,7 @@ class TestRecoveryDecisionFull:
         assert printing_buf._synced_to is not None
 
     def test_full_safety_retract_fallback_after_defer(
-            self, enabled_buf, reactor, force_move):
+            self, enabled_buf, reactor, sidecar_moves):
         """When FULL recovery DEFERs (idle extruder) and the buffer
         stays in FULL past full_safety_timeout, the existing
         _do_safety_retract path must still fire."""
@@ -242,15 +242,15 @@ class TestRecoveryDecisionFull:
         enabled_buf._update_rotation_distance(t)
         # DEFERed (idle extruder) — no recovery, no retract yet.
         assert enabled_buf._extreme_recovery_active is None
-        assert len(force_move.moves) == 0
+        assert len(sidecar_moves) == 0
 
         # Advance past full_safety_timeout — _control_timer_cb should
         # call _do_safety_retract which issues a negative manual_move.
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0
 
 
 class TestRecoveryDecisionEmpty:
@@ -259,20 +259,20 @@ class TestRecoveryDecisionEmpty:
     configured manual_speed."""
 
     def test_empty_idle_uses_manual_speed(self, printing_buf, reactor,
-                                          force_move):
+                                          sidecar_moves):
         # Idle extruder; first chunk should fire at manual_speed.
         reactor._monotonic = 1.0
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         # The first chunk fires inline from _enter_extreme_recovery.
-        assert len(force_move.moves) >= 1
-        last = force_move.moves[-1]
+        assert len(sidecar_moves) >= 1
+        last = sidecar_moves[-1]
         assert last[1] > 0  # forward feed
         assert last[2] == pytest.approx(printing_buf.manual_speed)
 
     def test_empty_slow_extruder_uses_manual_speed(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         # Slow extruder (well below manual_speed / 1.2) — recovery
         # should still pick manual_speed as the chunk rate.
         slow_rate = printing_buf.manual_speed / 4.0
@@ -281,11 +281,11 @@ class TestRecoveryDecisionEmpty:
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        last = force_move.moves[-1]
+        last = sidecar_moves[-1]
         assert last[2] == pytest.approx(printing_buf.manual_speed)
 
     def test_empty_fast_extruder_bumps_speed(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         # Extruder faster than manual_speed / 1.2; chunk should fire at
         # rate * RECOVERY_OVERHEAD (1.2x) so we keep ahead of the drain.
         fast_rate = printing_buf.manual_speed * 2.0  # over the threshold
@@ -294,12 +294,12 @@ class TestRecoveryDecisionEmpty:
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        last = force_move.moves[-1]
+        last = sidecar_moves[-1]
         # 1.2 = RECOVERY_OVERHEAD constant in buffer.py.
         assert last[2] == pytest.approx(fast_rate * 1.2)
 
     def test_empty_fill_speed_capped(self, printing_buf, reactor,
-                                     force_move):
+                                     sidecar_moves):
         # Pathological extruder rate (e.g. measurement glitch). The
         # cap is manual_speed * 4 (RECOVERY_SPEED_CAP_FACTOR).
         crazy_rate = printing_buf.manual_speed * 100.0
@@ -307,11 +307,11 @@ class TestRecoveryDecisionEmpty:
         reactor._monotonic = 1.0
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        last = force_move.moves[-1]
+        last = sidecar_moves[-1]
         assert last[2] == pytest.approx(printing_buf.manual_speed * 4.0)
 
     def test_empty_recovery_exits_when_zone_reaches_middle(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         # After fill chunks land filament at middle, recovery exits
         # and re-syncs at multiplier 1.0.
         reactor._monotonic = 1.0
@@ -334,14 +334,14 @@ class TestRecoveryFillSpeedReevaluated:
     change should bump the fill rate accordingly."""
 
     def test_chunk_recomputes_fill_speed(self, printing_buf, reactor,
-                                          force_move):
+                                          sidecar_moves):
         # Start at slow extruder rate -> recovery enters at manual_speed.
         slow = printing_buf.manual_speed / 4.0
         _seed_rate(printing_buf, reactor, slow)
         reactor._monotonic = 1.0
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        assert force_move.moves[-1][2] == pytest.approx(
+        assert sidecar_moves[-1][2] == pytest.approx(
             printing_buf.manual_speed)
 
         # Print speed jumps mid-recovery; re-seed sample so next call
@@ -353,7 +353,7 @@ class TestRecoveryFillSpeedReevaluated:
         reactor._monotonic = 2.0
         # Next chunk should observe the bumped rate and feed faster.
         printing_buf._do_recovery_fill_chunk(2.0)
-        assert force_move.moves[-1][2] == pytest.approx(fast * 1.2)
+        assert sidecar_moves[-1][2] == pytest.approx(fast * 1.2)
 
 
 class TestRecoveryTimeout:
@@ -417,7 +417,7 @@ class TestRecoveryGatedOnPrinting:
     surprise motion during manual loading/unloading was the bug."""
 
     def test_empty_does_not_enter_recovery_when_not_printing(
-            self, enabled_buf, reactor, force_move):
+            self, enabled_buf, reactor, sidecar_moves):
         # enabled_buf has _print_stats.state == "standby" by default
         # (the printing_buf fixture is what flips it to "printing").
         assert enabled_buf._print_stats.state != "printing"
@@ -426,7 +426,7 @@ class TestRecoveryGatedOnPrinting:
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._extreme_recovery_active is None
         # No chunked feed should have fired.
-        assert force_move.moves == []
+        assert sidecar_moves == []
 
     def test_full_does_not_enter_recovery_when_not_printing(
             self, enabled_buf, reactor):
@@ -450,7 +450,7 @@ class TestRateSamplePrimedAtReady:
         assert enabled_buf._last_extruder_position_sample is not None
 
     def test_first_recovery_decision_sees_nonzero_rate(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         # Configure the extruder so a fresh rate read returns > the
         # bump threshold (manual_speed / 1.2).  With the primed sample
         # from _handle_ready, the FIRST recovery decision must compute
@@ -464,7 +464,7 @@ class TestRateSamplePrimedAtReady:
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        last = force_move.moves[-1]
+        last = sidecar_moves[-1]
         # Did NOT collapse to manual_speed — the rate was observed.
         assert last[2] == pytest.approx(fast * 1.2)
 
@@ -526,7 +526,7 @@ class TestRecoveryMoveDistance:
         assert enabled_buf.recovery_move_distance == 5.0
 
     def test_recovery_chunk_uses_recovery_distance(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         # Override to a distinctive value so the assertion can't pass
         # by coincidence with manual_move_distance.
         printing_buf.recovery_move_distance = 2.5
@@ -534,17 +534,17 @@ class TestRecoveryMoveDistance:
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         # First chunk fires inline from _enter_extreme_recovery.
-        assert force_move.moves[-1][1] == pytest.approx(2.5)
+        assert sidecar_moves[-1][1] == pytest.approx(2.5)
 
     def test_recovery_distance_independent_of_manual(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         printing_buf.manual_move_distance = 12.0
         printing_buf._manual_chunk_dist = 12.0
         printing_buf.recovery_move_distance = 3.0
         reactor._monotonic = 1.0
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        assert force_move.moves[-1][1] == pytest.approx(3.0)
+        assert sidecar_moves[-1][1] == pytest.approx(3.0)
 
     def test_status_exposes_recovery_distance(self, enabled_buf):
         status = enabled_buf.get_status(0.0)
@@ -655,7 +655,7 @@ class TestRecoveryChunkSelfPaced:
     mid-print toolhead load."""
 
     def test_chunk_registers_pacing_timer(
-            self, printing_buf, reactor, force_move):
+            self, printing_buf, reactor, sidecar_moves):
         reactor._monotonic = 1.0
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
@@ -663,7 +663,7 @@ class TestRecoveryChunkSelfPaced:
         assert printing_buf._recovery_fill_timer is not None
         # No register_callback queued for the chunk chain (we now use
         # update_timer instead).  At least one move was issued.
-        assert len(force_move.moves) >= 1
+        assert len(sidecar_moves) >= 1
 
 
 class TestDlogThrottle:

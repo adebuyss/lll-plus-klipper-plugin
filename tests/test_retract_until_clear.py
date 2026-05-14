@@ -12,7 +12,7 @@ from conftest import (
 
 
 class TestRetractUntilClear:
-    def test_basic_retract_until_clear(self, buf, force_move, reactor):
+    def test_basic_retract_until_clear(self, buf, sidecar_moves, reactor):
         """Retracts in chunks until material_present becomes False."""
         buf.material_present = True
         reactor._monotonic = 1.0
@@ -20,8 +20,8 @@ class TestRetractUntilClear:
         buf.cmd_BUFFER_RETRACT_UNTIL_CLEAR(gcmd)
         assert buf.state == STATE_MANUAL_RETRACT
         assert buf.motor_direction == BACK
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # negative = retract
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # negative = retract
 
         # Simulate filament clearing the switch, then flush
         buf.material_present = False
@@ -37,7 +37,7 @@ class TestRetractUntilClear:
         buf.cmd_BUFFER_RETRACT_UNTIL_CLEAR(gcmd)
         assert buf.state == STATE_ERROR
 
-    def test_cancelled_by_buffer_stop(self, buf, force_move, reactor):
+    def test_cancelled_by_buffer_stop(self, buf, sidecar_moves, reactor):
         buf.material_present = True
         reactor._monotonic = 1.0
         gcmd = MockGcmd("BUFFER_RETRACT_UNTIL_CLEAR")
@@ -48,19 +48,19 @@ class TestRetractUntilClear:
         assert buf._retract_until_clear is False
 
         # Pending callbacks should not issue more chunks
-        chunks_before = len(force_move.moves)
+        chunks_before = len(sidecar_moves)
         reactor.flush_callbacks()
-        assert len(force_move.moves) == chunks_before
+        assert len(sidecar_moves) == chunks_before
 
-    def test_custom_speed(self, buf, force_move, reactor):
+    def test_custom_speed(self, buf, sidecar_moves, reactor):
         buf.material_present = True
         reactor._monotonic = 1.0
         gcmd = MockGcmd("BUFFER_RETRACT_UNTIL_CLEAR", {"SPEED": 30.0})
         buf.cmd_BUFFER_RETRACT_UNTIL_CLEAR(gcmd)
-        assert force_move.moves[-1][2] == 30.0
+        assert sidecar_moves[-1][2] == 30.0
 
     def test_empty_sensor_does_not_stop_retract_until_clear(
-            self, buf, force_move, reactor):
+            self, buf, sidecar_moves, reactor):
         """The empty-sensor auto-stop in _control_timer_cb must NOT cancel
         retract-until-clear.  The retract should keep going until the
         filament presence switch clears (material_present = False)."""
@@ -69,7 +69,7 @@ class TestRetractUntilClear:
         gcmd = MockGcmd("BUFFER_RETRACT_UNTIL_CLEAR")
         buf.cmd_BUFFER_RETRACT_UNTIL_CLEAR(gcmd)
         assert buf.state == STATE_MANUAL_RETRACT
-        chunks_before = len(force_move.moves)
+        chunks_before = len(sidecar_moves)
 
         # Trigger the empty sensor — this would normally auto-stop a
         # plain BUFFER_RETRACT, but retract-until-clear should ignore it.
