@@ -62,9 +62,16 @@ class MockReactor:
         self._fire_timers()
 
     def _fire_callbacks(self):
-        """Fire all pending deferred callbacks in FIFO order."""
-        while self._pending_callbacks:
-            cb = self._pending_callbacks.pop(0)
+        """Fire pending deferred callbacks in FIFO order.  Snapshot
+        the list at entry so callbacks that re-register themselves
+        (the chained-chunk pattern used by manual feed/retract/
+        initial fill) schedule for the NEXT advance_time call, not
+        recursively within this one — matching production reactor
+        semantics where register_callback fires on the next reactor
+        iteration."""
+        pending = self._pending_callbacks
+        self._pending_callbacks = []
+        for cb in pending:
             cb(self._monotonic)
 
     def _fire_timers(self):
@@ -238,13 +245,20 @@ class MockConfig:
 
 
 class MockStepper:
-    """Mock for PrinterStepper — tracks rotation_distance changes."""
+    """Mock for PrinterStepper — tracks rotation_distance changes.
 
-    def __init__(self, rotation_distance=19.2357, mcu=None):
+    Defaults match the LLL Plus reference config: 200 motor full
+    steps/rev × 16 microsteps × 50/17 gear_ratio / 19.2357 mm
+    rotation_distance ≈ 489.7 microsteps/mm ⇒ step_dist ≈ 0.002042 mm.
+    Used by the VACTUAL formula tests to assert register_value
+    = mm/s × ~489.7 / 0.715.
+    """
+
+    def __init__(self, rotation_distance=19.2357,
+                 step_dist=1.0 / 489.71524, mcu=None):
         self._rotation_distance = rotation_distance
+        self._step_dist = step_dist
         self.rd_log = []  # track all set_rotation_distance calls
-        self._trapq = None
-        self._sk = None
         self._mcu = mcu
 
     def get_rotation_distance(self):
@@ -254,24 +268,11 @@ class MockStepper:
         self._rotation_distance = rd
         self.rd_log.append(rd)
 
+    def get_step_dist(self):
+        return self._step_dist
+
     def get_mcu(self):
         return self._mcu
-
-    def set_trapq(self, t):
-        prev = self._trapq
-        self._trapq = t
-        return prev
-
-    def set_stepper_kinematics(self, sk):
-        prev = self._sk
-        self._sk = sk
-        return prev
-
-    def set_position(self, pos):
-        pass
-
-    def generate_steps(self, t):
-        pass
 
 
 class MockExtruderStepper:
@@ -360,29 +361,43 @@ class _MockExtrusionStepper:
 
 
 class MockMcu:
-    """Minimal MCU mock — estimated_print_time + test override.
-
-    The buffer's sidecar throttle queries mcu.estimated_print_time to
-    decide whether the previous chunk has finished.  By default the
-    mock returns the current eventtime so the throttle never fires in
-    unit tests; tests that exercise the throttle pin a fixed value
-    via set_estimated_print_time().
-    """
+    """Minimal MCU mock — estimated_print_time only (matches Klipper's
+    MCU.estimated_print_time signature)."""
 
     def __init__(self, reactor=None):
         self._reactor = reactor
-        self._est_override = None
 
     def estimated_print_time(self, eventtime):
-        if self._est_override is not None:
-            return self._est_override
         return eventtime
 
-    def set_estimated_print_time(self, value):
-        self._est_override = value
 
-    def clear_estimated_print_time(self):
-        self._est_override = None
+class MockTmc2208:
+    """Mock for the [tmc2208 extruder_stepper buffer_stepper] object.
+
+    Exposes a single `mcu_tmc` attribute whose set_register() captures
+    every call into `writes` for assertion.  The latency-regression
+    guard asserts that print_time is always None — i.e. that the
+    plugin never schedules VACTUAL writes at the lookahead tail.
+    """
+
+    def __init__(self):
+        self.mcu_tmc = MockMcuTmc()
+
+
+class MockMcuTmc:
+    """Backing for MockTmc2208.mcu_tmc.  set_register signature
+    matches Klipper's: (reg_name, value, print_time=None)."""
+
+    def __init__(self):
+        # All writes: [(reg_name, value, print_time), ...]
+        self.writes = []
+        # Convenience: VACTUAL writes only, just the integer value.
+        self.vactual_writes = []
+
+    def set_register(self, reg_name, value, print_time=None):
+        self.writes.append((reg_name, value, print_time))
+        if reg_name == "VACTUAL":
+            self.vactual_writes.append(value)
 
 
 class MockToolhead:
@@ -396,7 +411,6 @@ class MockToolhead:
         self.flush_count = 0
         self.dwell_calls = []
         self._last_move_time = 0.0
-        self.note_mcu_movequeue_activity_calls = []
 
     def _wire_extruder(self, extruder):
         if self._reactor is not None:
@@ -423,11 +437,6 @@ class MockToolhead:
     def dwell(self, delay):
         self.dwell_calls.append(delay)
         self._last_move_time += max(0.0, delay)
-
-    def note_mcu_movequeue_activity(self, mq_time, set_step_gen_time=False):
-        self.note_mcu_movequeue_activity_calls.append(mq_time)
-        # Does NOT advance _last_move_time.  That distinction is the
-        # whole point of moving buffer chunks off the main timeline.
 
 
 class MockForceMove:
@@ -476,12 +485,16 @@ class MockPrinter:
         self.toolhead = MockToolhead(reactor=self.reactor)
         self.printer_es = MockPrinterExtruderStepper(toolhead=self.toolhead)
         self.force_move = MockForceMove()
+        # MockTmc2208 captures direct VACTUAL register writes so
+        # recovery tests can assert against them.
+        self.tmc2208 = MockTmc2208()
         self.event_handlers = {}
 
         self._objects = {
             "gcode": self.gcode,
             "toolhead": self.toolhead,
             "extruder_stepper buffer_stepper": self.printer_es,
+            "tmc2208 extruder_stepper buffer_stepper": self.tmc2208,
             "force_move": self.force_move,
             "print_stats": self.print_stats,
             "pause_resume": self.pause_resume,
@@ -615,12 +628,27 @@ def force_move(printer):
 
 
 @pytest.fixture
-def sidecar_moves(buf):
-    """Buffer chunks queued via the sidecar trapq.  This replaces
-    force_move.moves after the refactor that moved chunk motion off
-    the main toolhead timeline.  Tuple shape: (stepper, dist, speed,
-    accel) — same as the previous force_move.moves entries."""
-    return buf.sidecar_moves
+def sidecar_moves(force_move):
+    """Backward-compat alias: post-VACTUAL-refactor, all chunked
+    motion is back on force_move.manual_move so this fixture aliases
+    to force_move.moves.  Existing tests that look up sidecar_moves
+    keep working without per-file rewrites."""
+    return force_move.moves
+
+
+@pytest.fixture
+def vactual_writes(printer):
+    """Returns the list of VACTUAL register values written via
+    mcu_tmc.set_register('VACTUAL', N).  Recovery tests assert
+    against this directly."""
+    return printer.tmc2208.mcu_tmc.vactual_writes
+
+
+@pytest.fixture
+def tmc_writes(printer):
+    """All TMC register writes including (reg_name, value, print_time).
+    Used by the latency-regression guard to assert print_time=None."""
+    return printer.tmc2208.mcu_tmc.writes
 
 
 @pytest.fixture
