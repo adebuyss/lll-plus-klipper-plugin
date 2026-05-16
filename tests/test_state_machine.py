@@ -39,28 +39,32 @@ class TestMiddleZone:
 
 class TestEmptyZone:
     def test_empty_enters_vactual_recovery(self, printing_buf):
-        # EMPTY recovery writes VACTUAL; the stepper stays nominally
-        # synced (TMC ignores STEP/DIR while VACTUAL != 0).
+        # EMPTY recovery writes VACTUAL.  The stepper is unsynced from
+        # the trapq during recovery because on hardware the TMC's
+        # internal commanded position diverges from Klipper's trapq
+        # tracking, and after VACTUAL=0 the trapq sync would silently
+        # break (drift or wrong direction).  The previous synced
+        # extruder is saved so _exit_extreme_recovery can re-sync.
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._current_zone == ZONE_EMPTY
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        # Stepper stays synced — that's the whole point of the
-        # VACTUAL refactor: no unsync needed during recovery.
-        assert printing_buf._synced_to is not None
+        assert printing_buf._synced_to is None
+        assert printing_buf._recovery_resync_to == "extruder"
 
 
 class TestFullZone:
     def test_full_enters_vactual_recovery(self, printing_buf, reactor):
         # FULL recovery enters unconditionally — slow reverse VACTUAL
         # drains regardless of extruder direction (no "defer if idle"
-        # branch any more).
+        # branch any more).  Same unsync pattern as EMPTY.
         set_sensors(printing_buf, full=True)
         reactor._monotonic = 1.0
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._current_zone == ZONE_FULL
         assert printing_buf._extreme_recovery_active == ZONE_FULL
-        assert printing_buf._synced_to is not None
+        assert printing_buf._synced_to is None
+        assert printing_buf._recovery_resync_to == "extruder"
 
 
 class TestEmptyMiddleZone:
