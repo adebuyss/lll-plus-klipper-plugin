@@ -239,7 +239,7 @@ class TestVactualRecoveryEntry:
         # (see _mm_per_s_to_vactual).  Forward filament motion is
         # encoded as a NEGATIVE VACTUAL register value; the formula
         # negates internally so the magnitude reads from
-        # +manual_speed.
+        # +recovery_speed.
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
@@ -248,6 +248,20 @@ class TestVactualRecoveryEntry:
         assert len(vactual_writes) >= 1
         # Forward feed -> negative VACTUAL (inverted polarity).
         assert vactual_writes[-1] < 0
+        # Magnitude check: ~10 mm/s default × 489.4 / 0.715 ≈ 6,845.
+        # Allow ±10% for rounding / step_dist variance.
+        assert 6000 < abs(vactual_writes[-1]) < 7700
+
+    def test_empty_entry_respects_recovery_speed_config(
+            self, printing_buf, vactual_writes):
+        # Override recovery_speed; recovery VACTUAL magnitude scales.
+        # manual_speed stays at 40 mm/s (force_move.manual_move uses
+        # it with a trapezoid ramp and that's fine).
+        printing_buf.recovery_speed = 15.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # ~15 mm/s × 489.4 / 0.715 ≈ 10,267.
+        assert 9500 < abs(vactual_writes[-1]) < 11000
 
     def test_full_entry_writes_reverse_vactual(
             self, printing_buf, vactual_writes):

@@ -131,6 +131,19 @@ class Buffer:
         self.error_clear_hold_time = config.getfloat("error_clear_hold_time",
                                                      2.0, above=0.0)
         self.manual_speed = config.getfloat("manual_speed", 40.0, above=0.0)
+        # EMPTY-zone VACTUAL recovery velocity.  Lower than manual_speed
+        # because VACTUAL is an instant velocity step at the chip — there
+        # is no trapezoid acceleration ramp like force_move.manual_move
+        # has, so the TMC has to develop torque from rest in a single
+        # microstep period.  On the LLL Plus reference hardware
+        # (stealthchop, run_current=0.3) the empirical safe ceiling is
+        # ~30 mm/s; 10 mm/s leaves a 3x margin and is still faster than
+        # typical extruder draw (5-10 mm/s on common print profiles),
+        # so EMPTY recovery still has net positive fill rate.  Bump
+        # this if you have higher run_current, spreadcycle, or
+        # consistently high-flow prints that outrun the default.
+        self.recovery_speed = config.getfloat("recovery_speed", 10.0,
+                                              above=0.0)
         self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
@@ -774,7 +787,10 @@ class Buffer:
     # the extruder's trapq, the print continues without hitch, and
     # we don't have to worry about stepcompress invariants.
     #
-    # EMPTY recovery: forward VACTUAL at manual_speed.
+    # EMPTY recovery: forward VACTUAL at recovery_speed (NOT manual_speed
+    #                 — VACTUAL is an instant velocity step, no trapezoid
+    #                 ramp, so the safe ceiling is much lower than the
+    #                 trapezoid-accelerated manual_speed).
     # FULL recovery:  reverse VACTUAL at 1 mm/s (slow drain — fast
     # enough to recover within timeout, slow enough not to fight a
     # forward-feeding extruder).
@@ -782,7 +798,7 @@ class Buffer:
     def _enter_empty_recovery(self, eventtime):
         if self._extreme_recovery_active is not None:
             return
-        register = self._mm_per_s_to_vactual(self.manual_speed)
+        register = self._mm_per_s_to_vactual(self.recovery_speed)
         if not self._write_vactual(register):
             self._handle_error("EMPTY recovery: VACTUAL write failed")
             return
@@ -790,7 +806,7 @@ class Buffer:
         self._recovery_started_at = eventtime
         self._dlog(eventtime,
                    "recovery enter EMPTY vactual=%d (%.1f mm/s)",
-                   register, self.manual_speed)
+                   register, self.recovery_speed)
         self._arm_recovery_timer(eventtime + _RECOVERY_POLL_INTERVAL)
 
     def _enter_full_recovery(self, eventtime):
@@ -1476,6 +1492,7 @@ class Buffer:
             "base_rotation_distance": round(self._base_rd, 4),
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
+            "recovery_speed": self.recovery_speed,
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
             "extreme_recovery_active": self._extreme_recovery_active,
