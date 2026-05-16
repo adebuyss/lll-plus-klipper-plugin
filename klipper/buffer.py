@@ -265,9 +265,14 @@ class Buffer:
         # VACTUAL recovery poller: 50 ms cadence, single registered
         # timer reused across recovery sessions via update_timer.
         self._recovery_check_timer = None
-        # Chained chunk callbacks (initial fill, continuous feed,
-        # retract-until-clear) terminate by checking their own state
-        # guards each iteration — no timer handles needed.
+        # Per-site chunk-pacing timers.  Each chunk schedules the next
+        # attempt at eventtime + chunk_duration so a brief button tap
+        # produces ONE chunk instead of bursting 3 back-to-back into
+        # the MCU queue (which would all execute regardless of when
+        # the user releases the button).
+        self._fill_timer = None
+        self._continuous_timer = None
+        self._retract_clear_timer = None
 
         # Register events.  klippy:disconnect is critical: VACTUAL
         # persists across host disconnect and the TMC will keep
@@ -471,6 +476,34 @@ class Buffer:
         cleanup-invariant point) and from every recovery exit path."""
         self._write_vactual(0)
 
+    def _chunk_move_duration(self, dist, speed, accel):
+        """Real-time duration of a single force_move.manual_move
+        chunk.  Used to pace the chained chunk loops: scheduling the
+        next callback at eventtime + duration ensures one chunk
+        completes before the next is queued, so a brief button tap
+        produces one chunk instead of a back-to-back burst that's
+        already committed to the MCU before the release callback
+        fires.  Matches the trapezoid math in force_move.calc_move_time.
+        """
+        d = abs(dist)
+        if d <= 0.0 or speed <= 0.0:
+            return 0.0
+        if accel <= 0.0:
+            return d / speed
+        # Klipper's trapezoid: if max_cruise_v² < speed², we never
+        # reach the requested speed.
+        max_cruise_v2 = d * accel
+        if max_cruise_v2 < speed * speed:
+            cruise_v = max_cruise_v2 ** 0.5
+        else:
+            cruise_v = speed
+        accel_t = cruise_v / accel
+        # Distance covered during accel+decel: cruise_v² / accel.
+        cruise_t = (d - cruise_v * cruise_v / accel) / cruise_v
+        if cruise_t < 0.0:
+            cruise_t = 0.0
+        return accel_t + cruise_t + accel_t
+
     # --- Sensor registration ---
 
     def _register_sensors(self, config):
@@ -504,10 +537,9 @@ class Buffer:
         return callback
 
     def _cancel_fill(self):
-        """Cancel any in-progress initial fill loop.  The chained
-        callback in _do_fill_chunk terminates by checking
-        _initial_fill_until at the top of its body."""
+        """Cancel any in-progress initial fill loop."""
         self._initial_fill_until = 0.0
+        self._cancel_fill_timer()
 
     def _material_callback(self, eventtime, state):
         was_present = self.material_present
@@ -945,6 +977,7 @@ class Buffer:
         if (self._initial_fill_until > 0.0
                 and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self._sync()
 
         # Mid-recovery handling: detect exit conditions.  The recovery
@@ -1020,6 +1053,7 @@ class Buffer:
         if (self._initial_fill_until > 0.0
                 and eventtime >= self._initial_fill_until):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self.motor_direction = STOP
             logging.info("buffer[%s]: initial fill timeout"
                          % self.short_name)
@@ -1032,12 +1066,14 @@ class Buffer:
         zone = self._compute_zone()
         if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
             self._sync()
             return
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
+            self._cancel_fill_timer()
             return
         # Issue one chunk
         try:
@@ -1049,15 +1085,29 @@ class Buffer:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self._sync()
             return
-        # Schedule next chunk — reactor will process sensor callbacks
-        # between this return and the next _fill_chunk_cb invocation.
-        self.reactor.register_callback(self._fill_chunk_cb)
+        # Schedule next chunk at chunk-completion eventtime so the
+        # chain self-terminates on a quick state change rather than
+        # bursting moves into the MCU queue ahead of time.
+        next_wake = eventtime + self._chunk_move_duration(
+            self._manual_chunk_dist, self.manual_speed, self.manual_accel)
+        if self._fill_timer is None:
+            self._fill_timer = self.reactor.register_timer(
+                self._fill_chunk_cb, next_wake)
+        else:
+            self.reactor.update_timer(self._fill_timer, next_wake)
 
     def _fill_chunk_cb(self, eventtime):
-        """Reactor callback: continue the fill if still active."""
+        """Timer callback: continue the fill if still active."""
         self._do_fill_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_fill_timer(self):
+        if self._fill_timer is not None:
+            self.reactor.update_timer(
+                self._fill_timer, self.reactor.NEVER)
 
     # --- Control timer ---
 
@@ -1317,15 +1367,17 @@ class Buffer:
         self._do_continuous_chunk(self.reactor.monotonic())
 
     def _do_continuous_chunk(self, eventtime):
-        """Issue one chunk of a continuous feed, schedule the next.
-        Pre-sidecar pattern (commit 5d68d34): state-machine-driven
-        self-termination — if state has changed (BUFFER_STOP, button
-        release, etc.) the chain returns without scheduling another
-        chunk."""
+        """Issue one chunk of a continuous feed, then schedule the
+        next at the chunk's completion eventtime.  A held button
+        therefore produces a continuous stream of chunks; a brief tap
+        produces exactly one chunk because the button-release callback
+        flips state before the next timer fires."""
         # Abort if state changed (stop, disable, error, button release)
         if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
+            self._cancel_continuous_timer()
             return
         if self.force_move is None:
+            self._cancel_continuous_timer()
             return
         stepper = self.extruder_stepper.stepper
         dist = self._manual_chunk_dist
@@ -1338,20 +1390,33 @@ class Buffer:
         except Exception as e:
             logging.warning("buffer[%s]: continuous feed chunk failed: %s"
                             % (self.short_name, e))
+            self._cancel_continuous_timer()
             return
-        # Schedule next chunk — reactor processes sensor callbacks
-        # between this return and _continuous_chunk_cb invocation.
-        self.reactor.register_callback(self._continuous_chunk_cb)
+        next_wake = eventtime + self._chunk_move_duration(
+            dist, self._continuous_feed_speed, self.manual_accel)
+        if self._continuous_timer is None:
+            self._continuous_timer = self.reactor.register_timer(
+                self._continuous_chunk_cb, next_wake)
+        else:
+            self.reactor.update_timer(self._continuous_timer, next_wake)
 
     def _continuous_chunk_cb(self, eventtime):
         self._do_continuous_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_continuous_timer(self):
+        if self._continuous_timer is not None:
+            self.reactor.update_timer(
+                self._continuous_timer, self.reactor.NEVER)
 
     def _stop_manual(self):
-        """Stop any pending manual move state.  The chained callback
-        in _do_continuous_chunk terminates by checking self.state at
-        the top of its body."""
+        """Stop any pending manual move state.  Cancels the timer
+        explicitly to prevent the next scheduled chunk from firing
+        with stale state — the state guard in _do_continuous_chunk
+        is belt-and-suspenders on top of this."""
         self.motor_direction = STOP
         self._manual_feed_full_start = 0.0
+        self._cancel_continuous_timer()
 
     # --- Error handling ---
 
@@ -1557,17 +1622,20 @@ class Buffer:
             "Buffer: retracting at %.1f mm/s until filament clears" % speed)
 
     def _do_retract_until_clear_chunk(self, eventtime):
-        """Issue one retract chunk, check material switch, schedule next.
-        Pre-sidecar pattern (commit 5d68d34): self-terminating chain
-        via state guards (_retract_until_clear, state, material_present)."""
+        """Issue one retract chunk, check material switch, schedule
+        the next at chunk completion.  Material_present sensor edges
+        between chunks abort the loop via the next iteration's guard."""
         if not self._retract_until_clear:
+            self._cancel_retract_clear_timer()
             return
         if self.state != STATE_MANUAL_RETRACT:
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
         if not self.material_present:
             # Filament has cleared the switch
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             self._stop_manual()
             self.state = STATE_IDLE
             self.auto_enabled = False
@@ -1576,6 +1644,7 @@ class Buffer:
             return
         if self.force_move is None:
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
         try:
             self.force_move.manual_move(
@@ -1587,18 +1656,31 @@ class Buffer:
                 "buffer[%s]: retract_until_clear chunk failed: %s"
                 % (self.short_name, e))
             self._retract_until_clear = False
+            self._cancel_retract_clear_timer()
             return
-        # Schedule next chunk — reactor processes sensor callbacks
-        # (notably material_switch) between this return and the next
-        # _retract_until_clear_cb invocation.
-        self.reactor.register_callback(self._retract_until_clear_cb)
+        next_wake = eventtime + self._chunk_move_duration(
+            self._manual_chunk_dist, self._continuous_feed_speed,
+            self.manual_accel)
+        if self._retract_clear_timer is None:
+            self._retract_clear_timer = self.reactor.register_timer(
+                self._retract_until_clear_cb, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._retract_clear_timer, next_wake)
 
     def _retract_until_clear_cb(self, eventtime):
         self._do_retract_until_clear_chunk(eventtime)
+        return self.reactor.NEVER
+
+    def _cancel_retract_clear_timer(self):
+        if self._retract_clear_timer is not None:
+            self.reactor.update_timer(
+                self._retract_clear_timer, self.reactor.NEVER)
 
     def cmd_BUFFER_STOP(self, gcmd):
         self._cancel_fill()
         self._retract_until_clear = False
+        self._cancel_retract_clear_timer()
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED

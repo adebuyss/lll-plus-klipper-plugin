@@ -78,9 +78,10 @@ class TestButtonHoldFeedsContinuously:
             self, buf, buttons, reactor, sidecar_moves):
         reactor._monotonic = 10.0
         buttons.callbacks["PE4"](10.0, 1)
-        # First chunk issued and a continuation callback is queued.
+        # First chunk issued and a continuation timer is scheduled at
+        # chunk-completion eventtime.
         assert len(sidecar_moves) == 1
-        assert len(reactor._pending_callbacks) >= 1
+        assert buf._continuous_timer is not None
 
     def test_feed_button_held_produces_multiple_chunks(
             self, buf, buttons, reactor, sidecar_moves):
@@ -104,6 +105,32 @@ class TestButtonHoldFeedsContinuously:
             reactor.advance_time(0.5)
         assert len(sidecar_moves) == 4
         assert all(m[1] < 0 for m in sidecar_moves)
+
+    def test_brief_feed_tap_produces_exactly_one_chunk(
+            self, buf, buttons, reactor, sidecar_moves):
+        """Regression: pressing+releasing the feed button quickly must
+        not queue multiple chunks ahead.  The earlier register_callback
+        chain fired callbacks back-to-back within a single reactor pass,
+        so a brief tap committed 3 chunks (30mm) to the MCU queue
+        before the release callback flipped state."""
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE4"](10.0, 1)
+        # Release immediately, before any chunk-completion timer can fire.
+        buttons.callbacks["PE4"](10.001, 0)
+        # Still advance time well past chunk duration — the cancelled
+        # timer must not produce a second chunk.
+        for _ in range(5):
+            reactor.advance_time(0.5)
+        assert len(sidecar_moves) == 1
+
+    def test_brief_retract_tap_produces_exactly_one_chunk(
+            self, buf, buttons, reactor, sidecar_moves):
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE5"](10.0, 1)
+        buttons.callbacks["PE5"](10.001, 0)
+        for _ in range(5):
+            reactor.advance_time(0.5)
+        assert len(sidecar_moves) == 1
 
     def test_feed_button_release_stops_loop(
             self, buf, buttons, reactor, sidecar_moves):
