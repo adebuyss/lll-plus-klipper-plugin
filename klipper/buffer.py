@@ -447,10 +447,17 @@ class Buffer:
         value.  Reads steps_per_mm from the live stepper (cached in
         _handle_ready) so changes to rotation_distance / microsteps /
         gear_ratio in the user's config take effect automatically.
+
+        Polarity: on the reference Mellow LLL Plus wiring, the TMC's
+        internal VACTUAL direction is INVERTED relative to STEP/DIR
+        (verified on hardware — positive STEP/DIR pulses drive
+        filament forward, but positive VACTUAL drives reverse).
+        Negate the result so callers can treat the input mm/s with
+        the same sign convention as manual_move (+forward / -reverse).
         """
         if self._steps_per_mm is None:
             return 0
-        return int(mm_per_s * self._steps_per_mm / _VACTUAL_USTEP_PER_LSB)
+        return -int(mm_per_s * self._steps_per_mm / _VACTUAL_USTEP_PER_LSB)
 
     def _write_vactual(self, register_value):
         """Write the TMC VACTUAL register directly.  This is the

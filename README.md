@@ -185,20 +185,18 @@ When the buffer hits ZONE_EMPTY or ZONE_FULL during a print, the plugin uses the
 
 Manual feed/retract (buttons, `BUFFER_FEED`/`BUFFER_RETRACT`, `BUFFER_RETRACT_UNTIL_CLEAR`, initial fill, safety retract) uses the proven `_unsync()` + `force_move.manual_move` + `_sync()` pattern. These paths run outside a print so the toolhead-dwell cost is invisible.
 
-### Polarity verification
+### Polarity
 
-VACTUAL polarity has been verified on the reference Mellow LLL Plus wiring: positive VACTUAL drives filament forward (toward the extruder). The reference `sample_config/lll-plus.cfg` requires no `driver_SHAFT` override.
+On the reference Mellow LLL Plus wiring the TMC's internal VACTUAL direction is **inverted** relative to STEP/DIR — positive STEP/DIR pulses drive filament forward, but positive VACTUAL drives reverse. The plugin negates VACTUAL internally (`_mm_per_s_to_vactual` in `klipper/buffer.py`) so callers can treat the helper's input mm/s with the same sign convention as `force_move.manual_move` (+forward, -reverse). EMPTY recovery drives forward; FULL recovery drives slow reverse — both behave as documented without any user-facing config.
 
-If you have non-reference wiring and find the motor runs the wrong direction during EMPTY recovery, verify at the Klipper console (with filament removed from the buffer):
+If you have non-reference wiring and find that EMPTY recovery drives the wrong direction (e.g. filament moves backward when the buffer is empty), the TMC's internal direction matches STEP/DIR on your board. Drop the negation in `_mm_per_s_to_vactual` (or invert `driver_SHAFT`) and retest with the filament removed:
 
 ```
 SET_STEPPER_ENABLE STEPPER=buffer_stepper ENABLE=1
 SET_TMC_FIELD STEPPER=buffer_stepper FIELD=VACTUAL VALUE=2000
-# observe motor direction
+# observe motor direction (should drive filament forward)
 SET_TMC_FIELD STEPPER=buffer_stepper FIELD=VACTUAL VALUE=0
 ```
-
-If reversed, uncomment `driver_SHAFT: 1` in the `[tmc2208 extruder_stepper buffer_stepper]` section and restart Klipper.
 
 ### Safety — VACTUAL on host crash
 

@@ -233,25 +233,30 @@ class TestVactualRecoveryEntry:
     register.  The stepper stays nominally synced — only the chip-side
     velocity mode is engaged."""
 
-    def test_empty_entry_writes_positive_vactual(
+    def test_empty_entry_writes_forward_vactual(
             self, printing_buf, vactual_writes):
+        # NB: VACTUAL polarity is inverted on the reference hardware
+        # (see _mm_per_s_to_vactual).  Forward filament motion is
+        # encoded as a NEGATIVE VACTUAL register value; the formula
+        # negates internally so the magnitude reads from
+        # +manual_speed.
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         # Stepper stays synced — VACTUAL bypasses STEP/DIR at the chip.
         assert printing_buf._synced_to is not None
-        # A positive VACTUAL value was written.
         assert len(vactual_writes) >= 1
-        assert vactual_writes[-1] > 0
+        # Forward feed -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
 
-    def test_full_entry_writes_negative_vactual(
+    def test_full_entry_writes_reverse_vactual(
             self, printing_buf, vactual_writes):
         set_sensors(printing_buf, full=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_FULL
-        # Slow reverse VACTUAL — negative value, magnitude scaled to 1 mm/s.
+        # Slow reverse drain -> positive VACTUAL (inverted polarity).
         assert len(vactual_writes) >= 1
-        assert vactual_writes[-1] < 0
+        assert vactual_writes[-1] > 0
         # Magnitude check: ~1 mm/s ≈ steps_per_mm/0.715 ≈ 685 LSB.
         # Allow ±10% slack for rounding.
         assert 600 < abs(vactual_writes[-1]) < 800
@@ -266,7 +271,8 @@ class TestVactualRecoveryExit:
             self, printing_buf, vactual_writes, reactor):
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        assert vactual_writes[-1] > 0  # forward VACTUAL active
+        # Forward feed active -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
 
         # Zone progresses to MIDDLE — callback path stops VACTUAL.
         set_sensors(printing_buf, middle=True)
@@ -371,18 +377,28 @@ class TestVactualFormula:
 
     LLL Plus: 200 motor full steps/rev × 16 microsteps × 50/17 gear_ratio
     / 19.2357 mm rotation_distance ≈ 489.7 microsteps/mm.
-    VACTUAL register = mm/s × steps_per_mm / 0.715.
-    At 40 mm/s: 40 × 489.7 / 0.715 ≈ 27,400.
-    At 1 mm/s:  1 × 489.7 / 0.715 ≈ 685.
+    VACTUAL register = mm/s × steps_per_mm / 0.715.  Reference-hardware
+    polarity is inverted so the helper negates the result (positive
+    input mm/s -> negative register value).
+    At 40 mm/s forward: -40 × 489.7 / 0.715 ≈ -27,400.
+    At 1 mm/s forward:  -1 × 489.7 / 0.715 ≈ -685.
     """
 
-    def test_40mm_per_s_is_about_27400(self, enabled_buf):
+    def test_40mm_per_s_magnitude_is_about_27400(self, enabled_buf):
         v = enabled_buf._mm_per_s_to_vactual(40.0)
-        assert 27000 < v < 28000
+        assert 27000 < abs(v) < 28000
+        assert v < 0  # inverted polarity: forward feed -> negative
 
-    def test_1mm_per_s_is_about_685(self, enabled_buf):
+    def test_1mm_per_s_magnitude_is_about_685(self, enabled_buf):
         v = enabled_buf._mm_per_s_to_vactual(1.0)
-        assert 600 < v < 800
+        assert 600 < abs(v) < 800
+        assert v < 0
+
+    def test_negative_input_writes_positive_vactual(self, enabled_buf):
+        # Reverse feed (-1 mm/s) under inverted polarity -> positive
+        # register value.  FULL recovery uses this signed convention.
+        v = enabled_buf._mm_per_s_to_vactual(-1.0)
+        assert v > 0
 
     def test_zero_speed_is_zero(self, enabled_buf):
         assert enabled_buf._mm_per_s_to_vactual(0.0) == 0
@@ -401,7 +417,8 @@ class TestVactualCleanupInvariant:
             self, printing_buf, vactual_writes):
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        assert vactual_writes[-1] > 0
+        # Forward feed -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
 
         printing_buf._unsync()
         # Cleanup invariant: _unsync writes VACTUAL=0.
@@ -412,7 +429,8 @@ class TestVactualCleanupInvariant:
         from conftest import MockGcmd
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
-        assert vactual_writes[-1] > 0
+        # Forward feed active -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
 
         printing_buf.cmd_BUFFER_DISABLE(MockGcmd("BUFFER_DISABLE"))
         assert 0 in vactual_writes
