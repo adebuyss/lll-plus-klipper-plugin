@@ -24,12 +24,12 @@ class TestInitialFillActivation:
         assert sidecar_moves[0][1] > 0  # positive distance
 
     def test_fill_queues_continuation(self, buf, buttons, reactor):
-        """After the first chunk, a continuation callback is queued
-        via reactor.register_callback so the fill loop continues."""
+        """After the first chunk, a continuation timer is scheduled
+        at chunk-completion eventtime so the fill loop continues."""
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
-        assert len(reactor._pending_callbacks) >= 1
+        assert buf._fill_timer is not None
 
 
 class TestInitialFillAbortOnMiddle:
