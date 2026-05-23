@@ -243,12 +243,8 @@ class TestVactualRecoveryEntry:
         set_sensors(printing_buf, empty=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
-        # Stepper unsynced during recovery (TMC commanded position
-        # diverges from trapq tracking when VACTUAL is active; the
-        # explicit unsync/resync at recovery boundaries is the only
-        # way to keep the trapq sync clean across VACTUAL transitions).
-        assert printing_buf._synced_to is None
-        assert printing_buf._recovery_resync_to == "extruder"
+        # Stepper stays synced — VACTUAL bypasses STEP/DIR at the chip.
+        assert printing_buf._synced_to is not None
         assert len(vactual_writes) >= 1
         # Forward feed -> negative VACTUAL (inverted polarity).
         assert vactual_writes[-1] < 0
