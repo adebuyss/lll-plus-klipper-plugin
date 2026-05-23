@@ -251,11 +251,6 @@ class Buffer:
         # but the TMC ignores STEP/DIR while VACTUAL != 0.
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
-        # Saved at recovery entry, used at recovery exit to re-sync
-        # the buffer stepper to the same extruder.  None if recovery
-        # entered while already unsynced (in which case exit doesn't
-        # re-sync — the next control timer or sensor edge handles it).
-        self._recovery_resync_to = None
 
         # Drift-correction rate-limit + zone hysteresis state.
         # _apply_multiplier rate-limits to 2 Hz during printing to
@@ -497,9 +492,44 @@ class Buffer:
             return False
 
     def _stop_recovery_vactual(self):
-        """Convenience: write VACTUAL=0.  Called from _unsync (the
-        cleanup-invariant point) and from every recovery exit path."""
+        """Stop VACTUAL recovery and restore correct STEP/DIR
+        interpretation via a brief directional nudge.
+
+        The TMC2208/2225 latches the sign of the last nonzero VACTUAL
+        write and applies it to subsequent STEP pulses regardless of
+        the DIR pin.  EMPTY recovery writes a negative VACTUAL value
+        (forward-filament intent, negated by _mm_per_s_to_vactual's
+        wiring inversion); a bare VACTUAL=0 would leave the latch
+        "negative" and the synced gear stepper would step backward
+        during the extruder's next forward motion (observed: buffer
+        drains back to EMPTY in ~3 s, recovery refires).  Manual
+        rescue with SET_TMC_FIELD VACTUAL=100 then VACTUAL=0
+        restores correct direction, which this method automates:
+
+        1. Write 0 to stop recovery immediately.
+        2. Write a small positive raw register value to set the
+           chip's internal direction latch to match the sign of
+           normal forward STEP/DIR motion under this wiring.
+        3. Schedule a final 0 ~50 ms later to return to step/dir
+           mode with the corrected latch.  Physical motion at
+           0.1 mm/s held 50 ms is well under one microstep.
+        """
         self._write_vactual(0)
+        # Negate _mm_per_s_to_vactual's caller-facing "+forward"
+        # convention to produce a POSITIVE raw register value —
+        # opposite sign from EMPTY recovery's push, matching the
+        # manual rescue.
+        nudge = -self._mm_per_s_to_vactual(0.1)
+        self._write_vactual(nudge)
+        self.reactor.register_callback(
+            self._clear_vactual_latch_nudge,
+            self.reactor.monotonic() + 0.05)
+
+    def _clear_vactual_latch_nudge(self, eventtime):
+        # Don't clobber a fresh recovery push if recovery has
+        # restarted within the 50 ms nudge window.
+        if self._extreme_recovery_active is None:
+            self._write_vactual(0)
 
     def _chunk_move_duration(self, dist, speed, accel):
         """Real-time duration of a single force_move.manual_move
@@ -651,11 +681,6 @@ class Buffer:
         self._stop_recovery_vactual()
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
-        # Drop any pending re-sync target — this _unsync was called
-        # outside the recovery exit path (e.g. BUFFER_DISABLE, runout,
-        # error) so we should NOT auto-resync when recovery exits.
-        # _enter_*_recovery sets it again if recovery starts again.
-        self._recovery_resync_to = None
         if self._recovery_check_timer is not None:
             self.reactor.update_timer(
                 self._recovery_check_timer, self.reactor.NEVER)
@@ -805,47 +830,15 @@ class Buffer:
     # enough to recover within timeout, slow enough not to fight a
     # forward-feeding extruder).
 
-    def _enter_recovery(self, eventtime, zone, register, label):
-        """Common entry for EMPTY/FULL VACTUAL recovery.
-
-        Unsync the buffer stepper from the extruder's trapq before
-        engaging VACTUAL.  In principle the chip ignores STEP/DIR
-        while VACTUAL is non-zero, so the trapq sync should be
-        harmless — but on hardware the TMC's internal commanded
-        position diverges from Klipper's trapq tracking, and after
-        VACTUAL=0 the trapq sync silently breaks (the buffer either
-        stops following the extruder or follows in the wrong
-        direction).  Explicit unsync/resync at recovery boundaries
-        is the proven pre-sidecar pattern and the only way to keep
-        the trapq sync clean across VACTUAL transitions.  Pays a
-        flush_step_generation cost (brief toolhead dwell) at recovery
-        entry and exit only — acceptable for a rare event.
-
-        _safety_zone_start is saved and restored across the unsync
-        so the cumulative safety-zone clock keeps counting from its
-        original arm time (otherwise full_safety_timeout / empty_
-        safety_timeout would never escalate to _do_safety_retract /
-        _handle_error because _unsync wipes _safety_zone_start).
-        """
-        saved_safety_start = self._safety_zone_start
-        prev_synced = self._synced_to
-        if prev_synced is not None:
-            self._unsync()
-        self._safety_zone_start = saved_safety_start
-        self._recovery_resync_to = prev_synced
-        if not self._write_vactual(register):
-            self._handle_error("%s recovery: VACTUAL write failed" % label)
-            return False
-        self._extreme_recovery_active = zone
-        self._recovery_started_at = eventtime
-        return True
-
     def _enter_empty_recovery(self, eventtime):
         if self._extreme_recovery_active is not None:
             return
         register = self._mm_per_s_to_vactual(self.recovery_speed)
-        if not self._enter_recovery(eventtime, ZONE_EMPTY, register, "EMPTY"):
+        if not self._write_vactual(register):
+            self._handle_error("EMPTY recovery: VACTUAL write failed")
             return
+        self._extreme_recovery_active = ZONE_EMPTY
+        self._recovery_started_at = eventtime
         self._dlog(eventtime,
                    "recovery enter EMPTY vactual=%d (%.1f mm/s)",
                    register, self.recovery_speed)
@@ -855,8 +848,11 @@ class Buffer:
         if self._extreme_recovery_active is not None:
             return
         register = -self._mm_per_s_to_vactual(1.0)  # 1 mm/s slow drain
-        if not self._enter_recovery(eventtime, ZONE_FULL, register, "FULL"):
+        if not self._write_vactual(register):
+            self._handle_error("FULL recovery: VACTUAL write failed")
             return
+        self._extreme_recovery_active = ZONE_FULL
+        self._recovery_started_at = eventtime
         self._dlog(eventtime,
                    "recovery enter FULL vactual=%d (1.0 mm/s reverse)",
                    register)
@@ -915,15 +911,6 @@ class Buffer:
         self._dlog(eventtime,
                    "recovery exit reason=%s prev=%s zone=%s elapsed=%.2fs",
                    reason, prev_zone, self._current_zone, elapsed)
-        # Re-sync the buffer stepper to its previous extruder so the
-        # trapq tracks fresh extruder motion.  Skipped if recovery
-        # entered while not synced, or if the buffer has been
-        # disabled / errored mid-recovery.
-        if (self._recovery_resync_to is not None
-                and self.auto_enabled
-                and self.state not in (STATE_DISABLED, STATE_ERROR)):
-            self._sync()
-        self._recovery_resync_to = None
 
     def _apply_multiplier(self, multiplier):
         """Set the buffer stepper's rotation_distance based on multiplier.

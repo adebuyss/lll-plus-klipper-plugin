@@ -98,7 +98,11 @@ class MockReactor:
         self._fire_callbacks()
         self._fire_timers()
 
-    def register_callback(self, callback):
+    def register_callback(self, callback, waketime=None):
+        # Production Klipper's register_callback takes an optional
+        # waketime; the mock ignores it (callbacks always fire on
+        # the next advance_time / flush_callbacks).  Tests that need
+        # to verify timing should use register_timer instead.
         self._pending_callbacks.append(callback)
 
     def register_timer(self, callback, waketime):
