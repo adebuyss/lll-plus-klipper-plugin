@@ -106,6 +106,29 @@ class TestButtonHoldFeedsContinuously:
         assert len(sidecar_moves) == 4
         assert all(m[1] < 0 for m in sidecar_moves)
 
+    def test_long_hold_does_not_stop_after_two_chunks(
+            self, buf, buttons, reactor, sidecar_moves):
+        """Regression: previously the chunked-callback used
+        update_timer + return NEVER, which in production Klipper
+        disarms the timer because update_timer is a no-op while a
+        timer's callback runs and the return value unconditionally
+        overwrites the timer's waketime.  Symptom on hardware: hold
+        the feed button, get exactly two chunks (one inline + one
+        timer-fire), then nothing.  The mock reactor previously
+        masked this by honouring update_timer-from-within-callback;
+        it now mirrors production semantics, so this loop only stays
+        going if the production code returns the next waketime from
+        the callback itself."""
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE4"](10.0, 1)
+        # Hold for 10 chunk durations worth of time.
+        for _ in range(10):
+            reactor.advance_time(0.5)
+        assert len(sidecar_moves) >= 8, (
+            "expected continuous chunks, got only %d — chunk loop "
+            "stopped early (regression of cfaba3f timer pattern)"
+            % len(sidecar_moves))
+
     def test_brief_feed_tap_produces_exactly_one_chunk(
             self, buf, buttons, reactor, sidecar_moves):
         """Regression: pressing+releasing the feed button quickly must
