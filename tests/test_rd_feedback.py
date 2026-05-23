@@ -340,6 +340,32 @@ class TestVactualRecoveryExit:
         reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
+    def test_full_recovery_exit_runs_nudge_sequence(
+            self, printing_buf, vactual_writes, reactor):
+        """FULL recovery pushes a positive VACTUAL (reverse drain).
+        The chip latch is already in the "positive" state that matches
+        normal forward STEP/DIR motion under this wiring, so the nudge
+        is functionally redundant for FULL exit — but the sequence
+        must still run cleanly without leaving VACTUAL stuck."""
+        set_sensors(printing_buf, full=True)
+        reactor._monotonic = 1.0
+        printing_buf._update_rotation_distance(1.0)
+        # FULL recovery wrote a positive raw register value (drain).
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        assert vactual_writes[-1] > 0
+        recovery_push_idx = len(vactual_writes) - 1
+
+        # Drain succeeds — zone returns to MIDDLE.  (FULL_MIDDLE is
+        # still in the FULL band per the poller's exit gate.)
+        set_sensors(printing_buf, middle=True)
+        printing_buf._check_recovery_done(1.5)
+        assert printing_buf._extreme_recovery_active is None
+        seq = vactual_writes[recovery_push_idx + 1:]
+        assert seq[0] == 0           # immediate stop
+        assert seq[1] > 0            # positive nudge (same sign as drain)
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
 
 class TestVactualRecoveryExitOnSkipMiddle:
     """A fast EMPTY -> FULL_MIDDLE transition (skipping MIDDLE between
