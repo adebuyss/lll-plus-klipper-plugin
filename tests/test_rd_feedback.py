@@ -293,6 +293,11 @@ class TestVactualRecoveryExit:
         reactor._monotonic = 2.0
         printing_buf._update_rotation_distance(2.0)
         assert printing_buf._extreme_recovery_active is None
+        # _stop_recovery_vactual writes 0 then a positive latch-correction
+        # nudge; the final 0 is deferred ~50 ms via register_callback.
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
     def test_zone_return_writes_vactual_zero_via_poller(
@@ -304,6 +309,35 @@ class TestVactualRecoveryExit:
         # Drive the poller directly.
         printing_buf._check_recovery_done(1.1)
         assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+    def test_stop_recovery_writes_latch_correction_nudge(
+            self, printing_buf, vactual_writes, reactor):
+        """The TMC chip latches the sign of the last nonzero VACTUAL
+        and would override the DIR pin during subsequent STEP/DIR
+        motion.  _stop_recovery_vactual must therefore write a
+        positive-magnitude nudge to flip the latch back before
+        returning to step/dir mode."""
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # EMPTY recovery wrote a negative raw register value.
+        assert vactual_writes[-1] < 0
+        recovery_push_idx = len(vactual_writes) - 1
+
+        # Exit recovery — must produce the three-step sequence:
+        # [..., recovery_neg, 0, positive_nudge] then a deferred 0.
+        set_sensors(printing_buf, middle=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        seq = vactual_writes[recovery_push_idx + 1:]
+        assert seq[0] == 0           # immediate stop
+        assert seq[1] > 0            # positive latch-correction nudge
+        # Deferred final 0 hasn't fired until the reactor drains.
+        assert vactual_writes[-1] == seq[1]
+        reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
 
@@ -323,6 +357,9 @@ class TestVactualRecoveryExitOnSkipMiddle:
         reactor._monotonic = 2.0
         printing_buf._update_rotation_distance(2.0)
         assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
 
@@ -343,6 +380,9 @@ class TestVactualRecoveryTimeout:
         printing_buf._check_recovery_done(timeout_t)
         assert printing_buf.state == STATE_ERROR
         assert "recovery exceeded" in printing_buf.error_msg.lower()
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
 
@@ -361,6 +401,9 @@ class TestVactualRecoveryRunout:
         printing_buf.material_present = False
         printing_buf._check_recovery_done(1.5)
         assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
         assert vactual_writes[-1] == 0
 
 

@@ -492,9 +492,44 @@ class Buffer:
             return False
 
     def _stop_recovery_vactual(self):
-        """Convenience: write VACTUAL=0.  Called from _unsync (the
-        cleanup-invariant point) and from every recovery exit path."""
+        """Stop VACTUAL recovery and restore correct STEP/DIR
+        interpretation via a brief directional nudge.
+
+        The TMC2208/2225 latches the sign of the last nonzero VACTUAL
+        write and applies it to subsequent STEP pulses regardless of
+        the DIR pin.  EMPTY recovery writes a negative VACTUAL value
+        (forward-filament intent, negated by _mm_per_s_to_vactual's
+        wiring inversion); a bare VACTUAL=0 would leave the latch
+        "negative" and the synced gear stepper would step backward
+        during the extruder's next forward motion (observed: buffer
+        drains back to EMPTY in ~3 s, recovery refires).  Manual
+        rescue with SET_TMC_FIELD VACTUAL=100 then VACTUAL=0
+        restores correct direction, which this method automates:
+
+        1. Write 0 to stop recovery immediately.
+        2. Write a small positive raw register value to set the
+           chip's internal direction latch to match the sign of
+           normal forward STEP/DIR motion under this wiring.
+        3. Schedule a final 0 ~50 ms later to return to step/dir
+           mode with the corrected latch.  Physical motion at
+           0.1 mm/s held 50 ms is well under one microstep.
+        """
         self._write_vactual(0)
+        # Negate _mm_per_s_to_vactual's caller-facing "+forward"
+        # convention to produce a POSITIVE raw register value —
+        # opposite sign from EMPTY recovery's push, matching the
+        # manual rescue.
+        nudge = -self._mm_per_s_to_vactual(0.1)
+        self._write_vactual(nudge)
+        self.reactor.register_callback(
+            self._clear_vactual_latch_nudge,
+            self.reactor.monotonic() + 0.05)
+
+    def _clear_vactual_latch_nudge(self, eventtime):
+        # Don't clobber a fresh recovery push if recovery has
+        # restarted within the 50 ms nudge window.
+        if self._extreme_recovery_active is None:
+            self._write_vactual(0)
 
     def _chunk_move_duration(self, dist, speed, accel):
         """Real-time duration of a single force_move.manual_move
