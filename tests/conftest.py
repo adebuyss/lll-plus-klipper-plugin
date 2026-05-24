@@ -52,6 +52,13 @@ class MockReactor:
         self._monotonic = 0.0
         self._timers = []  # [(callback, waketime)]
         self._pending_callbacks = []  # deferred callbacks
+        # Index of the timer whose callback is currently executing.
+        # Mirrors production Klipper's ReactorTimer.timer_is_running:
+        # update_timer is a no-op for the firing timer.  Without this
+        # guard, the "update_timer(...) + return NEVER" anti-pattern
+        # would appear to work in tests but silently disarm the timer
+        # on production hardware after exactly one fire.
+        self._firing_timer_idx = None
 
     def monotonic(self):
         return self._monotonic
@@ -77,18 +84,16 @@ class MockReactor:
     def _fire_timers(self):
         for i, (cb, wake) in enumerate(list(self._timers)):
             if self._monotonic >= wake:
-                # Snapshot the timer state pre-callback so we can detect
-                # whether cb modified it via update_timer.  Klipper's
-                # convention allows a cb to either return its next wake
-                # time OR reschedule itself via update_timer (returning
-                # NEVER).  Honour update_timer's value if present;
-                # otherwise use the return value.
-                pre_wake = self._timers[i][1]
-                next_wake = cb(self._monotonic)
-                post_wake = self._timers[i][1]
-                if post_wake != pre_wake:
-                    pass  # cb already rescheduled via update_timer
-                elif next_wake is not None:
+                # Mirror production Klipper: update_timer is a no-op
+                # while the timer's callback runs (timer_is_running
+                # guard), and the callback's return value is what
+                # rearms the timer.  See klippy/reactor.py upstream.
+                self._firing_timer_idx = i
+                try:
+                    next_wake = cb(self._monotonic)
+                finally:
+                    self._firing_timer_idx = None
+                if next_wake is not None:
                     self._timers[i] = (cb, next_wake)
 
     def flush_callbacks(self):
@@ -111,6 +116,11 @@ class MockReactor:
         return handle
 
     def update_timer(self, handle, waketime):
+        # Production semantics: a timer's update_timer is a no-op
+        # while that timer's callback is running.  Catches the
+        # "update_timer(...) + return NEVER" pattern at test time.
+        if handle == self._firing_timer_idx:
+            return
         cb, _ = self._timers[handle]
         self._timers[handle] = (cb, waketime)
 

@@ -1099,19 +1099,31 @@ class Buffer:
         self._unsync()
         self.state = STATE_FEEDING
         self.motor_direction = FORWARD
-        self._do_fill_chunk(eventtime)
+        next_wake = self._do_fill_chunk(eventtime)
+        if next_wake == self.reactor.NEVER:
+            return
+        if self._fill_timer is None:
+            self._fill_timer = self.reactor.register_timer(
+                self._do_fill_chunk, next_wake)
+        else:
+            self.reactor.update_timer(self._fill_timer, next_wake)
 
     def _do_fill_chunk(self, eventtime):
-        """Issue one fill chunk, then schedule the next via reactor.
-        Pre-sidecar pattern (commit 5d68d34): force_move.manual_move
-        synchronously enqueues onto the main toolhead and pays the
-        dwell cost.  Outside a print (which is when this runs) the
-        dwell is invisible."""
+        """Issue one fill chunk and return the next waketime, or
+        NEVER if the loop should terminate.  Pre-sidecar pattern
+        (commit 5d68d34): force_move.manual_move synchronously
+        enqueues onto the main toolhead and pays the dwell cost.
+        Outside a print (which is when this runs) the dwell is
+        invisible.
+
+        Serves as both the inline entry from _do_initial_fill and the
+        registered timer callback.  See _do_continuous_chunk for why
+        we return the next waketime instead of calling update_timer.
+        """
         # Abort: timeout expired
         if (self._initial_fill_until > 0.0
                 and eventtime >= self._initial_fill_until):
             self._initial_fill_until = 0.0
-            self._cancel_fill_timer()
             self.motor_direction = STOP
             logging.info("buffer[%s]: initial fill timeout"
                          % self.short_name)
@@ -1119,20 +1131,18 @@ class Buffer:
                 "Buffer: initial fill timed out after %.0fs"
                 % self.initial_fill_timeout)
             self._sync()
-            return
+            return self.reactor.NEVER
         # Abort: filament reached middle sensor or beyond
         zone = self._compute_zone()
         if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
             self._initial_fill_until = 0.0
-            self._cancel_fill_timer()
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
             self._sync()
-            return
+            return self.reactor.NEVER
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
-            self._cancel_fill_timer()
-            return
+            return self.reactor.NEVER
         # Issue one chunk
         try:
             self.force_move.manual_move(
@@ -1143,24 +1153,10 @@ class Buffer:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
-            self._cancel_fill_timer()
             self._sync()
-            return
-        # Schedule next chunk at chunk-completion eventtime so the
-        # chain self-terminates on a quick state change rather than
-        # bursting moves into the MCU queue ahead of time.
-        next_wake = eventtime + self._chunk_move_duration(
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
             self._manual_chunk_dist, self.manual_speed, self.manual_accel)
-        if self._fill_timer is None:
-            self._fill_timer = self.reactor.register_timer(
-                self._fill_chunk_cb, next_wake)
-        else:
-            self.reactor.update_timer(self._fill_timer, next_wake)
-
-    def _fill_chunk_cb(self, eventtime):
-        """Timer callback: continue the fill if still active."""
-        self._do_fill_chunk(eventtime)
-        return self.reactor.NEVER
 
     def _cancel_fill_timer(self):
         if self._fill_timer is not None:
@@ -1422,21 +1418,34 @@ class Buffer:
         self._manual_feed_full_start = 0.0
         self._continuous_feed_direction = direction
         self._continuous_feed_speed = speed
-        self._do_continuous_chunk(self.reactor.monotonic())
+        eventtime = self.reactor.monotonic()
+        next_wake = self._do_continuous_chunk(eventtime)
+        if next_wake == self.reactor.NEVER:
+            return
+        if self._continuous_timer is None:
+            self._continuous_timer = self.reactor.register_timer(
+                self._do_continuous_chunk, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._continuous_timer, next_wake)
 
     def _do_continuous_chunk(self, eventtime):
-        """Issue one chunk of a continuous feed, then schedule the
-        next at the chunk's completion eventtime.  A held button
-        therefore produces a continuous stream of chunks; a brief tap
-        produces exactly one chunk because the button-release callback
-        flips state before the next timer fires."""
+        """Issue one chunk of a continuous feed and return the next
+        waketime, or NEVER if the loop should terminate.
+
+        Serves as both the inline entry from _start_continuous_feed and
+        the registered timer callback.  Returning the next waketime
+        (rather than calling update_timer + returning NEVER) is the
+        only pattern that re-arms the timer in production Klipper:
+        update_timer is a no-op while a timer's callback is running,
+        and _check_timers unconditionally assigns the return value to
+        the timer's waketime.
+        """
         # Abort if state changed (stop, disable, error, button release)
         if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
-            self._cancel_continuous_timer()
-            return
+            return self.reactor.NEVER
         if self.force_move is None:
-            self._cancel_continuous_timer()
-            return
+            return self.reactor.NEVER
         stepper = self.extruder_stepper.stepper
         dist = self._manual_chunk_dist
         if self._continuous_feed_direction == BACK:
@@ -1448,19 +1457,9 @@ class Buffer:
         except Exception as e:
             logging.warning("buffer[%s]: continuous feed chunk failed: %s"
                             % (self.short_name, e))
-            self._cancel_continuous_timer()
-            return
-        next_wake = eventtime + self._chunk_move_duration(
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
             dist, self._continuous_feed_speed, self.manual_accel)
-        if self._continuous_timer is None:
-            self._continuous_timer = self.reactor.register_timer(
-                self._continuous_chunk_cb, next_wake)
-        else:
-            self.reactor.update_timer(self._continuous_timer, next_wake)
-
-    def _continuous_chunk_cb(self, eventtime):
-        self._do_continuous_chunk(eventtime)
-        return self.reactor.NEVER
 
     def _cancel_continuous_timer(self):
         if self._continuous_timer is not None:
@@ -1676,35 +1675,41 @@ class Buffer:
         self._continuous_feed_direction = BACK
         self._continuous_feed_speed = speed
         self._retract_until_clear = True
-        self._do_retract_until_clear_chunk(self.reactor.monotonic())
+        eventtime = self.reactor.monotonic()
+        next_wake = self._do_retract_until_clear_chunk(eventtime)
+        if next_wake != self.reactor.NEVER:
+            if self._retract_clear_timer is None:
+                self._retract_clear_timer = self.reactor.register_timer(
+                    self._do_retract_until_clear_chunk, next_wake)
+            else:
+                self.reactor.update_timer(
+                    self._retract_clear_timer, next_wake)
         gcmd.respond_info(
             "Buffer: retracting at %.1f mm/s until filament clears" % speed)
 
     def _do_retract_until_clear_chunk(self, eventtime):
-        """Issue one retract chunk, check material switch, schedule
-        the next at chunk completion.  Material_present sensor edges
-        between chunks abort the loop via the next iteration's guard."""
+        """Issue one retract chunk and return the next waketime, or
+        NEVER if the loop should terminate.  Serves as both the inline
+        entry from cmd_BUFFER_RETRACT_UNTIL_CLEAR and the registered
+        timer callback.  See _do_continuous_chunk for why we return
+        the next waketime instead of calling update_timer."""
         if not self._retract_until_clear:
-            self._cancel_retract_clear_timer()
-            return
+            return self.reactor.NEVER
         if self.state != STATE_MANUAL_RETRACT:
             self._retract_until_clear = False
-            self._cancel_retract_clear_timer()
-            return
+            return self.reactor.NEVER
         if not self.material_present:
             # Filament has cleared the switch
             self._retract_until_clear = False
-            self._cancel_retract_clear_timer()
             self._stop_manual()
             self.state = STATE_IDLE
             self.auto_enabled = False
             self.gcode.respond_info(
                 "Buffer: retract complete - filament cleared")
-            return
+            return self.reactor.NEVER
         if self.force_move is None:
             self._retract_until_clear = False
-            self._cancel_retract_clear_timer()
-            return
+            return self.reactor.NEVER
         try:
             self.force_move.manual_move(
                 self.extruder_stepper.stepper,
@@ -1715,21 +1720,10 @@ class Buffer:
                 "buffer[%s]: retract_until_clear chunk failed: %s"
                 % (self.short_name, e))
             self._retract_until_clear = False
-            self._cancel_retract_clear_timer()
-            return
-        next_wake = eventtime + self._chunk_move_duration(
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
             self._manual_chunk_dist, self._continuous_feed_speed,
             self.manual_accel)
-        if self._retract_clear_timer is None:
-            self._retract_clear_timer = self.reactor.register_timer(
-                self._retract_until_clear_cb, next_wake)
-        else:
-            self.reactor.update_timer(
-                self._retract_clear_timer, next_wake)
-
-    def _retract_until_clear_cb(self, eventtime):
-        self._do_retract_until_clear_chunk(eventtime)
-        return self.reactor.NEVER
 
     def _cancel_retract_clear_timer(self):
         if self._retract_clear_timer is not None:
