@@ -8,6 +8,7 @@ from conftest import (
     STATE_FEEDING,
     STATE_STOPPED,
     STATE_ERROR,
+    STATE_MANUAL_FEED,
     ZONE_EMPTY,
     ZONE_EMPTY_MIDDLE,
     ZONE_MIDDLE,
@@ -19,15 +20,15 @@ from conftest import (
 
 
 def _apply_zone_with_hysteresis(buf, zone_setter, t0=1.0):
-    """Helper: apply a zone twice with >200ms gap so the hysteresis
-    gate in _update_rotation_distance commits the multiplier.  The
-    plain-zone hysteresis is mandatory for non-extreme zones — the
-    first call records the proposed zone, the second (after 200ms)
-    commits it.  Extreme zones (EMPTY/FULL) are not hysteresis-gated;
-    they enter recovery on the first call."""
+    """Helper: settle a zone through the N-tick debounce.  At default
+    zone_debounce_ticks=2, two direct calls to _update_rotation_distance
+    increment the counter from 1 to 2 and commit.  Extreme zones
+    (EMPTY/FULL) are not debounce-gated; they enter recovery on the
+    first call.  Tests that want to override the tick count should set
+    buf.zone_debounce_ticks before calling this helper."""
     zone_setter()
-    buf._update_rotation_distance(t0)
-    buf._update_rotation_distance(t0 + 0.3)
+    for i in range(buf.zone_debounce_ticks):
+        buf._update_rotation_distance(t0 + i * 0.1)
 
 
 class TestZoneClassification:
@@ -117,41 +118,53 @@ class TestRotationDistanceApplication:
 
 
 class TestZoneHysteresis:
-    """A non-extreme zone must be stable for 200ms before the multiplier
-    commits.  Prevents sensor-bounce thrash at zone boundaries."""
+    """A non-extreme zone must hold for N control-timer ticks before
+    the multiplier commits.  N is configurable via zone_debounce_ticks
+    (default 2).  Prevents sensor-bounce thrash at zone boundaries."""
 
     def test_first_call_does_not_apply(self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
         set_sensors(enabled_buf)  # EMPTY_MIDDLE
         enabled_buf._update_rotation_distance(1.0)
-        # First call records the proposed zone but does not apply.
+        # First call brings the count to 1 (default N=2) — not committed.
         assert enabled_buf._rd_multiplier == 1.0
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
     def test_bounce_resets_proposed_zone(self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
-        # Propose EMPTY_MIDDLE
+        # Propose EMPTY_MIDDLE — count=1.
         set_sensors(enabled_buf)
         enabled_buf._update_rotation_distance(1.0)
-        # Bounce to MIDDLE before hysteresis settles
+        # Bounce to MIDDLE — resets proposed and count=1 again.
         set_sensors(enabled_buf, middle=True)
         enabled_buf._update_rotation_distance(1.1)
-        # Still no change — both attempts were under 200ms each.
+        # Still no commit — neither zone reached the N=2 threshold.
         assert enabled_buf._rd_multiplier == 1.0
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
 
 class TestSensorCallbackUpdatesMultiplier:
-    """Verify sensor callbacks trigger rotation_distance updates."""
+    """Verify sensor callbacks mirror state and start the conflict
+    clock; the apply path runs at control-timer cadence, not edge."""
 
-    def test_sensor_callback_updates_rd(self, enabled_buf, buttons, stepper):
-        base_rd = enabled_buf._base_rd
-        # Trigger middle sensor twice across hysteresis window
+    def test_sensor_callback_does_not_write_stepper(
+            self, enabled_buf, buttons, stepper):
+        baseline = len(stepper.rd_log)
+        # Bounce middle sensor many times — callback path only mirrors
+        # state into sensor_states, no rd writes until a timer tick.
+        for i in range(10):
+            trigger_sensor(buttons, "PE1", True, 1.0 + i * 0.001)
+            trigger_sensor(buttons, "PE1", False, 1.0 + i * 0.001 + 0.0005)
+        assert len(stepper.rd_log) == baseline
+
+    def test_sensor_callback_updates_sensor_state(
+            self, enabled_buf, buttons, stepper):
+        # PE1 is the middle sensor — triggered=True means raw 0 ->
+        # post-invert True.
         trigger_sensor(buttons, "PE1", True, 1.0)
-        trigger_sensor(buttons, "PE1", True, 1.3)
-        # MIDDLE -> multiplier 1.0 (same as baseline) -> no rd change
-        assert enabled_buf._rd_multiplier == 1.0
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        assert enabled_buf.sensor_states["middle"] is True
+        trigger_sensor(buttons, "PE1", False, 1.1)
+        assert enabled_buf.sensor_states["middle"] is False
 
     def test_sensor_conflict_triggers_error(self, enabled_buf, buttons):
         # Trigger empty first, then full
@@ -208,6 +221,174 @@ class TestApplyMultiplierRateLimit:
         printing_buf._control_timer_cb(1.6)
         assert printing_buf._pending_multiplier is None
         assert printing_buf._rd_multiplier == pytest.approx(1.10)
+
+
+class TestNTickDebounce:
+    """N-consecutive-tick debounce — the sensor callback resets the
+    counter on zone change; the control timer increments it once per
+    tick.  Multiplier commits when count >= zone_debounce_ticks."""
+
+    def test_rapid_bouncing_produces_zero_apply_calls(
+            self, enabled_buf, buttons, stepper):
+        """30 alternating callbacks in <100 ms with NO timer ticks
+        must not produce any rd write."""
+        enabled_buf.zone_debounce_ticks = 3
+        baseline = len(stepper.rd_log)
+        # Bounce middle and empty sensors at ~30 Hz.  The callback
+        # path's _observe_zone only ever resets the count; the timer
+        # is the sole incrementer.
+        for i in range(30):
+            t = 1.0 + i * 0.003
+            # Toggle middle on/off and empty on/off, simulating
+            # boundary bounce between MIDDLE and EMPTY_MIDDLE.
+            trigger_sensor(buttons, "PE1", i % 2 == 0, t)
+        assert len(stepper.rd_log) == baseline
+        assert enabled_buf._committed_zone is None
+
+    def test_n_ticks_required_before_commit(self, enabled_buf, stepper):
+        enabled_buf.zone_debounce_ticks = 2
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf)  # EMPTY_MIDDLE
+        enabled_buf._update_rotation_distance(1.0)  # tick 1 -> count=1
+        assert enabled_buf._rd_multiplier == 1.0
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        enabled_buf._update_rotation_distance(1.5)  # tick 2 -> count=2
+        expected = 1.0 + enabled_buf.drift_gain
+        assert enabled_buf._rd_multiplier == pytest.approx(expected)
+        assert enabled_buf._committed_zone == ZONE_EMPTY_MIDDLE
+
+    def test_n_equals_one_commits_first_tick(self, enabled_buf, stepper):
+        """zone_debounce_ticks=1 is the opt-out path — commits on the
+        first tick after a zone change (still timer-gated, not edge)."""
+        enabled_buf.zone_debounce_ticks = 1
+        set_sensors(enabled_buf)  # EMPTY_MIDDLE
+        enabled_buf._update_rotation_distance(1.0)
+        expected = 1.0 + enabled_buf.drift_gain
+        assert enabled_buf._rd_multiplier == pytest.approx(expected)
+        assert enabled_buf._committed_zone == ZONE_EMPTY_MIDDLE
+
+    def test_zone_change_resets_counter(self, enabled_buf, stepper):
+        """A bouncing-then-changing zone defers commit until the new
+        zone holds for N ticks."""
+        enabled_buf.zone_debounce_ticks = 3
+        # Build up count=2 on EMPTY_MIDDLE.
+        set_sensors(enabled_buf)
+        enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._update_rotation_distance(1.5)
+        assert enabled_buf._committed_zone is None
+        # Switch zones — counter resets to 1.
+        set_sensors(enabled_buf, middle=True)
+        enabled_buf._update_rotation_distance(2.0)
+        assert enabled_buf._committed_zone is None
+        # Need two more ticks at MIDDLE before commit.
+        enabled_buf._update_rotation_distance(2.5)
+        assert enabled_buf._committed_zone is None
+        enabled_buf._update_rotation_distance(3.0)
+        assert enabled_buf._committed_zone == ZONE_MIDDLE
+        # MIDDLE -> multiplier 1.0 -> dedup, no rd change.
+        assert enabled_buf._rd_multiplier == 1.0
+
+    def test_sensor_callback_resets_counter_on_zone_change(
+            self, enabled_buf, buttons):
+        """Verify the callback path resets _proposed_zone_count to 0
+        when zone changes (only the timer increments)."""
+        enabled_buf.zone_debounce_ticks = 3
+        # Start at MIDDLE: callback resets proposed to MIDDLE.
+        trigger_sensor(buttons, "PE1", True, 1.0)
+        assert enabled_buf._proposed_zone == ZONE_MIDDLE
+        assert enabled_buf._proposed_zone_count == 0
+        # Bump count via timer tick.
+        enabled_buf._update_rotation_distance(1.5)
+        assert enabled_buf._proposed_zone_count == 1
+        # Switch zones via callback — count resets to 0.
+        trigger_sensor(buttons, "PE1", False, 2.0)  # back to EMPTY_MIDDLE
+        assert enabled_buf._proposed_zone == ZONE_EMPTY_MIDDLE
+        assert enabled_buf._proposed_zone_count == 0
+
+
+class TestNTickDebounceExtremeFastPath:
+    """EMPTY/FULL recovery must still fire from the sensor callback —
+    delaying VACTUAL recovery by up to control_interval is a real
+    safety regression."""
+
+    def test_empty_from_callback_enters_recovery_immediately(
+            self, printing_buf, buttons, vactual_writes):
+        # No timer tick — only the callback fires.
+        trigger_sensor(buttons, "PE0", True, 1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        # VACTUAL was written (forward feed -> negative).
+        assert len(vactual_writes) >= 1
+        assert vactual_writes[-1] < 0
+
+    def test_full_from_callback_enters_recovery_immediately(
+            self, printing_buf, buttons, vactual_writes):
+        trigger_sensor(buttons, "PE2", True, 1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        # FULL recovery -> reverse drain -> positive VACTUAL.
+        assert len(vactual_writes) >= 1
+        assert vactual_writes[-1] > 0
+
+    def test_empty_recovery_exits_via_callback_path(
+            self, printing_buf, buttons, vactual_writes, reactor):
+        """Mid-recovery exit fires from the callback path too — a
+        fast zone return doesn't wait for the 50 ms recovery poller."""
+        trigger_sensor(buttons, "PE0", True, 1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        # Sensor returns to middle — exit recovery on the edge.
+        trigger_sensor(buttons, "PE0", False, 2.0)
+        trigger_sensor(buttons, "PE1", True, 2.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+
+
+class TestNTickDebounceConflict:
+    """Conflict-clock starts in the sensor callback (not the timer)
+    so escalation measures from when the conflict began, not from
+    the next tick."""
+
+    def test_callback_starts_conflict_clock(self, enabled_buf, buttons):
+        trigger_sensor(buttons, "PE0", True, 1.0)
+        trigger_sensor(buttons, "PE2", True, 1.0)
+        # _conflict_since set by the callback, not the timer.
+        assert enabled_buf._conflict_since == 1.0
+        assert enabled_buf.state != STATE_ERROR
+        # Escalation still fires from the control timer.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
+        assert enabled_buf.state == STATE_ERROR
+
+    def test_resolved_conflict_clears_clock_in_callback(
+            self, enabled_buf, buttons):
+        trigger_sensor(buttons, "PE0", True, 1.0)
+        trigger_sensor(buttons, "PE2", True, 1.0)
+        assert enabled_buf._conflict_since == 1.0
+        # Resolve: drop empty, keep full and middle.
+        trigger_sensor(buttons, "PE0", False, 1.05)
+        # Cleared by the callback path without a timer tick.
+        assert enabled_buf._conflict_since == 0.0
+
+
+class TestNTickManualAutoStop:
+    """Manual feed/retract auto-stop runs in _control_timer_cb and
+    reads sensor_states each tick.  After the apply-to-callback
+    move, the callback must still mirror state so the auto-stop
+    decision works."""
+
+    def test_manual_feed_sees_fresh_sensor_state(
+            self, enabled_buf, buttons, reactor):
+        # Drive manual feed.  Auto-stop should fire when 'full' sensor
+        # sustains for manual_feed_full_timeout seconds.
+        enabled_buf.state = STATE_MANUAL_FEED
+        enabled_buf._feed_button_pressed = False  # gcode-initiated
+        # No tick: callback fires the full sensor.
+        trigger_sensor(buttons, "PE2", True, 1.0)
+        assert enabled_buf.sensor_states["full"] is True
+        # First tick arms the timer.
+        enabled_buf._control_timer_cb(1.0)
+        assert enabled_buf._manual_feed_full_start == 1.0
+        # Advance past manual_feed_full_timeout — auto-stop fires.
+        elapsed = enabled_buf.manual_feed_full_timeout + 0.1
+        enabled_buf._control_timer_cb(1.0 + elapsed)
+        assert enabled_buf.state == STATE_STOPPED
 
 
 class TestUnsyncRestoresBaseRotationDistance:

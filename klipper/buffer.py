@@ -151,6 +151,16 @@ class Buffer:
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
+        # N-consecutive-tick debounce on zone transitions.  The sensor
+        # callback only RESETS the counter on a zone change; the control
+        # timer is the sole site that INCREMENTS it.  Burst bouncing
+        # inside one tick window therefore cannot inflate the count —
+        # the semantics are "N control-timer ticks of stable agreement".
+        # Default 2 → ~1.0 s effective window at default
+        # control_interval=0.5.  Set to 1 to commit on the first tick
+        # after a zone change (no debounce, still timer-rate-limited).
+        self.zone_debounce_ticks = config.getint(
+            "zone_debounce_ticks", 2, minval=1, maxval=20)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
         # Per-attempt cap on VACTUAL recovery.  If recovery has not
@@ -252,15 +262,21 @@ class Buffer:
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
 
-        # Drift-correction rate-limit + zone hysteresis state.
-        # _apply_multiplier rate-limits to 2 Hz during printing to
-        # avoid stacked no-flush set_rotation_distance calls when a
-        # sensor bounces.  _update_rotation_distance requires a zone
-        # to be stable for 200 ms before committing.
+        # Drift-correction rate-limit state.  _apply_multiplier rate-
+        # limits to 2 Hz during printing as defense-in-depth for the
+        # off-cadence call site in _sync().  The deferred apply lands
+        # on the next control-timer tick via _pending_multiplier.
         self._last_rd_apply_at = 0.0
         self._pending_multiplier = None
+        # N-tick zone debounce.  Sensor callback resets _proposed_zone
+        # and _proposed_zone_count on a zone change.  Control timer
+        # increments _proposed_zone_count once per tick.  Multiplier
+        # commits when _proposed_zone_count >= self.zone_debounce_ticks.
+        # _committed_zone tracks the last zone we applied so the timer
+        # doesn't redundantly re-call _apply_multiplier each tick.
         self._proposed_zone = None
-        self._proposed_zone_at = 0.0
+        self._proposed_zone_count = 0
+        self._committed_zone = None
 
         # Transient sensor-conflict deferral: timestamp of the first
         # tick where empty+full were both true.  Cleared on the next
@@ -582,13 +598,61 @@ class Buffer:
     # --- Sensor callbacks ---
 
     def _make_sensor_callback(self, sensor_name):
+        """Hot-path sensor callback.  Three concerns only:
+
+        (1) sensor_states mirror — manual feed/retract auto-stop in
+            _control_timer_cb reads these every tick and must see
+            fresh values.
+        (2) Conflict-clock start (_conflict_since) — set on the edge
+            so escalation in _control_timer_cb measures from when
+            the conflict began, not from the next tick.
+        (3) Extreme-zone (EMPTY/FULL) recovery entry — delaying VACTUAL
+            recovery by up to control_interval is a real safety
+            regression, so recovery still fires from the callback.
+            Mid-recovery exit is also handled here so a fast zone
+            return doesn't wait for the recovery poller's 50 ms tick.
+
+        Non-extreme multiplier application moved to _control_timer_cb
+        so a bouncing sensor produces at most one rotation_distance
+        write per tick instead of per edge.  See _observe_zone and
+        _update_rotation_distance for the N-tick debounce logic.
+        """
         def callback(eventtime, state):
             self.sensor_states[sensor_name] = not bool(state)
             self._any_sensor_reported = True
-            if self.auto_enabled and self.state not in (
+            if not self.auto_enabled or self.state in (
                     STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
                     STATE_ERROR, STATE_DISABLED):
-                self._update_rotation_distance(eventtime)
+                return
+            zone = self._compute_zone()
+            if zone is None:
+                # Transient empty+full — start the escalation clock
+                # on the edge (control timer promotes after
+                # control_interval if still set).
+                if self._conflict_since <= 0.0:
+                    self._conflict_since = eventtime
+                return
+            self._conflict_since = 0.0
+            # Fast safety path: extreme zone -> VACTUAL recovery NOW.
+            # Mirrors the gate in _update_rotation_distance.
+            if (zone in (ZONE_FULL, ZONE_EMPTY)
+                    and self._synced_to is not None
+                    and self._is_printing()
+                    and self._extreme_recovery_active is None):
+                if zone == ZONE_EMPTY:
+                    self._enter_empty_recovery(eventtime)
+                else:
+                    self._enter_full_recovery(eventtime)
+                return
+            # Mid-recovery exit on edge — same logic as control-timer
+            # path, factored so both sites stay in sync.
+            if self._extreme_recovery_active is not None:
+                self._maybe_exit_recovery_for_zone(eventtime, zone)
+                return
+            # Non-extreme: reset the debounce counter on zone change.
+            # Burst bouncing inside a tick can't inflate the count
+            # because only the control timer increments.
+            self._observe_zone(zone)
         return callback
 
     def _cancel_fill(self):
@@ -701,6 +765,12 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
+        # Reset zone-debounce tracking so the next sync re-commits the
+        # current zone's multiplier instead of being short-circuited by
+        # a stale _committed_zone from before the unsync.
+        self._proposed_zone = None
+        self._proposed_zone_count = 0
+        self._committed_zone = None
         self._dlog(None, "unsynced")
 
     def _handle_extruder_change(self, new_extruder_name):
@@ -767,6 +837,33 @@ class Buffer:
         if zone == ZONE_FULL_MIDDLE:
             return 1.0 - self.drift_gain
         return 1.0
+
+    def _observe_zone(self, zone):
+        """Sensor-callback side of the N-tick debounce.  Resets the
+        counter on a zone change.  The counter is incremented only by
+        the control timer — that way burst bouncing inside one tick
+        window cannot artificially satisfy the stability requirement.
+        """
+        if zone != self._proposed_zone:
+            self._proposed_zone = zone
+            self._proposed_zone_count = 0
+
+    def _maybe_exit_recovery_for_zone(self, eventtime, zone):
+        """Mid-recovery exit check.  Called from both the sensor
+        callback (immediate edge response) and the control timer
+        (tick cadence) so a fast zone return doesn't wait for the
+        recovery poller's 50 ms cadence.  Recovery's own poller still
+        covers the case where no edge / no tick happens to fire."""
+        active = self._extreme_recovery_active
+        if active is None:
+            return
+        if active == ZONE_EMPTY:
+            left = zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)
+        else:  # ZONE_FULL
+            left = zone not in (ZONE_FULL, ZONE_FULL_MIDDLE)
+        if left:
+            self._stop_recovery_vactual()
+            self._exit_extreme_recovery(eventtime, "reached-middle")
 
     def _dlog(self, eventtime, fmt, *args):
         """Debug log with reactor-eventtime prefix for cross-correlation.
@@ -1038,29 +1135,23 @@ class Buffer:
             self._cancel_fill_timer()
             self._sync()
 
-        # Mid-recovery handling: detect exit conditions.  The recovery
-        # check timer also polls for these; this branch covers the
-        # sensor-callback path so we react immediately on the edge
-        # rather than waiting for the next 50 ms poll.
+        # Mid-recovery handling: detect exit conditions via the shared
+        # helper so the same logic runs from the sensor callback path
+        # and the recovery poller.
         if self._extreme_recovery_active is not None:
-            active_zone = self._extreme_recovery_active
-            if active_zone == ZONE_EMPTY:
-                left_band = zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)
-            else:  # ZONE_FULL
-                left_band = zone not in (ZONE_FULL, ZONE_FULL_MIDDLE)
-            if left_band:
-                self._stop_recovery_vactual()
-                self._exit_extreme_recovery(eventtime, "reached-middle")
+            self._maybe_exit_recovery_for_zone(eventtime, zone)
             if self._extreme_recovery_active is not None:
                 # Still recovering — leave _rd_multiplier alone.
                 return
 
         # Extreme zones go through VACTUAL recovery, not multiplier.
+        # The sensor callback's fast-safety path normally enters
+        # recovery on the edge; this is the fallback for cases where
+        # zone becomes extreme without a callback (e.g. an earlier
+        # callback resolved a conflict that left the buffer in EMPTY).
         # Only enter recovery while actually printing — outside a print
-        # the user may be loading/unloading or manually drawing
-        # filament, and surprise active motion (EMPTY) or auto-drain
-        # (FULL) is unwanted.  This matches the safety-timeout policy
-        # which also only ticks while printing.
+        # the user may be loading/unloading and surprise motion is
+        # unwanted.  Matches the safety-timeout policy.
         if (zone in (ZONE_FULL, ZONE_EMPTY)
                 and self._synced_to is not None
                 and self._is_printing()):
@@ -1070,19 +1161,24 @@ class Buffer:
                 self._enter_full_recovery(eventtime)
             return
 
-        # Non-extreme zones: apply the drift-gain multiplier as usual,
-        # with 200 ms zone hysteresis to suppress sensor-bounce thrash.
-        # Bake the hysteresis here (rather than in _apply_multiplier)
-        # so that the multiplier itself is computed from a stable zone.
-        if zone != self._proposed_zone:
+        # Non-extreme zone: N-tick debounce gate.  The sensor callback
+        # resets _proposed_zone_count to 0 on a zone change; the timer
+        # increments it once per tick.  Commit when count >=
+        # self.zone_debounce_ticks.  _committed_zone short-circuits
+        # repeat commits for the same zone across many ticks.
+        if zone == self._proposed_zone:
+            self._proposed_zone_count += 1
+        else:
             self._proposed_zone = zone
-            self._proposed_zone_at = eventtime
+            self._proposed_zone_count = 1
+        if self._proposed_zone_count < self.zone_debounce_ticks:
             return
-        if eventtime - self._proposed_zone_at < 0.2:
+        if zone == self._committed_zone:
             return
         multiplier = self._zone_to_multiplier(zone)
         if self._synced_to is not None:
             self._apply_multiplier(multiplier)
+            self._committed_zone = zone
 
     # --- Initial fill ---
 

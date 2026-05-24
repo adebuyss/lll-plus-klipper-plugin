@@ -247,6 +247,13 @@ class MockConfig:
             return float(default)
         raise KeyError(key)
 
+    def getint(self, key, default=_SENTINEL, minval=None, maxval=None):
+        if key in self._values:
+            return int(self._values[key])
+        if default is not _SENTINEL:
+            return int(default)
+        raise KeyError(key)
+
     def getboolean(self, key, default=_SENTINEL):
         if key in self._values:
             v = self._values[key]
