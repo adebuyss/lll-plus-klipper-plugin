@@ -32,7 +32,7 @@ class TestFullZoneEntry:
 
 class TestFullZoneTimeout:
     def test_timeout_triggers_safety_retract(self, enabled_buf, reactor,
-                                              force_move):
+                                              sidecar_moves):
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, full=True)
         t = 10.0
@@ -42,13 +42,13 @@ class TestFullZoneTimeout:
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # retract = negative dist
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # retract = negative dist
 
 
 class TestSafetyRetractBehavior:
     def test_safety_retract_leaves_unsynced(self, enabled_buf, reactor,
-                                             force_move):
+                                             sidecar_moves):
         """After safety retract, stepper must remain unsynced so the
         retract move completes before re-sync on next timer cycle."""
         enabled_buf._print_stats.state = "printing"
@@ -60,7 +60,7 @@ class TestSafetyRetractBehavior:
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) > 0
+        assert len(sidecar_moves) > 0
         assert enabled_buf._synced_to is None
 
 
@@ -99,7 +99,7 @@ class TestFullEnteredBeforePrinting:
     re-arm the timer once _is_printing() flips to True."""
 
     def test_full_entered_before_printing_still_arms(self, enabled_buf,
-                                                      reactor, force_move):
+                                                      reactor, sidecar_moves):
         # 1. Buffer hits FULL while not printing (e.g. prime line)
         enabled_buf._print_stats.state = "standby"
         set_sensors(enabled_buf, full=True)
@@ -130,8 +130,8 @@ class TestFullEnteredBeforePrinting:
         t = 3.0 + enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # negative dist = retract
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # negative dist = retract
 
     def test_state_arming_does_not_fire_when_not_printing(self,
                                                             enabled_buf,

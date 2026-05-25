@@ -11,6 +11,9 @@ from conftest import (
 
 class TestEmptySafetyTimeout:
     def test_empty_timeout_triggers_error(self, enabled_buf, reactor):
+        # No extruder rate set, so _recovery_decision returns ENTER for
+        # EMPTY at manual_speed.  Recovery preserves _safety_zone_start
+        # so the cumulative empty_safety_timeout still escalates.
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, empty=True)
         t = 1.0
@@ -40,7 +43,7 @@ class TestEmptySafetyTimeout:
 
 class TestFullSafetyTimeout:
     def test_full_timeout_triggers_retract(self, enabled_buf, reactor,
-                                           force_move):
+                                           sidecar_moves):
         enabled_buf._print_stats.state = "printing"
         set_sensors(enabled_buf, full=True)
         t = 1.0
@@ -51,11 +54,11 @@ class TestFullSafetyTimeout:
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
         # Should have done a safety retract via force_move
-        assert len(force_move.moves) > 0
-        assert force_move.moves[-1][1] < 0  # negative dist = retract
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[-1][1] < 0  # negative dist = retract
 
     def test_no_retract_when_not_printing(self, enabled_buf, reactor,
-                                           force_move):
+                                           sidecar_moves):
         """Safety retract must not fire when the extruder is idle."""
         enabled_buf._print_stats.state = "standby"
         set_sensors(enabled_buf, full=True)
@@ -66,20 +69,40 @@ class TestFullSafetyTimeout:
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t
         enabled_buf._control_timer_cb(t)
-        assert len(force_move.moves) == 0
+        assert len(sidecar_moves) == 0
 
 
 class TestSensorConflict:
     def test_conflict_triggers_error(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        # First tick: deferred (might be transient out-of-order MCU
+        # report).  Control-timer promotes a persistent conflict to a
+        # hard error once it survives control_interval.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
     def test_error_stops_motor(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.motor_direction == "stop"
+
+    def test_transient_conflict_does_not_error(self, enabled_buf):
+        # First sensor flip leaves empty+full both true momentarily;
+        # the next flip resolves it.  Buffer must not crash the print.
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf.state != STATE_ERROR
+        # Resolve the transient — empty inactive, normal FULL_MIDDLE.
+        set_sensors(enabled_buf, empty=False, middle=True, full=True)
+        enabled_buf._update_rotation_distance(1.05)
+        # _conflict_since cleared, state stable.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
+        assert enabled_buf.state != STATE_ERROR
+        assert enabled_buf._conflict_since == 0.0
 
 
 class TestErrorBlocking:
@@ -103,17 +126,12 @@ class TestErrorBlocking:
 
 
 class TestUnsyncClearsSafetyTimer:
-    def test_unsync_clears_safety_timer(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, empty=True)
-        t = 1.0
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-        assert enabled_buf._safety_zone_start > 0.0
-        assert enabled_buf._synced_to is not None
-
+    def test_unsync_clears_safety_timer(self, enabled_buf):
+        """Explicit _unsync (not the recovery-internal one) must clear
+        the safety arming so a subsequent re-sync starts fresh."""
+        enabled_buf._safety_zone_start = 1.0
         enabled_buf._unsync()
         assert enabled_buf._safety_zone_start == 0.0
-        assert enabled_buf._safety_escalated is False
 
 
 class TestClearError:

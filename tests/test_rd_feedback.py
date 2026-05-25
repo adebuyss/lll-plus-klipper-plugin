@@ -1,4 +1,5 @@
-"""Tests for rotation_distance feedback loop (sensor -> multiplier -> rd)."""
+"""Tests for rotation_distance feedback loop (sensor -> multiplier -> rd)
+and VACTUAL-based extreme-zone recovery."""
 
 import pytest
 from conftest import (
@@ -15,6 +16,18 @@ from conftest import (
     set_sensors,
     trigger_sensor,
 )
+
+
+def _apply_zone_with_hysteresis(buf, zone_setter, t0=1.0):
+    """Helper: apply a zone twice with >200ms gap so the hysteresis
+    gate in _update_rotation_distance commits the multiplier.  The
+    plain-zone hysteresis is mandatory for non-extreme zones — the
+    first call records the proposed zone, the second (after 200ms)
+    commits it.  Extreme zones (EMPTY/FULL) are not hysteresis-gated;
+    they enter recovery on the first call."""
+    zone_setter()
+    buf._update_rotation_distance(t0)
+    buf._update_rotation_distance(t0 + 0.3)
 
 
 class TestZoneClassification:
@@ -55,17 +68,16 @@ class TestMultiplierMapping:
         m = enabled_buf._zone_to_multiplier(ZONE_EMPTY_MIDDLE)
         assert m == pytest.approx(1.0 + enabled_buf.drift_gain)
 
-    def test_empty_uses_multiplier_high(self, enabled_buf):
-        m = enabled_buf._zone_to_multiplier(ZONE_EMPTY)
-        assert m == pytest.approx(enabled_buf.multiplier_high)
-
     def test_full_middle_subtracts_drift_gain(self, enabled_buf):
         m = enabled_buf._zone_to_multiplier(ZONE_FULL_MIDDLE)
         assert m == pytest.approx(1.0 - enabled_buf.drift_gain)
 
-    def test_full_uses_multiplier_low(self, enabled_buf):
-        m = enabled_buf._zone_to_multiplier(ZONE_FULL)
-        assert m == pytest.approx(enabled_buf.multiplier_low)
+    def test_extreme_zones_return_one(self, enabled_buf):
+        """Extreme zones go through VACTUAL recovery, not multiplier.
+        The mapping returns 1.0 so the apply path is a no-op even
+        if the recovery branch is bypassed."""
+        assert enabled_buf._zone_to_multiplier(ZONE_EMPTY) == 1.0
+        assert enabled_buf._zone_to_multiplier(ZONE_FULL) == 1.0
 
 
 class TestDeadBand:
@@ -74,32 +86,59 @@ class TestDeadBand:
 
     def test_middle_sensor_no_correction(self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
+        _apply_zone_with_hysteresis(
+            enabled_buf, lambda: set_sensors(enabled_buf, middle=True))
         assert enabled_buf._rd_multiplier == 1.0
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
 
 class TestRotationDistanceApplication:
-    """Verify the multiplier is applied via rd_new = base_rd / multiplier."""
+    """Verify the multiplier is applied via rd_new = base_rd / multiplier
+    for the non-extreme drift_gain zones (after hysteresis settles)."""
 
-    def test_empty_increases_rd_multiplier(self, enabled_buf, stepper):
+    def test_empty_middle_applies_drift_gain(self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        expected_mult = enabled_buf.multiplier_high
+        _apply_zone_with_hysteresis(
+            enabled_buf, lambda: set_sensors(enabled_buf))  # EMPTY_MIDDLE
+        expected_mult = 1.0 + enabled_buf.drift_gain
         expected_rd = base_rd / expected_mult
         assert enabled_buf._rd_multiplier == pytest.approx(expected_mult)
         assert stepper.get_rotation_distance()[0] == pytest.approx(expected_rd)
 
-    def test_full_decreases_rd_multiplier(self, enabled_buf, stepper):
+    def test_full_middle_applies_drift_gain(self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        expected_mult = enabled_buf.multiplier_low
+        _apply_zone_with_hysteresis(
+            enabled_buf,
+            lambda: set_sensors(enabled_buf, full=True, middle=True))
+        expected_mult = 1.0 - enabled_buf.drift_gain
         expected_rd = base_rd / expected_mult
         assert enabled_buf._rd_multiplier == pytest.approx(expected_mult)
         assert stepper.get_rotation_distance()[0] == pytest.approx(expected_rd)
+
+
+class TestZoneHysteresis:
+    """A non-extreme zone must be stable for 200ms before the multiplier
+    commits.  Prevents sensor-bounce thrash at zone boundaries."""
+
+    def test_first_call_does_not_apply(self, enabled_buf, stepper):
+        base_rd = enabled_buf._base_rd
+        set_sensors(enabled_buf)  # EMPTY_MIDDLE
+        enabled_buf._update_rotation_distance(1.0)
+        # First call records the proposed zone but does not apply.
+        assert enabled_buf._rd_multiplier == 1.0
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+
+    def test_bounce_resets_proposed_zone(self, enabled_buf, stepper):
+        base_rd = enabled_buf._base_rd
+        # Propose EMPTY_MIDDLE
+        set_sensors(enabled_buf)
+        enabled_buf._update_rotation_distance(1.0)
+        # Bounce to MIDDLE before hysteresis settles
+        set_sensors(enabled_buf, middle=True)
+        enabled_buf._update_rotation_distance(1.1)
+        # Still no change — both attempts were under 200ms each.
+        assert enabled_buf._rd_multiplier == 1.0
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
 
 class TestSensorCallbackUpdatesMultiplier:
@@ -107,8 +146,10 @@ class TestSensorCallbackUpdatesMultiplier:
 
     def test_sensor_callback_updates_rd(self, enabled_buf, buttons, stepper):
         base_rd = enabled_buf._base_rd
-        # Trigger middle sensor
+        # Trigger middle sensor twice across hysteresis window
         trigger_sensor(buttons, "PE1", True, 1.0)
+        trigger_sensor(buttons, "PE1", True, 1.3)
+        # MIDDLE -> multiplier 1.0 (same as baseline) -> no rd change
         assert enabled_buf._rd_multiplier == 1.0
         assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
 
@@ -116,67 +157,17 @@ class TestSensorCallbackUpdatesMultiplier:
         # Trigger empty first, then full
         trigger_sensor(buttons, "PE0", True, 1.0)
         trigger_sensor(buttons, "PE2", True, 1.0)
+        # Initial conflict is deferred (could be transient out-of-order
+        # MCU report).  Persistent conflict promoted by control timer.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
 
-class TestFaultEscalation:
-    """After fault_escalation_time in a safety zone, the gain increases."""
-
-    def test_empty_escalation(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        initial_mult = enabled_buf._rd_multiplier
-
-        # Advance past fault_escalation_time
-        reactor._monotonic = 1.0 + enabled_buf.fault_escalation_time + 0.1
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-
-        # Multiplier should jump to the absolute fault_multiplier_high
-        escalated_mult = enabled_buf.fault_multiplier_high
-        assert enabled_buf._rd_multiplier == pytest.approx(escalated_mult)
-        assert enabled_buf._safety_escalated is True
-
-    def test_escalation_persists_on_subsequent_calls(self, enabled_buf, reactor):
-        """Escalated multiplier must persist, not revert to base gain."""
-        set_sensors(enabled_buf, empty=True)
-        t = 1.0
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-
-        # Escalate
-        t += enabled_buf.fault_escalation_time + 0.1
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-        escalated_mult = enabled_buf._rd_multiplier
-        assert enabled_buf._safety_escalated is True
-
-        # Call again — escalated multiplier must persist
-        t += 1.0
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-        assert enabled_buf._rd_multiplier == pytest.approx(escalated_mult)
-        assert enabled_buf._safety_escalated is True
-
-    def test_returning_to_middle_resets_escalation(self, enabled_buf, reactor):
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        reactor._monotonic = 10.0
-        enabled_buf._update_rotation_distance(10.0)
-
-        # Return to middle.  Advance past apply_dwell so the transition
-        # isn't deferred by short-cycle protection.
-        reactor._monotonic = 10.0 + enabled_buf.apply_dwell
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        assert enabled_buf._safety_escalated is False
-        assert enabled_buf._rd_multiplier == 1.0
-
-
-class TestFlushBeforeSetRotationDistance:
-    """Regression for MCU 'Rescheduled timer in the past' shutdown:
-    set_rotation_distance must be preceded by flush_step_generation,
-    matching upstream Klipper's cmd_SET_E_ROTATION_DISTANCE."""
+class TestApplyMultiplierDedup:
+    """_apply_multiplier should skip the stepper write when the requested
+    multiplier matches the current value."""
 
     def test_repeat_same_multiplier_skips_set(self, enabled_buf, stepper):
         baseline = len(stepper.rd_log)
@@ -185,272 +176,475 @@ class TestFlushBeforeSetRotationDistance:
         enabled_buf._apply_multiplier(1.0)
         assert len(stepper.rd_log) == baseline
 
-    def test_each_change_flushes_before_set(
-            self, enabled_buf, stepper, printer):
-        # Validate the flush-before-set invariant directly by disabling
-        # dwell coalescing (TestApplyDwellCoalescing covers throttling).
-        enabled_buf.apply_dwell = 0.0
-        toolhead = printer.toolhead
-        flushes_before = toolhead.flush_count
-        sets_before = len(stepper.rd_log)
-        enabled_buf._apply_multiplier(enabled_buf.multiplier_high)
-        enabled_buf._apply_multiplier(enabled_buf.fault_multiplier_high)
-        assert len(stepper.rd_log) == sets_before + 2
-        assert toolhead.flush_count == flushes_before + 2
+
+class TestApplyMultiplierRateLimit:
+    """During printing, _apply_multiplier rate-limits to 2 Hz to prevent
+    sensor-bounce-induced stacked no-flush rotation_distance writes.
+    The deferred update lands on the next control timer tick."""
+
+    def test_rate_limit_defers_during_print(
+            self, printing_buf, stepper, reactor):
+        baseline = len(stepper.rd_log)
+        reactor._monotonic = 1.0
+        printing_buf._apply_multiplier(1.05)
+        assert len(stepper.rd_log) == baseline + 1
+        # Second call within 500ms — should defer.
+        reactor._monotonic = 1.1
+        printing_buf._apply_multiplier(1.10)
+        assert len(stepper.rd_log) == baseline + 1
+        assert printing_buf._pending_multiplier == 1.10
+
+    def test_control_timer_drains_pending(
+            self, printing_buf, stepper, reactor):
+        baseline = len(stepper.rd_log)
+        reactor._monotonic = 1.0
+        printing_buf._apply_multiplier(1.05)
+        reactor._monotonic = 1.1
+        printing_buf._apply_multiplier(1.10)
+        assert printing_buf._pending_multiplier == 1.10
+        # Advance past the 500ms rate-limit window and tick the
+        # control timer.
+        reactor._monotonic = 1.6
+        printing_buf._control_timer_cb(1.6)
+        assert printing_buf._pending_multiplier is None
+        assert printing_buf._rd_multiplier == pytest.approx(1.10)
 
 
 class TestUnsyncRestoresBaseRotationDistance:
     """After _unsync, the stepper's rotation_distance must be restored
     to _base_rd so any subsequent force_move.manual_move computes the
-    right number of steps.  Without this, BUFFER_FEED/BUFFER_RETRACT
-    issued after leaving a non-MIDDLE zone would move the wrong amount
-    of filament (last zone's multiplier would apply)."""
+    right number of steps."""
 
-    def test_unsync_from_empty_restores_base(
-            self, enabled_buf, stepper, printer):
+    def test_unsync_from_drift_zone_restores_base(
+            self, enabled_buf, stepper):
         base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert stepper.get_rotation_distance()[0] == pytest.approx(
-            base_rd / enabled_buf.multiplier_high)
-
-        flushes_before = printer.toolhead.flush_count
-        enabled_buf._unsync()
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
-        assert enabled_buf._rd_multiplier == 1.0
-        # flush must have fired at least once before the restore set
-        assert printer.toolhead.flush_count >= flushes_before + 1
-
-    def test_unsync_from_full_restores_base(self, enabled_buf, stepper):
-        base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert stepper.get_rotation_distance()[0] == pytest.approx(
-            base_rd / enabled_buf.multiplier_low)
-        enabled_buf._unsync()
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
-
-    def test_unsync_from_fault_escalation_restores_base(
-            self, enabled_buf, stepper, reactor):
-        base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, empty=True)
-        reactor._monotonic = 1.0
-        enabled_buf._update_rotation_distance(1.0)
-        reactor._monotonic = 1.0 + enabled_buf.fault_escalation_time + 0.1
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            enabled_buf.fault_multiplier_high)
-
-        enabled_buf._unsync()
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
-
-    def test_resync_after_unsync_in_empty_reapplies_multiplier(
-            self, enabled_buf, stepper, reactor):
-        base_rd = enabled_buf._base_rd
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert stepper.get_rotation_distance()[0] == pytest.approx(
-            base_rd / enabled_buf.multiplier_high)
-
-        enabled_buf._unsync()
-        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
-
-        # Re-sync still in EMPTY — next control tick must re-apply
-        # the zone multiplier (dedupe must NOT suppress the write).
-        enabled_buf._sync()
-        reactor._monotonic = 2.0
-        enabled_buf._update_rotation_distance(2.0)
-        assert stepper.get_rotation_distance()[0] == pytest.approx(
-            base_rd / enabled_buf.multiplier_high)
-
-
-class TestApplyDwellCoalescing:
-    """Short-cycle protection: zone oscillation within apply_dwell of the
-    last applied change is coalesced into a single deferred apply.
-
-    Each apply does flush_step_generation(), which drains the entire step
-    pipeline (XYZ + extruder).  Without coalescing, MIDDLE <-> EMPTY_MIDDLE
-    thrash at a sensor edge produces a flush per transition.  With dwell,
-    the first transition applies immediately, subsequent changes are held
-    as _pending_multiplier, and a reactor timer applies the latest value
-    once the dwell window expires.  Fault escalation bypasses dwell."""
-
-    def test_thrash_coalesces_to_one_flush_per_window(
-            self, enabled_buf, reactor, printer):
-        """5 zone toggles within the dwell window should produce exactly
-        one immediate flush (the first transition); the deferred timer
-        either applies the final value or short-circuits via dedup."""
-        toolhead = printer.toolhead
-        # Settle MIDDLE so _last_apply_time is established at a known time.
-        reactor._monotonic = 1.0
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
-        # Advance past dwell so the first toggle below applies immediately.
-        reactor._monotonic = 1.0 + enabled_buf.apply_dwell
-        flushes_before = toolhead.flush_count
-
-        # Burst: MIDDLE -> EMPTY_MIDDLE -> MIDDLE -> EMPTY_MIDDLE -> MIDDLE,
-        # all within 100 ms (well under the 500 ms dwell).
-        t = reactor._monotonic
-        for i, sensors in enumerate([
-                {},  # EMPTY_MIDDLE (all off)
-                {"middle": True},  # MIDDLE
-                {},  # EMPTY_MIDDLE
-                {"middle": True},  # MIDDLE
-        ]):
-            t += 0.02
-            reactor._monotonic = t
-            set_sensors(enabled_buf, **sensors)
-            enabled_buf._update_rotation_distance(t)
-
-        # Exactly one flush during the burst (the first transition into
-        # EMPTY_MIDDLE).  Subsequent changes are within dwell -> pending.
-        assert toolhead.flush_count == flushes_before + 1
-        # Final state is MIDDLE (multiplier 1.0); since 1.0 was the
-        # _last_applied multiplier before the burst started, the dwell
-        # timer will see pending == _rd_multiplier and short-circuit.
-        # However, _rd_multiplier is currently 1.0 + drift_gain because
-        # the first transition (into EMPTY_MIDDLE) applied it.
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            1.0 + enabled_buf.drift_gain)
-        # Pending value is the final intended (MIDDLE -> 1.0)
-        assert enabled_buf._pending_multiplier == pytest.approx(1.0)
-
-        # Advance past the dwell window — the deferred apply fires.
-        reactor.advance_time(enabled_buf.apply_dwell + 0.01)
-        # Now the latest pending (1.0) has been applied.
-        assert enabled_buf._rd_multiplier == 1.0
-        assert enabled_buf._pending_multiplier is None
-        # Total: one immediate + one deferred = exactly two flushes.
-        assert toolhead.flush_count == flushes_before + 2
-
-    def test_within_dwell_change_is_deferred_not_dropped(
-            self, enabled_buf, reactor, printer):
-        """A second distinct multiplier within dwell must still arrive
-        at the stepper — the latest pending value is applied by the
-        timer when the window expires."""
-        toolhead = printer.toolhead
-        stepper = enabled_buf.extruder_stepper.stepper
-        base_rd = enabled_buf._base_rd
-
-        # Establish baseline at MIDDLE.
-        reactor._monotonic = 1.0
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
-        reactor._monotonic = 1.0 + enabled_buf.apply_dwell
-
-        # First transition: MIDDLE -> EMPTY (applies immediately).
-        t = reactor._monotonic
-        reactor._monotonic = t + 0.01
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            enabled_buf.multiplier_high)
-        flushes_after_first = toolhead.flush_count
-
-        # Second transition within dwell: EMPTY -> EMPTY_MIDDLE (deferred).
-        reactor._monotonic += 0.05
-        set_sensors(enabled_buf)  # all off -> EMPTY_MIDDLE
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        # Not yet applied; held as pending.
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            enabled_buf.multiplier_high)
-        assert enabled_buf._pending_multiplier == pytest.approx(
-            1.0 + enabled_buf.drift_gain)
-        assert toolhead.flush_count == flushes_after_first
-
-        # Fire the dwell timer.
-        reactor.advance_time(enabled_buf.apply_dwell + 0.01)
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            1.0 + enabled_buf.drift_gain)
-        assert enabled_buf._pending_multiplier is None
+        _apply_zone_with_hysteresis(
+            enabled_buf, lambda: set_sensors(enabled_buf))  # EMPTY_MIDDLE
         assert stepper.get_rotation_distance()[0] == pytest.approx(
             base_rd / (1.0 + enabled_buf.drift_gain))
-        assert toolhead.flush_count == flushes_after_first + 1
 
-    def test_fault_escalation_bypasses_dwell(
-            self, enabled_buf, reactor, printer):
-        """Safety escalation must apply immediately even within dwell."""
-        toolhead = printer.toolhead
-        # Enter EMPTY at t=1.0 (applies multiplier_high, _last_apply_time=1.0).
-        set_sensors(enabled_buf, empty=True)
-        reactor._monotonic = 1.0
-        enabled_buf._update_rotation_distance(1.0)
-        flushes_before = toolhead.flush_count
-
-        # Advance past fault_escalation_time but stay within apply_dwell of
-        # _last_apply_time (i.e. eventtime - _last_apply_time would be
-        # > fault_escalation_time but < apply_dwell after the next apply).
-        # Here we just verify force=True takes effect: the escalation tick
-        # arrives at any time after fault_escalation_time elapsed.
-        t = 1.0 + enabled_buf.fault_escalation_time + 0.1
-        reactor._monotonic = t
-        enabled_buf._update_rotation_distance(t)
-
-        # Escalated value applied despite dwell: force=True path.
-        assert enabled_buf._safety_escalated is True
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            enabled_buf.fault_multiplier_high)
-        assert toolhead.flush_count == flushes_before + 1
-
-    def test_unsync_cancels_pending_apply(
-            self, enabled_buf, reactor, printer):
-        """Pending multiplier and dwell timer must be cleaned up on
-        _unsync — a stale pending would otherwise fire on the next
-        timer tick after the stepper is no longer being driven."""
-        toolhead = printer.toolhead
-
-        # Establish baseline.
-        reactor._monotonic = 1.0
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
-        reactor._monotonic = 1.0 + enabled_buf.apply_dwell
-
-        # First transition applies; second within dwell defers.
-        t = reactor._monotonic + 0.01
-        reactor._monotonic = t
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(t)
-        reactor._monotonic = t + 0.05
-        set_sensors(enabled_buf)  # EMPTY_MIDDLE
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        assert enabled_buf._pending_multiplier is not None
-
-        flushes_before_unsync = toolhead.flush_count
         enabled_buf._unsync()
-        assert enabled_buf._pending_multiplier is None
-        # Advancing past dwell must not trigger a deferred apply: the
-        # stepper is unsynced, so the callback bails and rd is unchanged.
-        # (The unsync itself flushes via sync_to_extruder(None) in the
-        # mock, so flush_count increments by exactly one.)
-        rd_before = enabled_buf.extruder_stepper.stepper.get_rotation_distance()[0]
-        reactor.advance_time(enabled_buf.apply_dwell + 0.01)
-        rd_after = enabled_buf.extruder_stepper.stepper.get_rotation_distance()[0]
-        assert rd_before == pytest.approx(rd_after)
-        assert toolhead.flush_count == flushes_before_unsync + 1
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        assert enabled_buf._rd_multiplier == 1.0
 
-    def test_dwell_zero_disables_coalescing(
-            self, enabled_buf, reactor, printer):
-        """apply_dwell=0 -> every transition flushes immediately
-        (legacy behavior, opt-out)."""
-        enabled_buf.apply_dwell = 0.0
-        toolhead = printer.toolhead
 
+class TestVactualRecoveryEntry:
+    """Entering an extreme zone while printing writes the VACTUAL
+    register.  The stepper stays nominally synced — only the chip-side
+    velocity mode is engaged."""
+
+    def test_empty_entry_writes_forward_vactual(
+            self, printing_buf, vactual_writes):
+        # NB: VACTUAL polarity is inverted on the reference hardware
+        # (see _mm_per_s_to_vactual).  Forward filament motion is
+        # encoded as a NEGATIVE VACTUAL register value; the formula
+        # negates internally so the magnitude reads from
+        # +recovery_speed.
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        # Stepper stays synced — VACTUAL bypasses STEP/DIR at the chip.
+        assert printing_buf._synced_to is not None
+        assert len(vactual_writes) >= 1
+        # Forward feed -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
+        # Magnitude check: ~10 mm/s default × 489.4 / 0.715 ≈ 6,845.
+        # Allow ±10% for rounding / step_dist variance.
+        assert 6000 < abs(vactual_writes[-1]) < 7700
+
+    def test_empty_entry_respects_recovery_speed_config(
+            self, printing_buf, vactual_writes):
+        # Override recovery_speed; recovery VACTUAL magnitude scales.
+        # manual_speed stays at 40 mm/s (force_move.manual_move uses
+        # it with a trapezoid ramp and that's fine).
+        printing_buf.recovery_speed = 15.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # ~15 mm/s × 489.4 / 0.715 ≈ 10,267.
+        assert 9500 < abs(vactual_writes[-1]) < 11000
+
+    def test_full_entry_writes_reverse_vactual(
+            self, printing_buf, vactual_writes):
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        # Slow reverse drain -> positive VACTUAL (inverted polarity).
+        assert len(vactual_writes) >= 1
+        assert vactual_writes[-1] > 0
+        # Magnitude check: ~1 mm/s ≈ steps_per_mm/0.715 ≈ 685 LSB.
+        # Allow ±10% slack for rounding.
+        assert 600 < abs(vactual_writes[-1]) < 800
+
+
+class TestVactualRecoveryExit:
+    """On zone return, recovery writes VACTUAL=0 to stop the chip-side
+    velocity mode.  Both sensor-callback path and polling-timer path
+    should trigger this."""
+
+    def test_zone_return_writes_vactual_zero_via_callback(
+            self, printing_buf, vactual_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # Forward feed active -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
+
+        # Zone progresses to MIDDLE — callback path stops VACTUAL.
+        set_sensors(printing_buf, middle=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        assert printing_buf._extreme_recovery_active is None
+        # _stop_recovery_vactual writes 0 then a positive latch-correction
+        # nudge; the final 0 is deferred ~50 ms via register_callback.
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+    def test_zone_return_writes_vactual_zero_via_poller(
+            self, printing_buf, vactual_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # Zone returns without sensor-callback triggering update_rd.
+        set_sensors(printing_buf, middle=True)
+        # Drive the poller directly.
+        printing_buf._check_recovery_done(1.1)
+        assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+    def test_stop_recovery_writes_latch_correction_nudge(
+            self, printing_buf, vactual_writes, reactor):
+        """The TMC chip latches the sign of the last nonzero VACTUAL
+        and would override the DIR pin during subsequent STEP/DIR
+        motion.  _stop_recovery_vactual must therefore write a
+        positive-magnitude nudge to flip the latch back before
+        returning to step/dir mode."""
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # EMPTY recovery wrote a negative raw register value.
+        assert vactual_writes[-1] < 0
+        recovery_push_idx = len(vactual_writes) - 1
+
+        # Exit recovery — must produce the three-step sequence:
+        # [..., recovery_neg, 0, positive_nudge] then a deferred 0.
+        set_sensors(printing_buf, middle=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        seq = vactual_writes[recovery_push_idx + 1:]
+        assert seq[0] == 0           # immediate stop
+        assert seq[1] > 0            # positive latch-correction nudge
+        # Deferred final 0 hasn't fired until the reactor drains.
+        assert vactual_writes[-1] == seq[1]
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+    def test_full_recovery_exit_runs_nudge_sequence(
+            self, printing_buf, vactual_writes, reactor):
+        """FULL recovery pushes a positive VACTUAL (reverse drain).
+        The chip latch is already in the "positive" state that matches
+        normal forward STEP/DIR motion under this wiring, so the nudge
+        is functionally redundant for FULL exit — but the sequence
+        must still run cleanly without leaving VACTUAL stuck."""
+        set_sensors(printing_buf, full=True)
         reactor._monotonic = 1.0
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
-        flushes_before = toolhead.flush_count
+        printing_buf._update_rotation_distance(1.0)
+        # FULL recovery wrote a positive raw register value (drain).
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        assert vactual_writes[-1] > 0
+        recovery_push_idx = len(vactual_writes) - 1
 
-        # Two distinct transitions back-to-back at the same eventtime.
-        reactor._monotonic = 1.01
+        # Drain succeeds — zone returns to MIDDLE.  (FULL_MIDDLE is
+        # still in the FULL band per the poller's exit gate.)
+        set_sensors(printing_buf, middle=True)
+        printing_buf._check_recovery_done(1.5)
+        assert printing_buf._extreme_recovery_active is None
+        seq = vactual_writes[recovery_push_idx + 1:]
+        assert seq[0] == 0           # immediate stop
+        assert seq[1] > 0            # positive nudge (same sign as drain)
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+
+class TestVactualRecoveryExitOnSkipMiddle:
+    """A fast EMPTY -> FULL_MIDDLE transition (skipping MIDDLE between
+    sensor callbacks) must still exit recovery — the exit gate is
+    "left the EMPTY band", not "reached MIDDLE exactly"."""
+
+    def test_empty_recovery_exits_at_full_middle(
+            self, printing_buf, vactual_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+
+        # Zone jumps straight to FULL_MIDDLE without a MIDDLE pass.
+        set_sensors(printing_buf, middle=True, full=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+
+class TestVactualRecoveryTimeout:
+    """Per-attempt cap: if recovery cannot pull the buffer out of the
+    extreme zone within extreme_recovery_timeout seconds, the poller
+    writes VACTUAL=0 and escalates to _handle_error."""
+
+    def test_empty_recovery_timeout_triggers_error(
+            self, printing_buf, vactual_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+
+        # Advance past the timeout — poller faults.
+        timeout_t = 1.0 + printing_buf.extreme_recovery_timeout + 0.5
+        reactor._monotonic = timeout_t
+        printing_buf._check_recovery_done(timeout_t)
+        assert printing_buf.state == STATE_ERROR
+        assert "recovery exceeded" in printing_buf.error_msg.lower()
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+
+class TestVactualRecoveryRunout:
+    """If filament leaves the presence switch during recovery, the
+    chunked fill aborts and VACTUAL=0 is written.  Runs through the
+    cleanup invariant in _unsync."""
+
+    def test_runout_aborts_recovery(
+            self, printing_buf, vactual_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+
+        # Material removed mid-recovery — poller stops VACTUAL.
+        printing_buf.material_present = False
+        printing_buf._check_recovery_done(1.5)
+        assert printing_buf._extreme_recovery_active is None
+        assert 0 in vactual_writes
+        assert vactual_writes[-1] > 0
+        reactor.flush_callbacks()
+        assert vactual_writes[-1] == 0
+
+
+class TestVactualLatencyRegressionGuard:
+    """Critical regression guard: every VACTUAL register write must
+    pass print_time=None to mcu_tmc.set_register.  Scheduling at the
+    lookahead tail is what made the sidecar approach fail; we must
+    apply VACTUAL immediately."""
+
+    def test_all_vactual_writes_are_immediate(
+            self, printing_buf, tmc_writes, reactor):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        set_sensors(printing_buf, middle=True)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        vactual_writes_full = [w for w in tmc_writes if w[0] == "VACTUAL"]
+        assert len(vactual_writes_full) >= 2
+        for reg_name, value, print_time in vactual_writes_full:
+            assert print_time is None, (
+                "VACTUAL must be written immediately, not deferred to "
+                "toolhead.get_last_move_time() — that's the bug we "
+                "refactored away from")
+
+
+class TestVactualFormula:
+    """Sanity-check the formula and constants for the reference config.
+
+    LLL Plus: 200 motor full steps/rev × 16 microsteps × 50/17 gear_ratio
+    / 19.2357 mm rotation_distance ≈ 489.7 microsteps/mm.
+    VACTUAL register = mm/s × steps_per_mm / 0.715.  Reference-hardware
+    polarity is inverted so the helper negates the result (positive
+    input mm/s -> negative register value).
+    At 40 mm/s forward: -40 × 489.7 / 0.715 ≈ -27,400.
+    At 1 mm/s forward:  -1 × 489.7 / 0.715 ≈ -685.
+    """
+
+    def test_40mm_per_s_magnitude_is_about_27400(self, enabled_buf):
+        v = enabled_buf._mm_per_s_to_vactual(40.0)
+        assert 27000 < abs(v) < 28000
+        assert v < 0  # inverted polarity: forward feed -> negative
+
+    def test_1mm_per_s_magnitude_is_about_685(self, enabled_buf):
+        v = enabled_buf._mm_per_s_to_vactual(1.0)
+        assert 600 < abs(v) < 800
+        assert v < 0
+
+    def test_negative_input_writes_positive_vactual(self, enabled_buf):
+        # Reverse feed (-1 mm/s) under inverted polarity -> positive
+        # register value.  FULL recovery uses this signed convention.
+        v = enabled_buf._mm_per_s_to_vactual(-1.0)
+        assert v > 0
+
+    def test_zero_speed_is_zero(self, enabled_buf):
+        assert enabled_buf._mm_per_s_to_vactual(0.0) == 0
+
+    def test_steps_per_mm_derived_from_config(self, enabled_buf):
+        # MockStepper default step_dist matches the reference config.
+        assert enabled_buf._steps_per_mm == pytest.approx(489.7, rel=0.01)
+
+
+class TestVactualCleanupInvariant:
+    """Every code path that ends a sync session must clear VACTUAL,
+    routed through _unsync.  BUFFER_DISABLE, runout, error, manual
+    feed/retract entry all go through _unsync."""
+
+    def test_unsync_clears_vactual_after_recovery(
+            self, printing_buf, vactual_writes):
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # Forward feed -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
+
+        printing_buf._unsync()
+        # Cleanup invariant: _unsync writes VACTUAL=0.
+        assert 0 in vactual_writes
+
+    def test_disable_clears_vactual(
+            self, printing_buf, vactual_writes):
+        from conftest import MockGcmd
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        # Forward feed active -> negative VACTUAL (inverted polarity).
+        assert vactual_writes[-1] < 0
+
+        printing_buf.cmd_BUFFER_DISABLE(MockGcmd("BUFFER_DISABLE"))
+        assert 0 in vactual_writes
+
+
+class TestRecoveryGatedOnPrinting:
+    """Recovery must not enter while the printer is not printing —
+    surprise motion during manual loading/unloading was the bug."""
+
+    def test_empty_does_not_enter_recovery_when_not_printing(
+            self, enabled_buf, vactual_writes):
+        # enabled_buf has _print_stats.state == "standby" by default
+        # (the printing_buf fixture is what flips it to "printing").
+        assert enabled_buf._print_stats.state != "printing"
         set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(reactor._monotonic)
-        reactor._monotonic = 1.02
-        set_sensors(enabled_buf)  # EMPTY_MIDDLE
-        enabled_buf._update_rotation_distance(reactor._monotonic)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._extreme_recovery_active is None
+        # No VACTUAL writes during non-printing zone entry.
+        assert vactual_writes == []
 
-        # Both applied immediately; pending should never have been set.
-        assert toolhead.flush_count == flushes_before + 2
-        assert enabled_buf._pending_multiplier is None
-        assert enabled_buf._rd_multiplier == pytest.approx(
-            1.0 + enabled_buf.drift_gain)
+    def test_full_does_not_enter_recovery_when_not_printing(
+            self, enabled_buf, vactual_writes):
+        set_sensors(enabled_buf, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._extreme_recovery_active is None
+        assert vactual_writes == []
+
+
+class TestExtremeMultipliersNoLongerApplied:
+    """Sanity guard: the multiplier path must not drive rotation_distance
+    away from base when in ZONE_FULL or ZONE_EMPTY.  Recovery owns
+    those zones now via VACTUAL."""
+
+    def test_extreme_zones_leave_rd_at_base(
+            self, printing_buf, stepper, reactor):
+        base_rd = printing_buf._base_rd
+        # Sync, observe initial rd
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+
+        # Enter EMPTY — recovery starts via VACTUAL, no rd change.
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert stepper.get_rotation_distance()[0] == pytest.approx(base_rd)
+        assert printing_buf._rd_multiplier == 1.0
+
+
+class TestSafetyZoneStartInvariantDuringRecovery:
+    """_safety_zone_start must not be re-armed by zone bouncing inside
+    the same recovery cycle.  Cumulative cap measures from recovery
+    entry, not the latest empty/full re-entry."""
+
+    def test_empty_bounce_does_not_reset_safety_start(
+            self, printing_buf, reactor):
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        start_before = printing_buf._safety_zone_start
+        assert start_before > 0.0
+
+        # Bounce out to empty_middle and back to empty.
+        set_sensors(printing_buf, empty=False)
+        reactor._monotonic = 2.0
+        printing_buf._update_rotation_distance(2.0)
+        # _safety_zone_start should NOT have been cleared (recovery in
+        # flight; cumulative cap keeps counting).
+        assert printing_buf._safety_zone_start == start_before
+
+
+class TestSensorConflictDebounce:
+    """Out-of-order callbacks within one MCU report can produce a
+    transient empty+full state.  That should defer, not error.  A
+    persistent conflict (real wiring fault) escalates via the control
+    timer."""
+
+    def test_transient_conflict_then_resolved(self, enabled_buf):
+        # Force the transient state, then resolve it before
+        # control_interval elapses.
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf.state != STATE_ERROR
+        assert enabled_buf._conflict_since == 1.0
+        set_sensors(enabled_buf, empty=False, middle=True, full=True)
+        enabled_buf._update_rotation_distance(1.05)
+        assert enabled_buf._conflict_since == 0.0
+        enabled_buf._control_timer_cb(1.5)
+        assert enabled_buf.state != STATE_ERROR
+
+    def test_persistent_conflict_escalates(self, enabled_buf):
+        set_sensors(enabled_buf, empty=True, full=True)
+        enabled_buf._update_rotation_distance(1.0)
+        # Conflict survives past control_interval.
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
+        assert enabled_buf.state == STATE_ERROR
+
+
+class TestDlogThrottle:
+    """Zone-transition and rd_mult logs should collapse rapid same-key
+    repeats so klippy.log isn't drowned by sensor chatter."""
+
+    def test_throttle_suppresses_repeats(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        for i in range(5):
+            buf._dlog_throttled(1.0 + i * 0.01, "key", 0.25, "hello %d", i)
+        emitted = [r.getMessage() for r in caplog.records
+                   if "hello" in r.getMessage()]
+        assert len(emitted) == 1
+        assert "hello 0" in emitted[0]
+
+    def test_throttle_releases_after_window(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        buf._dlog_throttled(1.0, "key", 0.25, "first")
+        for i in range(3):
+            buf._dlog_throttled(1.05 + i * 0.01, "key", 0.25, "drop %d", i)
+        buf._dlog_throttled(2.0, "key", 0.25, "after")
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("first" in m for m in msgs)
+        assert any("after" in m for m in msgs)
+        assert any("suppressed 3" in m for m in msgs)
+
+    def test_different_keys_dont_interfere(self, buf, caplog):
+        import logging
+        buf.debug = True
+        caplog.set_level(logging.INFO)
+        buf._dlog_throttled(1.0, "key_a", 0.25, "A")
+        buf._dlog_throttled(1.001, "key_b", 0.25, "B")
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(m.endswith("A") for m in msgs)
+        assert any(m.endswith("B") for m in msgs)

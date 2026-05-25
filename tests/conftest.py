@@ -52,6 +52,13 @@ class MockReactor:
         self._monotonic = 0.0
         self._timers = []  # [(callback, waketime)]
         self._pending_callbacks = []  # deferred callbacks
+        # Index of the timer whose callback is currently executing.
+        # Mirrors production Klipper's ReactorTimer.timer_is_running:
+        # update_timer is a no-op for the firing timer.  Without this
+        # guard, the "update_timer(...) + return NEVER" anti-pattern
+        # would appear to work in tests but silently disarm the timer
+        # on production hardware after exactly one fire.
+        self._firing_timer_idx = None
 
     def monotonic(self):
         return self._monotonic
@@ -62,23 +69,46 @@ class MockReactor:
         self._fire_timers()
 
     def _fire_callbacks(self):
-        """Fire all pending deferred callbacks in FIFO order."""
-        while self._pending_callbacks:
-            cb = self._pending_callbacks.pop(0)
+        """Fire pending deferred callbacks in FIFO order.  Snapshot
+        the list at entry so callbacks that re-register themselves
+        (the chained-chunk pattern used by manual feed/retract/
+        initial fill) schedule for the NEXT advance_time call, not
+        recursively within this one — matching production reactor
+        semantics where register_callback fires on the next reactor
+        iteration."""
+        pending = self._pending_callbacks
+        self._pending_callbacks = []
+        for cb in pending:
             cb(self._monotonic)
 
     def _fire_timers(self):
         for i, (cb, wake) in enumerate(list(self._timers)):
             if self._monotonic >= wake:
-                next_wake = cb(self._monotonic)
+                # Mirror production Klipper: update_timer is a no-op
+                # while the timer's callback runs (timer_is_running
+                # guard), and the callback's return value is what
+                # rearms the timer.  See klippy/reactor.py upstream.
+                self._firing_timer_idx = i
+                try:
+                    next_wake = cb(self._monotonic)
+                finally:
+                    self._firing_timer_idx = None
                 if next_wake is not None:
                     self._timers[i] = (cb, next_wake)
 
-    def register_callback(self, callback):
-        self._pending_callbacks.append(callback)
-
     def flush_callbacks(self):
+        """Fire pending register_callback callbacks AND any timers
+        whose wake is at or before the current monotonic.  Mirrors how
+        production drains the reactor between scheduled tasks."""
         self._fire_callbacks()
+        self._fire_timers()
+
+    def register_callback(self, callback, waketime=None):
+        # Production Klipper's register_callback takes an optional
+        # waketime; the mock ignores it (callbacks always fire on
+        # the next advance_time / flush_callbacks).  Tests that need
+        # to verify timing should use register_timer instead.
+        self._pending_callbacks.append(callback)
 
     def register_timer(self, callback, waketime):
         handle = len(self._timers)
@@ -86,6 +116,11 @@ class MockReactor:
         return handle
 
     def update_timer(self, handle, waketime):
+        # Production semantics: a timer's update_timer is a no-op
+        # while that timer's callback is running.  Catches the
+        # "update_timer(...) + return NEVER" pattern at test time.
+        if handle == self._firing_timer_idx:
+            return
         cb, _ = self._timers[handle]
         self._timers[handle] = (cb, waketime)
 
@@ -224,11 +259,21 @@ class MockConfig:
 
 
 class MockStepper:
-    """Mock for PrinterStepper — tracks rotation_distance changes."""
+    """Mock for PrinterStepper — tracks rotation_distance changes.
 
-    def __init__(self, rotation_distance=19.2357):
+    Defaults match the LLL Plus reference config: 200 motor full
+    steps/rev × 16 microsteps × 50/17 gear_ratio / 19.2357 mm
+    rotation_distance ≈ 489.7 microsteps/mm ⇒ step_dist ≈ 0.002042 mm.
+    Used by the VACTUAL formula tests to assert register_value
+    = mm/s × ~489.7 / 0.715.
+    """
+
+    def __init__(self, rotation_distance=19.2357,
+                 step_dist=1.0 / 489.71524, mcu=None):
         self._rotation_distance = rotation_distance
+        self._step_dist = step_dist
         self.rd_log = []  # track all set_rotation_distance calls
+        self._mcu = mcu
 
     def get_rotation_distance(self):
         return (self._rotation_distance, False)
@@ -236,6 +281,12 @@ class MockStepper:
     def set_rotation_distance(self, rd):
         self._rotation_distance = rd
         self.rd_log.append(rd)
+
+    def get_step_dist(self):
+        return self._step_dist
+
+    def get_mcu(self):
+        return self._mcu
 
 
 class MockExtruderStepper:
@@ -247,7 +298,8 @@ class MockExtruderStepper:
     exercised faithfully by tests."""
 
     def __init__(self, toolhead=None):
-        self.stepper = MockStepper()
+        mcu = toolhead.get_mcu() if toolhead is not None else None
+        self.stepper = MockStepper(mcu=mcu)
         self.motion_queue = None
         self._synced_to = None
         self._toolhead = toolhead
@@ -273,21 +325,111 @@ class MockPrinterExtruderStepper:
 
 
 class MockExtruder:
-    """Mock for kinematics.extruder.PrinterExtruder."""
+    """Mock for kinematics.extruder.PrinterExtruder.
+
+    The buffer's _estimated_extruder_rate samples
+    extruder.extruder_stepper.stepper.get_commanded_position() across
+    eventtime samples to derive a signed mm/s rate. Tests can drive
+    this either by setting `_position` directly between sensor ticks
+    or by calling `set_rate(mm_per_s, t0)` to have the position
+    auto-advance with eventtime queries.
+    """
 
     def __init__(self, name="extruder"):
         self._name = name
+        self.extruder_stepper = _MockMainExtruderStepper()
 
     def get_name(self):
         return self._name
+
+    def set_rate(self, mm_per_s, t0=0.0):
+        """Configure auto-advancing position: pos(t) = mm_per_s * (t - t0)."""
+        self.extruder_stepper.stepper.set_rate(mm_per_s, t0)
+
+
+class _MockMainExtruderStepper:
+    """Stepper-host wrapper so extruder.extruder_stepper.stepper resolves."""
+
+    def __init__(self):
+        self.stepper = _MockExtrusionStepper()
+
+
+class _MockExtrusionStepper:
+    """Position source for the active extruder. Either a static value the
+    test sets via _position, or an auto-advancing value driven by set_rate."""
+
+    def __init__(self):
+        self._position = 0.0
+        self._rate = None  # (mm_per_s, t0) when auto-advancing
+        self._eventtime_provider = None
+
+    def set_rate(self, mm_per_s, t0=0.0):
+        self._rate = (mm_per_s, t0)
+
+    def get_commanded_position(self):
+        if self._rate is None or self._eventtime_provider is None:
+            return self._position
+        eventtime = self._eventtime_provider()
+        rate, t0 = self._rate
+        return rate * (eventtime - t0)
+
+
+class MockMcu:
+    """Minimal MCU mock — estimated_print_time only (matches Klipper's
+    MCU.estimated_print_time signature)."""
+
+    def __init__(self, reactor=None):
+        self._reactor = reactor
+
+    def estimated_print_time(self, eventtime):
+        return eventtime
+
+
+class MockTmc2208:
+    """Mock for the [tmc2208 extruder_stepper buffer_stepper] object.
+
+    Exposes a single `mcu_tmc` attribute whose set_register() captures
+    every call into `writes` for assertion.  The latency-regression
+    guard asserts that print_time is always None — i.e. that the
+    plugin never schedules VACTUAL writes at the lookahead tail.
+    """
+
+    def __init__(self):
+        self.mcu_tmc = MockMcuTmc()
+
+
+class MockMcuTmc:
+    """Backing for MockTmc2208.mcu_tmc.  set_register signature
+    matches Klipper's: (reg_name, value, print_time=None)."""
+
+    def __init__(self):
+        # All writes: [(reg_name, value, print_time), ...]
+        self.writes = []
+        # Convenience: VACTUAL writes only, just the integer value.
+        self.vactual_writes = []
+
+    def set_register(self, reg_name, value, print_time=None):
+        self.writes.append((reg_name, value, print_time))
+        if reg_name == "VACTUAL":
+            self.vactual_writes.append(value)
 
 
 class MockToolhead:
     """Mock for toolhead.ToolHead."""
 
-    def __init__(self):
+    def __init__(self, reactor=None):
+        self._reactor = reactor
+        self._mcu = MockMcu(reactor=reactor)
         self._extruder = MockExtruder()
+        self._wire_extruder(self._extruder)
         self.flush_count = 0
+        self.dwell_calls = []
+        self._last_move_time = 0.0
+
+    def _wire_extruder(self, extruder):
+        if self._reactor is not None:
+            extruder.extruder_stepper.stepper._eventtime_provider = (
+                self._reactor.monotonic)
 
     def get_extruder(self):
         return self._extruder
@@ -295,15 +437,20 @@ class MockToolhead:
     def set_extruder(self, extruder):
         """Test helper: swap the active extruder."""
         self._extruder = extruder
+        self._wire_extruder(extruder)
+
+    def get_mcu(self):
+        return self._mcu
 
     def flush_step_generation(self):
         self.flush_count += 1
 
     def get_last_move_time(self):
-        return 0.0
+        return self._last_move_time
 
     def dwell(self, delay):
-        pass
+        self.dwell_calls.append(delay)
+        self._last_move_time += max(0.0, delay)
 
 
 class MockForceMove:
@@ -349,15 +496,19 @@ class MockPrinter:
         self.buttons = MockButtons()
         self.print_stats = MockPrintStats()
         self.pause_resume = MockPauseResume()
-        self.toolhead = MockToolhead()
+        self.toolhead = MockToolhead(reactor=self.reactor)
         self.printer_es = MockPrinterExtruderStepper(toolhead=self.toolhead)
         self.force_move = MockForceMove()
+        # MockTmc2208 captures direct VACTUAL register writes so
+        # recovery tests can assert against them.
+        self.tmc2208 = MockTmc2208()
         self.event_handlers = {}
 
         self._objects = {
             "gcode": self.gcode,
             "toolhead": self.toolhead,
             "extruder_stepper buffer_stepper": self.printer_es,
+            "tmc2208 extruder_stepper buffer_stepper": self.tmc2208,
             "force_move": self.force_move,
             "print_stats": self.print_stats,
             "pause_resume": self.pause_resume,
@@ -458,6 +609,19 @@ def enabled_buf(buf, printer):
 
 
 @pytest.fixture
+def printing_buf(enabled_buf):
+    """enabled_buf with _print_stats.state flipped to 'printing'.
+
+    Recovery entry is gated on _is_printing() to avoid surprise motion
+    outside a print (user loading/unloading filament).  Tests that
+    exercise the recovery path use this fixture instead of plain
+    enabled_buf.
+    """
+    enabled_buf._print_stats.state = "printing"
+    return enabled_buf
+
+
+@pytest.fixture
 def buttons(printer):
     return printer.buttons
 
@@ -475,6 +639,30 @@ def gcode(printer):
 @pytest.fixture
 def force_move(printer):
     return printer.force_move
+
+
+@pytest.fixture
+def sidecar_moves(force_move):
+    """Backward-compat alias: post-VACTUAL-refactor, all chunked
+    motion is back on force_move.manual_move so this fixture aliases
+    to force_move.moves.  Existing tests that look up sidecar_moves
+    keep working without per-file rewrites."""
+    return force_move.moves
+
+
+@pytest.fixture
+def vactual_writes(printer):
+    """Returns the list of VACTUAL register values written via
+    mcu_tmc.set_register('VACTUAL', N).  Recovery tests assert
+    against this directly."""
+    return printer.tmc2208.mcu_tmc.vactual_writes
+
+
+@pytest.fixture
+def tmc_writes(printer):
+    """All TMC register writes including (reg_name, value, print_time).
+    Used by the latency-regression guard to assert print_time=None."""
+    return printer.tmc2208.mcu_tmc.writes
 
 
 @pytest.fixture

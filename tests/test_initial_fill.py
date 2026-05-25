@@ -13,34 +13,33 @@ from conftest import (
 
 class TestInitialFillActivation:
     def test_material_insert_starts_fill(self, buf, buttons, reactor,
-                                         force_move):
+                                         sidecar_moves):
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
         # First chunk should have been issued
         assert buf.state == STATE_FEEDING
         assert buf.motor_direction == FORWARD
-        assert len(force_move.moves) > 0
-        assert force_move.moves[0][1] > 0  # positive distance
+        assert len(sidecar_moves) > 0
+        assert sidecar_moves[0][1] > 0  # positive distance
 
     def test_fill_queues_continuation(self, buf, buttons, reactor):
-        """After the first chunk, a reactor callback is queued for the
-        next chunk."""
+        """After the first chunk, a continuation timer is scheduled
+        at chunk-completion eventtime so the fill loop continues."""
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
-        # There should be a pending callback for the next chunk
-        assert len(reactor._pending_callbacks) > 0
+        assert buf._fill_timer is not None
 
 
 class TestInitialFillAbortOnMiddle:
     def test_middle_sensor_stops_fill(self, buf, buttons, reactor,
-                                      force_move):
+                                      sidecar_moves):
         """Fill aborts when the middle sensor triggers between chunks."""
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
-        chunks_before = len(force_move.moves)
+        chunks_before = len(sidecar_moves)
 
         # Simulate middle sensor triggering between chunks
         set_sensors(buf, middle=True)
@@ -50,29 +49,29 @@ class TestInitialFillAbortOnMiddle:
         reactor.flush_callbacks()
 
         # No new chunk should have been issued
-        assert len(force_move.moves) == chunks_before
+        assert len(sidecar_moves) == chunks_before
         assert buf._initial_fill_until == 0.0
         # Should have synced to extruder
         assert buf._synced_to is not None
 
     def test_full_sensor_also_stops_fill(self, buf, buttons, reactor,
-                                          force_move):
+                                          sidecar_moves):
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
-        chunks_before = len(force_move.moves)
+        chunks_before = len(sidecar_moves)
 
         set_sensors(buf, full=True)
         t += 0.5
         reactor._monotonic = t
         reactor.flush_callbacks()
 
-        assert len(force_move.moves) == chunks_before
+        assert len(sidecar_moves) == chunks_before
         assert buf._initial_fill_until == 0.0
 
 
 class TestInitialFillTimeout:
-    def test_timeout_stops_fill(self, buf, buttons, reactor, force_move):
+    def test_timeout_stops_fill(self, buf, buttons, reactor, sidecar_moves):
         t = 10.0
         reactor._monotonic = t
         buttons.callbacks["PE3"](t, 1)
@@ -113,7 +112,7 @@ class TestInitialFillClear:
         assert buf.state == STATE_IDLE
 
     def test_fill_cancelled_by_feed_button(self, buf, buttons, reactor,
-                                            force_move):
+                                            sidecar_moves):
         """Pressing feed button during fill cancels the fill loop."""
         t = 10.0
         reactor._monotonic = t
@@ -125,19 +124,18 @@ class TestInitialFillClear:
         assert buf._initial_fill_until == 0.0
         assert buf.state == STATE_MANUAL_FEED
 
-        # Fire only the pending fill-chunk callback (first in the queue).
-        # It should see _initial_fill_until == 0.0 and bail without issuing
-        # another move. We don't drain the rest of the queue because the
-        # manual continuous-feed loop keeps re-scheduling itself while the
-        # button is "held" — that behavior is covered by its own tests.
-        chunks_before = len(force_move.moves)
-        fill_cb = reactor._pending_callbacks.pop(0)
-        fill_cb(reactor._monotonic)
-        assert len(force_move.moves) == chunks_before
+        # Fire the fill chunk path directly.  It should see
+        # _initial_fill_until == 0.0 and bail without issuing another
+        # move.  We don't drain other timers because the manual
+        # continuous-feed loop keeps re-scheduling itself while the
+        # button is "held" — that's covered by its own tests.
+        chunks_before = len(sidecar_moves)
+        buf._do_fill_chunk(reactor._monotonic)
+        assert len(sidecar_moves) == chunks_before
         assert buf._initial_fill_until == 0.0
 
     def test_fill_cancelled_by_buffer_feed_command(self, buf, buttons,
-                                                    reactor, force_move):
+                                                    reactor, sidecar_moves):
         """BUFFER_FEED command during fill cancels the fill loop."""
         t = 10.0
         reactor._monotonic = t

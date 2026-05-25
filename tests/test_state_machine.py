@@ -38,45 +38,63 @@ class TestMiddleZone:
 
 
 class TestEmptyZone:
-    def test_empty_increases_multiplier(self, enabled_buf):
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._current_zone == ZONE_EMPTY
-        assert enabled_buf._rd_multiplier > 1.0
+    def test_empty_enters_vactual_recovery(self, printing_buf):
+        # EMPTY recovery writes VACTUAL; the stepper stays nominally
+        # synced (TMC ignores STEP/DIR while VACTUAL != 0).
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._current_zone == ZONE_EMPTY
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
+        # Stepper stays synced — that's the whole point of the
+        # VACTUAL refactor: no unsync needed during recovery.
+        assert printing_buf._synced_to is not None
 
 
 class TestFullZone:
-    def test_full_decreases_multiplier(self, enabled_buf):
-        set_sensors(enabled_buf, full=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._current_zone == ZONE_FULL
-        assert enabled_buf._rd_multiplier < 1.0
+    def test_full_enters_vactual_recovery(self, printing_buf, reactor):
+        # FULL recovery enters unconditionally — slow reverse VACTUAL
+        # drains regardless of extruder direction (no "defer if idle"
+        # branch any more).
+        set_sensors(printing_buf, full=True)
+        reactor._monotonic = 1.0
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._current_zone == ZONE_FULL
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        assert printing_buf._synced_to is not None
 
 
 class TestEmptyMiddleZone:
     def test_empty_middle_slight_increase(self, enabled_buf):
-        set_sensors(enabled_buf)  # all off
+        # Non-extreme zone application is hysteresis-gated: requires
+        # the same zone to be seen across >200ms before commit.
+        set_sensors(enabled_buf)  # all off -> EMPTY_MIDDLE
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._update_rotation_distance(1.3)
         assert enabled_buf._current_zone == ZONE_EMPTY_MIDDLE
         assert enabled_buf._rd_multiplier > 1.0
-        # drift correction is gentler than the safety zone correction
-        assert enabled_buf._rd_multiplier < enabled_buf.multiplier_high
+        assert enabled_buf._rd_multiplier == pytest.approx(
+            1.0 + enabled_buf.drift_gain)
 
 
 class TestFullMiddleZone:
     def test_full_middle_slight_decrease(self, enabled_buf):
         set_sensors(enabled_buf, full=True, middle=True)
         enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._update_rotation_distance(1.3)
         assert enabled_buf._current_zone == ZONE_FULL_MIDDLE
         assert enabled_buf._rd_multiplier < 1.0
-        # drift correction is gentler than the safety zone correction
-        assert enabled_buf._rd_multiplier > enabled_buf.multiplier_low
+        assert enabled_buf._rd_multiplier == pytest.approx(
+            1.0 - enabled_buf.drift_gain)
 
 
 class TestSensorConflict:
     def test_empty_and_full_triggers_error(self, enabled_buf):
         set_sensors(enabled_buf, empty=True, full=True)
         enabled_buf._update_rotation_distance(1.0)
+        # Conflict is deferred at first (could be transient).  Persistent
+        # conflict escalates via the control timer after control_interval.
+        assert enabled_buf.state != STATE_ERROR
+        enabled_buf._control_timer_cb(1.0 + enabled_buf.control_interval)
         assert enabled_buf.state == STATE_ERROR
         assert "conflict" in enabled_buf.error_msg.lower()
 
@@ -105,21 +123,26 @@ class TestGuardConditions:
 
 
 class TestZoneTransitions:
-    def test_middle_to_empty_to_middle(self, enabled_buf):
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(1.0)
-        assert enabled_buf._current_zone == ZONE_MIDDLE
-        assert enabled_buf._rd_multiplier == 1.0
+    def test_middle_to_empty_to_middle(self, printing_buf):
+        # Forward extruder rate so EMPTY recovery is ENTERed.
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+        set_sensors(printing_buf, middle=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._current_zone == ZONE_MIDDLE
+        assert printing_buf._rd_multiplier == 1.0
 
-        set_sensors(enabled_buf, empty=True)
-        enabled_buf._update_rotation_distance(2.0)
-        assert enabled_buf._current_zone == ZONE_EMPTY
-        assert enabled_buf._rd_multiplier > 1.0
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(2.0)
+        assert printing_buf._current_zone == ZONE_EMPTY
+        # Recovery owns this; buffer is unsynced, no multiplier change.
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY
 
-        set_sensors(enabled_buf, middle=True)
-        enabled_buf._update_rotation_distance(3.0)
-        assert enabled_buf._current_zone == ZONE_MIDDLE
-        assert enabled_buf._rd_multiplier == 1.0
+        set_sensors(printing_buf, middle=True)
+        printing_buf._update_rotation_distance(3.0)
+        assert printing_buf._current_zone == ZONE_MIDDLE
+        # Returning to MIDDLE exits recovery and re-syncs at 1.0.
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._rd_multiplier == 1.0
 
     def test_full_to_full_middle_to_middle(self, enabled_buf):
         set_sensors(enabled_buf, full=True)

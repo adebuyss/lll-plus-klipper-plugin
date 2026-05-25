@@ -1,21 +1,21 @@
 # LLL-Plus Klipper Plugin
 
-A Klipper extras module for real-time control of the Mellow LLL Plus filament buffer. Uses the AFC/Happy Hare motion strategy: the buffer stepper is synchronized with the main extruder via a shared trapq, and hall effect sensors dynamically adjust `rotation_distance` to keep the filament loop centered on the middle sensor.
+A Klipper extras module for real-time control of the Mellow LLL Plus filament buffer. The buffer stepper is synchronized with the main extruder via a shared trapq (the AFC pattern); hall effect sensors dynamically adjust `rotation_distance` to keep the filament loop centered on the middle sensor. Extreme-zone recovery (EMPTY/FULL) uses the TMC's chip-side `VACTUAL` velocity mode so it can run during a print without disturbing the toolhead pipeline.
 
 ## Features
 
 - **Trapq sync** -- buffer stepper follows the extruder step-for-step via `extruder_stepper` and shared motion queue
 - **Middle-zone seeking** -- three hall sensors define a five-zone state; rotation_distance feedback keeps the filament centered on the middle sensor (dead-band at multiplier 1.0)
-- **Fault escalation** -- sustained time in a safety zone (EMPTY/FULL) increases the correction gain, then triggers an error or forced retract
+- **VACTUAL recovery** -- EMPTY/FULL zones are recovered via the TMC's internal velocity mode; the stepper stays nominally synced and the print continues without pause or hitch
 - **Initial fill** -- continuous forward feed on first filament insertion via `force_move`
 - **Manual override** -- physical feed/retract buttons and GCode commands for filament loading
 - **Error clear via buttons** -- hold both buttons for 2 seconds to clear an error state
-- **Error protection** -- forward timeout, sensor conflict detection, safety timeouts, and optional pause-on-runout
+- **Error protection** -- sensor conflict detection, safety timeouts, and optional pause-on-runout
 
 ## Hardware
 
 - Mellow LLL Plus filament buffer board (STM32F072 MCU)
-- TMC2208 / TMC2225 stepper driver (step/dir control; UART used only for initial config)
+- TMC2208 / TMC2225 stepper driver (UART required — used for VACTUAL recovery and TMC config)
 - Three hall effect sensors (empty, middle, full positions)
 - Filament presence switch
 - Feed and retract buttons
@@ -118,15 +118,12 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | Parameter              | Default | Description                                                      |
 |------------------------|---------|------------------------------------------------------------------|
 | `drift_gain`           | 0.02    | Multiplier offset in EMPTY_MIDDLE / FULL_MIDDLE zones            |
-| `multiplier_low`       | 0.9     | rd_multiplier in FULL zone (under-feed). AFC default              |
-| `multiplier_high`      | 1.1     | rd_multiplier in EMPTY zone (over-feed). AFC default              |
-| `fault_multiplier_low` | 0.36    | rd_multiplier in FULL after fault_escalation_time (AFC formula)   |
-| `fault_multiplier_high`| 1.65    | rd_multiplier in EMPTY after fault_escalation_time (AFC formula)  |
-| `fault_escalation_time`| 5.0     | Seconds in a safety zone before jumping to fault_multiplier_*    |
-| `empty_safety_timeout` | 30.0    | Seconds in EMPTY zone before raising an error                    |
+| `empty_safety_timeout` | 30.0    | Cumulative cap while EMPTY-armed but recovery has not entered     |
 | `full_safety_timeout`  | 10.0    | Seconds in FULL zone before forced retract                       |
-| `manual_speed`         | 15.0    | Speed (mm/s) for manual feed/retract                             |
-| `manual_accel`         | 100.0   | Acceleration (mm/s^2) for manual feed/retract                    |
+| `extreme_recovery_timeout` | 10.0 | Per-attempt cap on VACTUAL recovery (hard error on exceed)       |
+| `manual_speed`         | 40.0    | Speed (mm/s) for manual feed/retract (trapezoid-ramped, safe at 40) |
+| `recovery_speed`       | 10.0    | Speed (mm/s) of EMPTY-zone VACTUAL recovery (instant velocity step — lower ceiling than manual_speed) |
+| `manual_accel`         | 1500.0  | Acceleration (mm/s^2) for manual feed/retract                    |
 | `manual_move_distance` | 10.0    | Distance (mm) per manual / safety-retract chunk                  |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
 | `initial_fill_timeout` | 10.0    | Duration (s) of forward feed on first filament insertion         |
@@ -169,20 +166,50 @@ rd_new = base_rotation_distance / multiplier
 
 ### Sensor Zones
 
-| Empty | Middle | Full | Zone         | Multiplier                |
-|:-----:|:------:|:----:|--------------|---------------------------|
-|   1   |   *    |   1  | **ERROR**    | sensor conflict           |
-|   1   |   *    |   0  | EMPTY        | `multiplier_high` (1.1)   |
-|   0   |   0    |   0  | EMPTY_MIDDLE | 1.0 + `drift_gain`        |
-|   0   |   1    |   0  | **MIDDLE**   | **1.00 (dead-band)**      |
-|   0   |   1    |   1  | FULL_MIDDLE  | 1.0 - `drift_gain`        |
-|   0   |   0    |   1  | FULL         | `multiplier_low` (0.9)    |
+| Empty | Middle | Full | Zone         | Behavior                                              |
+|:-----:|:------:|:----:|--------------|-------------------------------------------------------|
+|   1   |   *    |   1  | **ERROR**    | sensor conflict                                       |
+|   1   |   *    |   0  | EMPTY        | forward VACTUAL at `recovery_speed` (recovery)        |
+|   0   |   0    |   0  | EMPTY_MIDDLE | 1.0 + `drift_gain`                                    |
+|   0   |   1    |   0  | **MIDDLE**   | **1.00 (dead-band)**                                  |
+|   0   |   1    |   1  | FULL_MIDDLE  | 1.0 - `drift_gain`                                    |
+|   0   |   0    |   1  | FULL         | reverse VACTUAL at 1 mm/s (slow drain, recovery)      |
 
-The MIDDLE zone is the target equilibrium. When the middle sensor alone is active, the multiplier is exactly 1.0 -- the buffer rides the extruder step-for-step with zero correction. Deviations toward empty or full apply proportional corrections that push the filament loop back toward center.
+The MIDDLE zone is the target equilibrium. When the middle sensor alone is active, the multiplier is exactly 1.0 -- the buffer rides the extruder step-for-step with zero correction. The two near-edge zones (EMPTY_MIDDLE / FULL_MIDDLE) apply a gentle `drift_gain` correction.
 
-### Fault escalation
+### Extreme-zone recovery (VACTUAL)
 
-If a safety zone (EMPTY or FULL) persists for `fault_escalation_time` seconds, the multiplier jumps to the absolute `fault_multiplier_low` / `fault_multiplier_high` value (AFC defaults: 0.36 / 1.65 — strong corrections that drain or fill the loop quickly). If it persists past the safety timeout, an error is raised (EMPTY) or a forced retract is executed (FULL).
+When the buffer hits ZONE_EMPTY or ZONE_FULL during a print, the plugin uses the TMC2208/2225 `VACTUAL` register to drive the motor at constant velocity from the chip side. While `VACTUAL ≠ 0` the TMC ignores STEP/DIR and generates steps internally, so the buffer stepper can stay nominally synced to the extruder's trapq — the print continues without hitch or pause, and Klipper's motion pipeline invariants stay intact.
+
+- **EMPTY** recovery writes VACTUAL at `recovery_speed` (default 10 mm/s) and polls every 50 ms for zone exit. The recovery velocity is intentionally lower than `manual_speed` because VACTUAL is an instant velocity step at the TMC chip — there's no trapezoid acceleration ramp, so the safe instant-step ceiling on the reference hardware (stealthchop, 0.3 A) is ~30 mm/s. Bump `recovery_speed` higher if you have spreadcycle, higher run_current, or consistently high-flow prints. If recovery cannot pull the buffer out of EMPTY within `extreme_recovery_timeout` seconds, the buffer writes VACTUAL=0 and raises a hard error.
+- **FULL** recovery writes a negative VACTUAL at 1 mm/s (slow drain). Fast enough to recover from FULL within a reasonable timeout, slow enough not to fight an extruder that's also feeding forward at typical print speeds. The 200 mm FULL_MIDDLE → MIDDLE travel takes ~20 s at 1 mm/s.
+
+Manual feed/retract (buttons, `BUFFER_FEED`/`BUFFER_RETRACT`, `BUFFER_RETRACT_UNTIL_CLEAR`, initial fill, safety retract) uses the proven `_unsync()` + `force_move.manual_move` + `_sync()` pattern. These paths run outside a print so the toolhead-dwell cost is invisible.
+
+### Polarity
+
+On the reference Mellow LLL Plus wiring the TMC's internal VACTUAL direction is **inverted** relative to STEP/DIR — positive STEP/DIR pulses drive filament forward, but positive VACTUAL drives reverse. The plugin negates VACTUAL internally (`_mm_per_s_to_vactual` in `klipper/buffer.py`) so callers can treat the helper's input mm/s with the same sign convention as `force_move.manual_move` (+forward, -reverse). EMPTY recovery drives forward; FULL recovery drives slow reverse — both behave as documented without any user-facing config.
+
+If you have non-reference wiring and find that EMPTY recovery drives the wrong direction (e.g. filament moves backward when the buffer is empty), the TMC's internal direction matches STEP/DIR on your board. Drop the negation in `_mm_per_s_to_vactual` (or invert `driver_SHAFT`) and retest with the filament removed:
+
+```
+SET_STEPPER_ENABLE STEPPER=buffer_stepper ENABLE=1
+SET_TMC_FIELD STEPPER=buffer_stepper FIELD=VACTUAL VALUE=2000
+# observe motor direction (should drive filament forward)
+SET_TMC_FIELD STEPPER=buffer_stepper FIELD=VACTUAL VALUE=0
+```
+
+### Safety — VACTUAL on host crash
+
+The TMC retains its VACTUAL register until power-off, a UART driver-init sequence, or the enable pin going inactive. The plugin clears VACTUAL on `_unsync` (cleanup invariant), `klippy:shutdown` (with belt-and-suspenders driver disable), and `klippy:disconnect` — three layers covering every clean exit path Klipper exposes. A hard host kill (`kill -9`, host power loss) bypasses all three layers and leaves VACTUAL set; the chip will keep the motor running until printer power is removed. Add an MCU watchdog or relay-cut on the buffer power rail if that residual failure mode is unacceptable for your install.
+
+### Drift correction without flushing
+
+Inside `_apply_multiplier` the plugin calls `set_rotation_distance` directly *without* `flush_step_generation()` — the AFC pattern, deliberately not canonical Klipper. At small multiplier deltas (drift_gain ≤ 0.02 ⇒ ≤ 2% step_dist change) over a buffer stepper's shallow queued depth (~5–20 ms), the resulting sub-step timing glitch is mechanically invisible, while the canonical flush would drain the entire main-toolhead lookahead (1–10 ms pipeline drain per zone transition) and show up as visible XYZ stalls on long fast moves. Multiplier changes are rate-limited to 2 Hz during printing and gated by 200 ms zone hysteresis to suppress sensor-bounce thrash at zone boundaries.
+
+### Why no `multiplier_high` / `multiplier_low`?
+
+Earlier versions chased extreme zones by jamming `rotation_distance` to absolute multipliers (with `fault_*` escalation after a timeout). That coarse correction regularly over- or under-shot. A subsequent attempt routed extreme-zone recovery through a private "sidecar trapq" that called `trapq_append` + `stepper.generate_steps()` directly — that turned out to violate Klipper's stepcompress invariants and caused MCU shutdowns on resume after manual filament movement. VACTUAL bypasses both problems at the chip level. Old config knobs (`multiplier_high`, `multiplier_low`, `fault_multiplier_high`, `fault_multiplier_low`, `fault_escalation_time`, `apply_dwell`, `recovery_move_distance`) still parse so existing configs load with a deprecation warning, but their values are ignored.
 
 ### State Transitions
 

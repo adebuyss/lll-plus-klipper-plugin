@@ -30,6 +30,20 @@ ZONE_FULL_MIDDLE = "full_middle"
 ZONE_MIDDLE = "middle"
 ZONE_EMPTY_MIDDLE = "empty_middle"
 
+# VACTUAL scaling: TMC2208/2225 internal-velocity register expresses
+# velocity in units of f_clk_internal / 2^24 microsteps per second.
+# With the typical 12 MHz internal clock, one VACTUAL LSB = ~0.715
+# microsteps/s.  Therefore register_value = µsteps/s / 0.715 — the
+# constant is a divisor.  Verified against the working BufferMotor
+# formula from commit de26ddc.
+_VACTUAL_USTEP_PER_LSB = 0.715
+
+# VACTUAL recovery polling cadence.  At 50 ms and 40 mm/s the
+# worst-case overshoot past the zone-exit trigger is 2 mm, well
+# inside the MIDDLE band on the reference LLL Plus.  Doubling the
+# reactor-tick cost is trivial.
+_RECOVERY_POLL_INTERVAL = 0.05
+
 # State machine transitions:
 #   DISABLED -> IDLE          on klippy:ready
 #   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
@@ -66,6 +80,17 @@ _DEPRECATED_PARAMS = [
     ("full_zone_retract_length", 0.0, "minval", 0.0),
     ("min_extrusion_velocity", 0.05, "minval", 0.0),
     ("forward_timeout", 60.0, "minval", 0.0),
+    ("apply_dwell", 0.5, "minval", 0.0),
+    ("fault_multiplier_low", 0.36, "minval", 0.0),
+    ("fault_multiplier_high", 1.65, "minval", 1.0),
+    ("fault_escalation_time", 5.0, "above", 0.0),
+    ("multiplier_low", 0.9, "minval", 0.0),
+    ("multiplier_high", 1.1, "minval", 1.0),
+    # recovery_move_distance was used by the sidecar-chunked EMPTY
+    # recovery loop.  VACTUAL recovery is continuous, so the chunk
+    # size is meaningless; kept here for one release so existing
+    # configs load with a warning rather than erroring out.
+    ("recovery_move_distance", 5.0, "above", 0.0),
 ]
 
 
@@ -99,52 +124,42 @@ class Buffer:
         self.extruder_name = config.get("bound_extruder", None)
         self.drift_gain = config.getfloat("drift_gain", 0.02, minval=0.0,
                                           maxval=0.5)
-        # Absolute rotation_distance multipliers, matching AFC_buffer.py.
-        # _low is applied in the FULL safety zone (under-feed to drain
-        # the loop); _high is applied in the EMPTY safety zone (over-feed
-        # to fill it).  The fault_* variants are the escalated values
-        # used after fault_escalation_time seconds in the same zone.
-        # AFC defaults: 0.9 / 1.1 normal, 0.36 / 1.65 fault.
-        self.multiplier_low = config.getfloat(
-            "multiplier_low", 0.9, minval=0.0, maxval=1.0)
-        self.multiplier_high = config.getfloat(
-            "multiplier_high", 1.1, minval=1.0)
-        self.fault_multiplier_low = config.getfloat(
-            "fault_multiplier_low",
-            (self.multiplier_low * 2.0) / 5.0,
-            minval=0.0, maxval=self.multiplier_low)
-        self.fault_multiplier_high = config.getfloat(
-            "fault_multiplier_high",
-            self.multiplier_high * 1.5,
-            minval=self.multiplier_high)
-        self.fault_escalation_time = config.getfloat("fault_escalation_time",
-                                                     5.0, above=0.0)
         self.empty_safety_timeout = config.getfloat("empty_safety_timeout",
                                                     30.0, above=0.0)
         self.full_safety_timeout = config.getfloat("full_safety_timeout",
                                                    10.0, above=0.0)
         self.error_clear_hold_time = config.getfloat("error_clear_hold_time",
                                                      2.0, above=0.0)
-        self.manual_speed = config.getfloat("manual_speed", 15.0, above=0.0)
-        self.manual_accel = config.getfloat("manual_accel", 100.0, above=0.0)
+        self.manual_speed = config.getfloat("manual_speed", 40.0, above=0.0)
+        # EMPTY-zone VACTUAL recovery velocity.  Lower than manual_speed
+        # because VACTUAL is an instant velocity step at the chip — there
+        # is no trapezoid acceleration ramp like force_move.manual_move
+        # has, so the TMC has to develop torque from rest in a single
+        # microstep period.  On the LLL Plus reference hardware
+        # (stealthchop, run_current=0.3) the empirical safe ceiling is
+        # ~30 mm/s; 10 mm/s leaves a 3x margin and is still faster than
+        # typical extruder draw (5-10 mm/s on common print profiles),
+        # so EMPTY recovery still has net positive fill rate.  Bump
+        # this if you have higher run_current, spreadcycle, or
+        # consistently high-flow prints that outrun the default.
+        self.recovery_speed = config.getfloat("recovery_speed", 10.0,
+                                              above=0.0)
+        self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
-        # Minimum interval between actually-applied rotation_distance
-        # changes. Each apply does flush_step_generation() which drains
-        # the entire step pipeline (XYZ + extruder) for ~1-10 ms; during
-        # printing, rapid zone oscillation (e.g. MIDDLE <-> EMPTY_MIDDLE)
-        # would flush on every transition. With apply_dwell > 0, the
-        # first transition applies immediately and any further changes
-        # within the dwell window are coalesced into a single deferred
-        # apply (HVAC short-cycle protection pattern). Fault escalation
-        # bypasses the dwell. apply_dwell=0 disables coalescing.
-        self.apply_dwell = config.getfloat("apply_dwell", 0.5, minval=0.0)
         self.initial_fill_timeout = config.getfloat("initial_fill_timeout",
                                                     10.0, above=0.0)
+        # Per-attempt cap on VACTUAL recovery.  If recovery has not
+        # pulled the buffer out of the extreme zone within this many
+        # seconds, the recovery poller escalates to _handle_error.
+        # empty_safety_timeout is the cumulative cap for cases where
+        # recovery never starts (e.g. EMPTY entered while not printing).
+        self.extreme_recovery_timeout = config.getfloat(
+            "extreme_recovery_timeout", 10.0, above=0.0)
         self.manual_feed_full_timeout = config.getfloat(
             "manual_feed_full_timeout", 3.0, above=0.0)
         # Sensor pin names
@@ -174,12 +189,6 @@ class Buffer:
         self._rd_multiplier = 1.0
         self._synced_to = None  # extruder name when synced, None when not
         self._last_active_extruder = None  # tracked for tool-change detection
-
-        # Apply-dwell coalescing state. -inf so the first apply is never
-        # gated; resets to -inf on _unsync so a fresh sync isn't gated.
-        self._last_apply_time = -float("inf")
-        self._pending_multiplier = None
-        self._dwell_timer = None  # reactor timer handle, lazily registered
 
         # State
         self.state = STATE_DISABLED
@@ -216,7 +225,6 @@ class Buffer:
 
         # Safety timeout tracking
         self._safety_zone_start = 0.0  # when we entered EMPTY or FULL
-        self._safety_escalated = False
 
         # Initial fill
         self._initial_fill_until = 0.0
@@ -237,13 +245,58 @@ class Buffer:
         # Print state tracking
         self._print_stats = None
 
+        # Extreme-zone recovery via TMC VACTUAL.  When non-None, the
+        # TMC is in chip-side velocity mode driving the motor at a
+        # constant rate; the stepper is still nominally trapq-synced
+        # but the TMC ignores STEP/DIR while VACTUAL != 0.
+        self._extreme_recovery_active = None
+        self._recovery_started_at = 0.0
+
+        # Drift-correction rate-limit + zone hysteresis state.
+        # _apply_multiplier rate-limits to 2 Hz during printing to
+        # avoid stacked no-flush set_rotation_distance calls when a
+        # sensor bounces.  _update_rotation_distance requires a zone
+        # to be stable for 200 ms before committing.
+        self._last_rd_apply_at = 0.0
+        self._pending_multiplier = None
+        self._proposed_zone = None
+        self._proposed_zone_at = 0.0
+
+        # Transient sensor-conflict deferral: timestamp of the first
+        # tick where empty+full were both true.  Cleared on the next
+        # clean zone read.  Promoted to a hard error from the control
+        # timer if it persists past control_interval (i.e. a real
+        # wiring fault, not just out-of-order callbacks within one MCU
+        # report).
+        self._conflict_since = 0.0
+
+        # Per-key debug-log throttle: key -> (last_eventtime, suppressed_count)
+        self._dlog_throttle = {}
+
         # Timer handles
         self._control_timer = None
+        # VACTUAL recovery poller: 50 ms cadence, single registered
+        # timer reused across recovery sessions via update_timer.
+        self._recovery_check_timer = None
+        # Per-site chunk-pacing timers.  Each chunk schedules the next
+        # attempt at eventtime + chunk_duration so a brief button tap
+        # produces ONE chunk instead of bursting 3 back-to-back into
+        # the MCU queue (which would all execute regardless of when
+        # the user releases the button).
+        self._fill_timer = None
+        self._continuous_timer = None
+        self._retract_clear_timer = None
 
-        # Register events
+        # Register events.  klippy:disconnect is critical: VACTUAL
+        # persists across host disconnect and the TMC will keep
+        # stepping the motor until power-off or until the enable pin
+        # drops.  Reuse _handle_shutdown so the same cleanup runs on
+        # both clean shutdown and connection loss.
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown",
+                                            self._handle_shutdown)
+        self.printer.register_event_handler("klippy:disconnect",
                                             self._handle_shutdown)
 
         # Register gcode commands via mux so multiple [buffer ...] sections
@@ -290,10 +343,44 @@ class Buffer:
         printer_es = self.printer.lookup_object(es_key)
         self.extruder_stepper = printer_es.extruder_stepper
         self.force_move = self.printer.lookup_object("force_move")
+        # Look up the TMC driver for direct VACTUAL register writes.
+        # Recovery uses chip-side velocity mode (TMC ignores STEP/DIR
+        # while VACTUAL != 0) so we can drive the motor independently
+        # of Klipper's motion pipeline.  Try common variants — the
+        # plugin targets TMC2208/2225, but TMC2209 shares the same
+        # field layout via inheritance.
+        self._mcu_tmc = None
+        for prefix in ("tmc2208", "tmc2225", "tmc2209"):
+            try:
+                tmc_obj = self.printer.lookup_object(
+                    "%s extruder_stepper %s"
+                    % (prefix, self.stepper_name))
+                self._mcu_tmc = tmc_obj.mcu_tmc
+                break
+            except Exception:
+                continue
+        if self._mcu_tmc is None:
+            logging.warning(
+                "buffer[%s]: TMC driver not found — VACTUAL recovery "
+                "disabled" % self.short_name)
         # Capture baseline rotation_distance
         self._base_rd = (
             self.extruder_stepper.stepper.get_rotation_distance()[0])
         self._rd_multiplier = 1.0
+        # Cache steps_per_mm for VACTUAL register conversion.
+        # get_step_dist() returns mm per microstep, folding in the
+        # user's rotation_distance, microsteps, and gear_ratio exactly
+        # as Klipper computed them at config time.  No literals — the
+        # cache stays consistent with set_rotation_distance because
+        # both live on the same stepper object.
+        try:
+            self._steps_per_mm = (
+                1.0 / self.extruder_stepper.stepper.get_step_dist())
+        except Exception as e:
+            logging.warning(
+                "buffer[%s]: get_step_dist() unavailable (%s); "
+                "VACTUAL conversion disabled" % (self.short_name, e))
+            self._steps_per_mm = None
         # Undo the auto-sync that [extruder_stepper]'s handle_connect
         # performed at klippy:connect.  The buffer stepper should not
         # follow the extruder until the user enables the buffer.
@@ -347,10 +434,130 @@ class Buffer:
                      % (self.short_name, self._base_rd))
 
     def _handle_shutdown(self):
+        # VACTUAL persists across host disconnect; the chip will keep
+        # stepping the motor unless we explicitly stop it.  Try the
+        # register write first, then drop the enable pin as a fallback
+        # — disabling the driver halts the TMC internal step generator.
+        try:
+            self._write_vactual(0)
+        except Exception:
+            pass
+        try:
+            self.gcode.run_script(
+                "SET_STEPPER_ENABLE STEPPER=%s ENABLE=0"
+                % self.stepper_name)
+        except Exception:
+            pass
         self._unsync()
         self.state = STATE_DISABLED
         self.auto_enabled = False
         logging.info("buffer[%s]: shutdown" % self.short_name)
+
+    # --- VACTUAL helpers ---
+
+    def _mm_per_s_to_vactual(self, mm_per_s):
+        """Convert mm/s of filament motion to a signed VACTUAL register
+        value.  Reads steps_per_mm from the live stepper (cached in
+        _handle_ready) so changes to rotation_distance / microsteps /
+        gear_ratio in the user's config take effect automatically.
+
+        Polarity: on the reference Mellow LLL Plus wiring, the TMC's
+        internal VACTUAL direction is INVERTED relative to STEP/DIR
+        (verified on hardware — positive STEP/DIR pulses drive
+        filament forward, but positive VACTUAL drives reverse).
+        Negate the result so callers can treat the input mm/s with
+        the same sign convention as manual_move (+forward / -reverse).
+        """
+        if self._steps_per_mm is None:
+            return 0
+        return -int(mm_per_s * self._steps_per_mm / _VACTUAL_USTEP_PER_LSB)
+
+    def _write_vactual(self, register_value):
+        """Write the TMC VACTUAL register directly.  This is the
+        critical part of the refactor: SET_TMC_FIELD via gcode dispatch
+        schedules the register write at toolhead.get_last_move_time()
+        — which during a print is the lookahead tail, ~1-2 s ahead of
+        MCU execution.  mcu_tmc.set_register with no print_time
+        argument applies immediately, which is what recovery needs.
+        Mirrors the working pattern from BufferMotor (commit de26ddc).
+        """
+        if self._mcu_tmc is None:
+            return False
+        try:
+            self._mcu_tmc.set_register("VACTUAL", register_value)
+            return True
+        except Exception as e:
+            logging.warning("buffer[%s]: VACTUAL write failed: %s"
+                            % (self.short_name, e))
+            return False
+
+    def _stop_recovery_vactual(self):
+        """Stop VACTUAL recovery and restore correct STEP/DIR
+        interpretation via a brief directional nudge.
+
+        The TMC2208/2225 latches the sign of the last nonzero VACTUAL
+        write and applies it to subsequent STEP pulses regardless of
+        the DIR pin.  EMPTY recovery writes a negative VACTUAL value
+        (forward-filament intent, negated by _mm_per_s_to_vactual's
+        wiring inversion); a bare VACTUAL=0 would leave the latch
+        "negative" and the synced gear stepper would step backward
+        during the extruder's next forward motion (observed: buffer
+        drains back to EMPTY in ~3 s, recovery refires).  Manual
+        rescue with SET_TMC_FIELD VACTUAL=100 then VACTUAL=0
+        restores correct direction, which this method automates:
+
+        1. Write 0 to stop recovery immediately.
+        2. Write a small positive raw register value to set the
+           chip's internal direction latch to match the sign of
+           normal forward STEP/DIR motion under this wiring.
+        3. Schedule a final 0 ~50 ms later to return to step/dir
+           mode with the corrected latch.  Physical motion at
+           0.1 mm/s held 50 ms is well under one microstep.
+        """
+        self._write_vactual(0)
+        # Negate _mm_per_s_to_vactual's caller-facing "+forward"
+        # convention to produce a POSITIVE raw register value —
+        # opposite sign from EMPTY recovery's push, matching the
+        # manual rescue.
+        nudge = -self._mm_per_s_to_vactual(0.1)
+        self._write_vactual(nudge)
+        self.reactor.register_callback(
+            self._clear_vactual_latch_nudge,
+            self.reactor.monotonic() + 0.05)
+
+    def _clear_vactual_latch_nudge(self, eventtime):
+        # Don't clobber a fresh recovery push if recovery has
+        # restarted within the 50 ms nudge window.
+        if self._extreme_recovery_active is None:
+            self._write_vactual(0)
+
+    def _chunk_move_duration(self, dist, speed, accel):
+        """Real-time duration of a single force_move.manual_move
+        chunk.  Used to pace the chained chunk loops: scheduling the
+        next callback at eventtime + duration ensures one chunk
+        completes before the next is queued, so a brief button tap
+        produces one chunk instead of a back-to-back burst that's
+        already committed to the MCU before the release callback
+        fires.  Matches the trapezoid math in force_move.calc_move_time.
+        """
+        d = abs(dist)
+        if d <= 0.0 or speed <= 0.0:
+            return 0.0
+        if accel <= 0.0:
+            return d / speed
+        # Klipper's trapezoid: if max_cruise_v² < speed², we never
+        # reach the requested speed.
+        max_cruise_v2 = d * accel
+        if max_cruise_v2 < speed * speed:
+            cruise_v = max_cruise_v2 ** 0.5
+        else:
+            cruise_v = speed
+        accel_t = cruise_v / accel
+        # Distance covered during accel+decel: cruise_v² / accel.
+        cruise_t = (d - cruise_v * cruise_v / accel) / cruise_v
+        if cruise_t < 0.0:
+            cruise_t = 0.0
+        return accel_t + cruise_t + accel_t
 
     # --- Sensor registration ---
 
@@ -387,6 +594,7 @@ class Buffer:
     def _cancel_fill(self):
         """Cancel any in-progress initial fill loop."""
         self._initial_fill_until = 0.0
+        self._cancel_fill_timer()
 
     def _material_callback(self, eventtime, state):
         was_present = self.material_present
@@ -441,11 +649,8 @@ class Buffer:
             # If bound to a specific extruder, only sync when it's active.
             if (self.extruder_name is not None
                     and extruder_name != self.extruder_name):
-                if self.debug:
-                    logging.info(
-                        "buffer[%s] debug: skip sync (active=%s, "
-                        "bound=%s)" % (self.short_name, extruder_name,
-                                       self.extruder_name))
+                self._dlog(None, "skip sync (active=%s, bound=%s)",
+                           extruder_name, self.extruder_name)
                 return
             self.extruder_stepper.sync_to_extruder(extruder_name)
             self._synced_to = extruder_name
@@ -453,9 +658,7 @@ class Buffer:
             if self.state == STATE_STOPPED:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
-            if self.debug:
-                logging.info("buffer[%s] debug: synced to %s"
-                             % (self.short_name, extruder_name))
+            self._dlog(None, "synced to %s", extruder_name)
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
@@ -470,6 +673,17 @@ class Buffer:
         Without this, force_move.manual_move would use the last applied
         zone multiplier and move the wrong amount of filament.
         """
+        # VACTUAL cleanup invariant: every code path that ends a sync
+        # session must clear the chip-side velocity register too.  The
+        # TMC does NOT clear VACTUAL on its own; without this, BUFFER_
+        # DISABLE / runout / error / tool-change while VACTUAL is
+        # active would leave the motor running indefinitely.
+        self._stop_recovery_vactual()
+        self._extreme_recovery_active = None
+        self._recovery_started_at = 0.0
+        if self._recovery_check_timer is not None:
+            self.reactor.update_timer(
+                self._recovery_check_timer, self.reactor.NEVER)
         if self._synced_to is None:
             return
         try:
@@ -487,18 +701,7 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
-        # Cancel any pending dwell-deferred apply: we're no longer driving
-        # this stepper, and a stale pending value would fire after resync
-        # with whatever rd was set during the unsynced interval.
-        self._pending_multiplier = None
-        if self._dwell_timer is not None:
-            self.reactor.update_timer(
-                self._dwell_timer, self.reactor.NEVER)
-        # Reset apply-time so a fresh sync isn't gated.
-        self._last_apply_time = -float("inf")
-        if self.debug:
-            logging.info("buffer[%s] debug: unsynced" % self.short_name)
+        self._dlog(None, "unsynced")
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -548,87 +751,205 @@ class Buffer:
         return ZONE_EMPTY_MIDDLE
 
     def _zone_to_multiplier(self, zone):
-        """Map a sensor zone to a rotation_distance multiplier.
+        """Map a non-extreme sensor zone to a rotation_distance multiplier.
 
         multiplier > 1.0 -> smaller rd -> more steps/mm -> deliver MORE
         multiplier < 1.0 -> larger rd  -> fewer steps/mm -> deliver LESS
         Formula: rd_new = base_rd / multiplier (matches AFC convention)
+
+        The extreme zones (ZONE_FULL, ZONE_EMPTY) intentionally return
+        1.0 here because they are handled by the unsync-and-recover
+        path in _update_rotation_distance — at the extremes we stop
+        chasing with rotation_distance entirely.
         """
-        if zone == ZONE_MIDDLE:
-            return 1.0
         if zone == ZONE_EMPTY_MIDDLE:
             return 1.0 + self.drift_gain
-        if zone == ZONE_EMPTY:
-            return self.multiplier_high
         if zone == ZONE_FULL_MIDDLE:
             return 1.0 - self.drift_gain
-        if zone == ZONE_FULL:
-            return self.multiplier_low
         return 1.0
 
-    def _apply_multiplier(self, multiplier, eventtime=None, force=False):
+    def _dlog(self, eventtime, fmt, *args):
+        """Debug log with reactor-eventtime prefix for cross-correlation.
+
+        Embeds the reactor monotonic eventtime so klippy.log lines line
+        up with toolhead/MCU events when chasing mid-print regressions.
+        Pass None when eventtime is not in scope; the helper falls back
+        to reactor.monotonic() (cheap but a syscall, so prefer to pass
+        the existing eventtime on hot paths).
+        """
+        if not self.debug:
+            return
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        logging.info("buffer[%s] t=%.3f debug: " + fmt,
+                     self.short_name, eventtime, *args)
+
+    def _dlog_throttled(self, eventtime, key, window, fmt, *args):
+        """Throttled debug log: collapse repeated same-key entries inside
+        `window` seconds.  On the first call after the gap, emit the
+        line plus a "(N suppressed)" summary if any were dropped.
+
+        Used to tame rd_mult / zone-transition chatter when filament
+        oscillates at a sensor boundary; bouncing 30+ times per second
+        between two adjacent zones would otherwise drown other Klipper
+        log messages.  Each distinct key throttles independently so a
+        genuinely new edge breaks through immediately.
+        """
+        if not self.debug:
+            return
+        if eventtime is None:
+            eventtime = self.reactor.monotonic()
+        last = self._dlog_throttle.get(key)
+        if last is not None:
+            last_t, count = last
+            if eventtime - last_t < window:
+                self._dlog_throttle[key] = (last_t, count + 1)
+                return
+            if count > 0:
+                logging.info(
+                    "buffer[%s] t=%.3f debug: (suppressed %d %s repeats)",
+                    self.short_name, eventtime, count, key)
+        self._dlog_throttle[key] = (eventtime, 0)
+        logging.info("buffer[%s] t=%.3f debug: " + fmt,
+                     self.short_name, eventtime, *args)
+
+    # --- Extreme-zone recovery (VACTUAL) ---
+    #
+    # Recovery drives the stepper independently of Klipper's motion
+    # pipeline by writing the TMC VACTUAL register.  While VACTUAL is
+    # non-zero the TMC ignores STEP/DIR pins and generates steps
+    # internally — so the buffer stepper can stay nominally synced to
+    # the extruder's trapq, the print continues without hitch, and
+    # we don't have to worry about stepcompress invariants.
+    #
+    # EMPTY recovery: forward VACTUAL at recovery_speed (NOT manual_speed
+    #                 — VACTUAL is an instant velocity step, no trapezoid
+    #                 ramp, so the safe ceiling is much lower than the
+    #                 trapezoid-accelerated manual_speed).
+    # FULL recovery:  reverse VACTUAL at 1 mm/s (slow drain — fast
+    # enough to recover within timeout, slow enough not to fight a
+    # forward-feeding extruder).
+
+    def _enter_empty_recovery(self, eventtime):
+        if self._extreme_recovery_active is not None:
+            return
+        register = self._mm_per_s_to_vactual(self.recovery_speed)
+        if not self._write_vactual(register):
+            self._handle_error("EMPTY recovery: VACTUAL write failed")
+            return
+        self._extreme_recovery_active = ZONE_EMPTY
+        self._recovery_started_at = eventtime
+        self._dlog(eventtime,
+                   "recovery enter EMPTY vactual=%d (%.1f mm/s)",
+                   register, self.recovery_speed)
+        self._arm_recovery_timer(eventtime + _RECOVERY_POLL_INTERVAL)
+
+    def _enter_full_recovery(self, eventtime):
+        if self._extreme_recovery_active is not None:
+            return
+        register = -self._mm_per_s_to_vactual(1.0)  # 1 mm/s slow drain
+        if not self._write_vactual(register):
+            self._handle_error("FULL recovery: VACTUAL write failed")
+            return
+        self._extreme_recovery_active = ZONE_FULL
+        self._recovery_started_at = eventtime
+        self._dlog(eventtime,
+                   "recovery enter FULL vactual=%d (1.0 mm/s reverse)",
+                   register)
+        self._arm_recovery_timer(eventtime + 0.5)
+
+    def _arm_recovery_timer(self, wake):
+        if self._recovery_check_timer is None:
+            self._recovery_check_timer = self.reactor.register_timer(
+                self._check_recovery_done, wake)
+        else:
+            self.reactor.update_timer(
+                self._recovery_check_timer, wake)
+
+    def _check_recovery_done(self, eventtime):
+        """Poll recovery state every _RECOVERY_POLL_INTERVAL.  Exits
+        on zone return, material runout, or per-attempt timeout."""
+        if self._extreme_recovery_active is None:
+            return self.reactor.NEVER
+        active = self._extreme_recovery_active
+        if not self.material_present:
+            self._stop_recovery_vactual()
+            self._exit_extreme_recovery(eventtime, "material-gone")
+            return self.reactor.NEVER
+        if (eventtime - self._recovery_started_at
+                > self.extreme_recovery_timeout):
+            self._stop_recovery_vactual()
+            self._extreme_recovery_active = None
+            self._handle_error(
+                "%s recovery exceeded %.0fs"
+                % (active, self.extreme_recovery_timeout))
+            return self.reactor.NEVER
+        zone = self._compute_zone()
+        if zone is not None:
+            if (active == ZONE_EMPTY
+                    and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
+                self._stop_recovery_vactual()
+                self._exit_extreme_recovery(eventtime, "reached-middle")
+                return self.reactor.NEVER
+            if (active == ZONE_FULL
+                    and zone not in (ZONE_FULL, ZONE_FULL_MIDDLE)):
+                self._stop_recovery_vactual()
+                self._exit_extreme_recovery(eventtime, "reached-middle")
+                return self.reactor.NEVER
+        return eventtime + _RECOVERY_POLL_INTERVAL
+
+    def _exit_extreme_recovery(self, eventtime, reason):
+        """Clear recovery state.  The stepper was never unsynced
+        during VACTUAL recovery, so there is no resync to perform."""
+        if self._extreme_recovery_active is None:
+            return
+        prev_zone = self._extreme_recovery_active
+        elapsed = (eventtime - self._recovery_started_at
+                   if self._recovery_started_at > 0.0 else 0.0)
+        self._extreme_recovery_active = None
+        self._recovery_started_at = 0.0
+        self._dlog(eventtime,
+                   "recovery exit reason=%s prev=%s zone=%s elapsed=%.2fs",
+                   reason, prev_zone, self._current_zone, elapsed)
+
+    def _apply_multiplier(self, multiplier):
         """Set the buffer stepper's rotation_distance based on multiplier.
 
-        Flushes step generation before mutating step_dist, matching
-        upstream Klipper's cmd_SET_E_ROTATION_DISTANCE pattern.  Without
-        the flush, already-queued steps computed under the old step_dist
-        can end up scheduled before the new ones, causing the MCU to
-        shutdown with "Rescheduled timer in the past".
+        Deliberately does NOT call flush_step_generation() — this is
+        the AFC pattern, NOT canonical Klipper.  At small multiplier
+        deltas (drift_gain <= 0.02 ⇒ <= 2% step_dist change) over a
+        buffer stepper's shallow queued depth (~5-20 ms), the resulting
+        sub-step timing glitch is mechanically invisible.  The
+        canonical flush, by contrast, drains the entire main-toolhead
+        lookahead (1-10 ms pipeline drain per zone transition) and
+        shows up as visible XYZ stalls on long fast moves.  AFC makes
+        the same trade-off.
 
-        Subsequent changes within apply_dwell of the last apply are
-        coalesced: the latest intended multiplier is stored as
-        _pending_multiplier and applied by a deferred reactor timer.
-        force=True bypasses dwell (used for fault escalation).
+        Rate-limited to 2 Hz during printing: sensor bouncing at a
+        zone boundary can otherwise stack up no-flush set_rotation_
+        distance calls every few ms, each of which still has some
+        cost.  The deferred update lands on the next control timer
+        tick via _pending_multiplier.
         """
         if multiplier <= 0.0:
             multiplier = 0.01
         if abs(multiplier - self._rd_multiplier) < 1e-9:
-            # Already at target — discard any stale pending value.
             self._pending_multiplier = None
             return
-        if eventtime is None:
-            eventtime = self.reactor.monotonic()
-        if not force and self.apply_dwell > 0.0:
-            elapsed = eventtime - self._last_apply_time
-            if elapsed < self.apply_dwell:
-                # Only arm the timer on the first defer in this window;
-                # subsequent defers just refresh _pending_multiplier so
-                # the latest intent wins (no need to re-update the wake,
-                # it doesn't move within a window).
-                if self._pending_multiplier is None:
-                    wake = self._last_apply_time + self.apply_dwell
-                    if self._dwell_timer is None:
-                        self._dwell_timer = self.reactor.register_timer(
-                            self._dwell_timer_cb, wake)
-                    else:
-                        self.reactor.update_timer(self._dwell_timer, wake)
-                self._pending_multiplier = multiplier
-                return
-        self._do_apply(eventtime, multiplier)
-
-    def _do_apply(self, eventtime, multiplier):
-        """Unconditionally flush, set rotation_distance, and stamp time."""
+        now = self.reactor.monotonic()
+        if (self._is_printing()
+                and now - self._last_rd_apply_at < 0.5):
+            self._pending_multiplier = multiplier
+            return
         self._rd_multiplier = multiplier
-        new_rd = self._base_rd / multiplier
-        self.toolhead.flush_step_generation()
-        self.extruder_stepper.stepper.set_rotation_distance(new_rd)
-        self._last_apply_time = eventtime
         self._pending_multiplier = None
-        if self.debug:
-            logging.info(
-                "buffer[%s] debug: rd_mult=%.4f rd=%.4f zone=%s"
-                % (self.short_name, multiplier, new_rd, self._current_zone))
-
-    def _dwell_timer_cb(self, eventtime):
-        """Fire the deferred apply after the dwell window expires."""
-        pending = self._pending_multiplier
-        if pending is None or self._synced_to is None:
-            return self.reactor.NEVER
-        if abs(pending - self._rd_multiplier) >= 1e-9:
-            self._do_apply(eventtime, pending)
-        else:
-            self._pending_multiplier = None
-        return self.reactor.NEVER
+        self._last_rd_apply_at = now
+        new_rd = self._base_rd / multiplier
+        self.extruder_stepper.stepper.set_rotation_distance(new_rd)
+        self._dlog_throttled(
+            None, "rd_mult zone=%s" % self._current_zone, 0.25,
+            "rd_mult=%.4f rd=%.4f zone=%s",
+            multiplier, new_rd, self._current_zone)
 
     def _update_rotation_distance(self, eventtime):
         """Evaluate sensors and update rotation_distance multiplier."""
@@ -642,21 +963,41 @@ class Buffer:
             return
         zone = self._compute_zone()
         if zone is None:
-            self._handle_error(
-                "Sensor conflict: empty and full both triggered")
+            # Transient empty+full conflict: Klipper's buttons module
+            # dispatches edge callbacks serially across one MCU report,
+            # so a fast EMPTY->FULL transit can arrive as
+            # "full=True (set first) before empty=False (set next)" —
+            # _compute_zone sees both true and returns None.  Treat as
+            # a deferral; the next callback resolves it.  Only escalate
+            # if the conflict persists past control_interval (the
+            # control timer promotes it to _handle_error).
+            if self._conflict_since <= 0.0:
+                self._conflict_since = eventtime
+            self._dlog(eventtime,
+                       "transient sensor conflict — deferring")
             return
+        self._conflict_since = 0.0
 
         # Track zone transitions
         entered = zone != self._current_zone
         if entered:
-            if self.debug:
-                logging.info("buffer[%s] debug: zone %s -> %s"
-                             % (self.short_name, self._current_zone, zone))
+            # Throttled — adjacent-zone bouncing at a sensor boundary
+            # otherwise produces 40+ log lines per second.  The key
+            # encodes both endpoints so a true new edge (e.g.
+            # full_middle -> full) breaks through immediately.
+            self._dlog_throttled(
+                eventtime,
+                "zone %s->%s" % (self._current_zone, zone), 0.25,
+                "zone %s -> %s", self._current_zone, zone)
             self._prev_zone = self._current_zone
         self._current_zone = zone
 
-        # Ensure we're synced when auto-enabled
-        if self._synced_to is None and self._initial_fill_until <= 0.0:
+        # Ensure we're synced when auto-enabled.  Skip during extreme
+        # recovery — the recovery owns the unsynced state and will
+        # resync via _exit_extreme_recovery when the zone returns.
+        if (self._synced_to is None
+                and self._initial_fill_until <= 0.0
+                and self._extreme_recovery_active is None):
             self._sync()
 
         # Safety timeout tracking.  Edge-based arming on zone entry
@@ -670,43 +1011,78 @@ class Buffer:
         # the timer counts only post-print-start time, exactly as
         # be70969 intended.
         if zone in (ZONE_EMPTY, ZONE_FULL):
-            if entered:
+            in_active_recovery = self._extreme_recovery_active == zone
+            if entered and not in_active_recovery:
+                # Fresh entry to a safety zone — start the cumulative
+                # clock.  Skip during active same-zone recovery so a
+                # bounce out and back into the zone (e.g. empty <->
+                # empty_middle while chunks pump) doesn't reset the
+                # cap that's already counting from recovery_started_at.
                 self._safety_zone_start = eventtime
-                self._safety_escalated = False
             elif (self._safety_zone_start <= 0.0
-                    and self._is_printing()):
+                    and self._is_printing()
+                    and not in_active_recovery):
                 self._safety_zone_start = eventtime
-                self._safety_escalated = False
         else:
-            self._safety_zone_start = 0.0
-            self._safety_escalated = False
+            # Only clear when no recovery is in flight — empty <->
+            # empty_middle bouncing during recovery should not reset
+            # the cumulative cap (the recovery's per-attempt cap is
+            # measured from _recovery_started_at independently).
+            if self._extreme_recovery_active is None:
+                self._safety_zone_start = 0.0
 
         # Clear initial fill once filament reaches middle or beyond
         if (self._initial_fill_until > 0.0
                 and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
             self._initial_fill_until = 0.0
+            self._cancel_fill_timer()
             self._sync()
 
-        # Compute and apply multiplier
+        # Mid-recovery handling: detect exit conditions.  The recovery
+        # check timer also polls for these; this branch covers the
+        # sensor-callback path so we react immediately on the edge
+        # rather than waiting for the next 50 ms poll.
+        if self._extreme_recovery_active is not None:
+            active_zone = self._extreme_recovery_active
+            if active_zone == ZONE_EMPTY:
+                left_band = zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)
+            else:  # ZONE_FULL
+                left_band = zone not in (ZONE_FULL, ZONE_FULL_MIDDLE)
+            if left_band:
+                self._stop_recovery_vactual()
+                self._exit_extreme_recovery(eventtime, "reached-middle")
+            if self._extreme_recovery_active is not None:
+                # Still recovering — leave _rd_multiplier alone.
+                return
+
+        # Extreme zones go through VACTUAL recovery, not multiplier.
+        # Only enter recovery while actually printing — outside a print
+        # the user may be loading/unloading or manually drawing
+        # filament, and surprise active motion (EMPTY) or auto-drain
+        # (FULL) is unwanted.  This matches the safety-timeout policy
+        # which also only ticks while printing.
+        if (zone in (ZONE_FULL, ZONE_EMPTY)
+                and self._synced_to is not None
+                and self._is_printing()):
+            if zone == ZONE_EMPTY:
+                self._enter_empty_recovery(eventtime)
+            else:
+                self._enter_full_recovery(eventtime)
+            return
+
+        # Non-extreme zones: apply the drift-gain multiplier as usual,
+        # with 200 ms zone hysteresis to suppress sensor-bounce thrash.
+        # Bake the hysteresis here (rather than in _apply_multiplier)
+        # so that the multiplier itself is computed from a stable zone.
+        if zone != self._proposed_zone:
+            self._proposed_zone = zone
+            self._proposed_zone_at = eventtime
+            return
+        if eventtime - self._proposed_zone_at < 0.2:
+            return
         multiplier = self._zone_to_multiplier(zone)
-
-        # Fault escalation: if in safety zone too long, jump to the
-        # absolute fault multiplier.  Once escalated, the stronger
-        # value persists until the zone clears.
-        if self._safety_zone_start > 0.0:
-            if (not self._safety_escalated
-                    and eventtime - self._safety_zone_start
-                    >= self.fault_escalation_time):
-                self._safety_escalated = True
-            if self._safety_escalated:
-                if zone == ZONE_FULL:
-                    multiplier = self.fault_multiplier_low
-                elif zone == ZONE_EMPTY:
-                    multiplier = self.fault_multiplier_high
-
         if self._synced_to is not None:
-            self._apply_multiplier(multiplier, eventtime,
-                                   force=self._safety_escalated)
+            self._apply_multiplier(multiplier)
 
     # --- Initial fill ---
 
@@ -723,12 +1099,30 @@ class Buffer:
         self._unsync()
         self.state = STATE_FEEDING
         self.motor_direction = FORWARD
-        self._do_fill_chunk(eventtime)
+        next_wake = self._do_fill_chunk(eventtime)
+        if next_wake == self.reactor.NEVER:
+            return
+        if self._fill_timer is None:
+            self._fill_timer = self.reactor.register_timer(
+                self._do_fill_chunk, next_wake)
+        else:
+            self.reactor.update_timer(self._fill_timer, next_wake)
 
     def _do_fill_chunk(self, eventtime):
-        """Issue one fill chunk, then schedule the next via reactor."""
+        """Issue one fill chunk and return the next waketime, or
+        NEVER if the loop should terminate.  Pre-sidecar pattern
+        (commit 5d68d34): force_move.manual_move synchronously
+        enqueues onto the main toolhead and pays the dwell cost.
+        Outside a print (which is when this runs) the dwell is
+        invisible.
+
+        Serves as both the inline entry from _do_initial_fill and the
+        registered timer callback.  See _do_continuous_chunk for why
+        we return the next waketime instead of calling update_timer.
+        """
         # Abort: timeout expired
-        if self._initial_fill_until > 0.0 and eventtime >= self._initial_fill_until:
+        if (self._initial_fill_until > 0.0
+                and eventtime >= self._initial_fill_until):
             self._initial_fill_until = 0.0
             self.motor_direction = STOP
             logging.info("buffer[%s]: initial fill timeout"
@@ -737,7 +1131,7 @@ class Buffer:
                 "Buffer: initial fill timed out after %.0fs"
                 % self.initial_fill_timeout)
             self._sync()
-            return
+            return self.reactor.NEVER
         # Abort: filament reached middle sensor or beyond
         zone = self._compute_zone()
         if zone is not None and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE):
@@ -745,28 +1139,29 @@ class Buffer:
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
             self._sync()
-            return
+            return self.reactor.NEVER
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
-            return
+            return self.reactor.NEVER
         # Issue one chunk
         try:
             self.force_move.manual_move(
-                self.extruder_stepper.stepper, self._manual_chunk_dist,
+                self.extruder_stepper.stepper,
+                self._manual_chunk_dist,
                 self.manual_speed, self.manual_accel)
         except Exception as e:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
             self._sync()
-            return
-        # Schedule next chunk — reactor will process sensor callbacks
-        # between this return and the next _fill_chunk_cb invocation
-        self.reactor.register_callback(self._fill_chunk_cb)
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
+            self._manual_chunk_dist, self.manual_speed, self.manual_accel)
 
-    def _fill_chunk_cb(self, eventtime):
-        """Reactor callback: continue the fill if still active."""
-        self._do_fill_chunk(eventtime)
+    def _cancel_fill_timer(self):
+        if self._fill_timer is not None:
+            self.reactor.update_timer(
+                self._fill_timer, self.reactor.NEVER)
 
     # --- Control timer ---
 
@@ -838,6 +1233,18 @@ class Buffer:
                           STATE_ERROR, STATE_DISABLED):
             return eventtime + self.control_interval
 
+        # Persistent sensor conflict escalation.  _update_rotation_distance
+        # defers a transient empty+full conflict (out-of-order callbacks
+        # in one MCU report); if the conflict survives past
+        # control_interval it's a real wiring fault and must error.
+        if (self._conflict_since > 0.0
+                and eventtime - self._conflict_since
+                >= self.control_interval):
+            self._conflict_since = 0.0
+            self._handle_error(
+                "Sensor conflict: empty and full both triggered")
+            return eventtime + self.control_interval
+
         # Safety timeout check — only tick while printing.  When the
         # extruder is idle, the multiplier has no moves to act on, so
         # being in a safety zone is static, not worsening.  Clear the
@@ -865,15 +1272,24 @@ class Buffer:
         if self._synced_to is not None:
             self._update_rotation_distance(eventtime)
 
+        # Drain any rate-limit-deferred multiplier update.  Without
+        # this, a multiplier change that was rate-limited away during
+        # a print would linger until the next sensor edge.
+        if (self._pending_multiplier is not None
+                and eventtime - self._last_rd_apply_at >= 0.5):
+            self._apply_multiplier(self._pending_multiplier)
+
         return eventtime + self.control_interval
 
     def _do_safety_retract(self, eventtime):
         """Forced retract when full zone times out.
 
-        Unsyncs, issues a retract via force_move, then leaves the
-        stepper unsynced.  The next control timer cycle will re-sync
-        via _update_rotation_distance once the retract has completed
-        and print_time has advanced past the move.
+        Unsyncs, issues a retract via force_move.manual_move, then
+        leaves the stepper unsynced.  The next control timer cycle
+        will re-sync via _update_rotation_distance -> _sync() once
+        print_time has advanced past the move.  This pays a brief
+        toolhead dwell during a print — acceptable for a rare
+        fault-recovery path.
         """
         logging.info("buffer[%s]: full zone safety retract"
                      % self.short_name)
@@ -885,16 +1301,13 @@ class Buffer:
         self.motor_direction = BACK
         try:
             self.force_move.manual_move(
-                stepper, -self._manual_chunk_dist,
-                self.manual_speed, self.manual_accel)
+                stepper, -self._manual_chunk_dist, self.manual_speed,
+                self.manual_accel)
         except Exception as e:
             logging.warning("buffer[%s]: safety retract failed: %s"
                             % (self.short_name, e))
+            return
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
-        # Do NOT re-sync here — the retract move is still in the MCU's
-        # step buffer.  The next control timer cycle will re-sync via
-        # _update_rotation_distance -> _sync() once the move completes.
 
     # --- Button callbacks ---
 
@@ -1005,15 +1418,34 @@ class Buffer:
         self._manual_feed_full_start = 0.0
         self._continuous_feed_direction = direction
         self._continuous_feed_speed = speed
-        self._do_continuous_chunk(self.reactor.monotonic())
+        eventtime = self.reactor.monotonic()
+        next_wake = self._do_continuous_chunk(eventtime)
+        if next_wake == self.reactor.NEVER:
+            return
+        if self._continuous_timer is None:
+            self._continuous_timer = self.reactor.register_timer(
+                self._do_continuous_chunk, next_wake)
+        else:
+            self.reactor.update_timer(
+                self._continuous_timer, next_wake)
 
     def _do_continuous_chunk(self, eventtime):
-        """Issue one chunk of a continuous feed, schedule the next."""
+        """Issue one chunk of a continuous feed and return the next
+        waketime, or NEVER if the loop should terminate.
+
+        Serves as both the inline entry from _start_continuous_feed and
+        the registered timer callback.  Returning the next waketime
+        (rather than calling update_timer + returning NEVER) is the
+        only pattern that re-arms the timer in production Klipper:
+        update_timer is a no-op while a timer's callback is running,
+        and _check_timers unconditionally assigns the return value to
+        the timer's waketime.
+        """
         # Abort if state changed (stop, disable, error, button release)
         if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT):
-            return
+            return self.reactor.NEVER
         if self.force_move is None:
-            return
+            return self.reactor.NEVER
         stepper = self.extruder_stepper.stepper
         dist = self._manual_chunk_dist
         if self._continuous_feed_direction == BACK:
@@ -1025,17 +1457,23 @@ class Buffer:
         except Exception as e:
             logging.warning("buffer[%s]: continuous feed chunk failed: %s"
                             % (self.short_name, e))
-            return
-        # Schedule next chunk — reactor processes sensor callbacks between
-        self.reactor.register_callback(self._continuous_chunk_cb)
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
+            dist, self._continuous_feed_speed, self.manual_accel)
 
-    def _continuous_chunk_cb(self, eventtime):
-        self._do_continuous_chunk(eventtime)
+    def _cancel_continuous_timer(self):
+        if self._continuous_timer is not None:
+            self.reactor.update_timer(
+                self._continuous_timer, self.reactor.NEVER)
 
     def _stop_manual(self):
-        """Stop any pending manual move state."""
+        """Stop any pending manual move state.  Cancels the timer
+        explicitly to prevent the next scheduled chunk from firing
+        with stale state — the state guard in _do_continuous_chunk
+        is belt-and-suspenders on top of this."""
         self.motor_direction = STOP
         self._manual_feed_full_start = 0.0
+        self._cancel_continuous_timer()
 
     # --- Error handling ---
 
@@ -1055,7 +1493,6 @@ class Buffer:
         self.state = STATE_STOPPED if self.auto_enabled else STATE_IDLE
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
         if self.auto_enabled:
             self._sync()
 
@@ -1089,12 +1526,10 @@ class Buffer:
             "base_rotation_distance": round(self._base_rd, 4),
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
+            "recovery_speed": self.recovery_speed,
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
-            "multiplier_low": self.multiplier_low,
-            "multiplier_high": self.multiplier_high,
-            "fault_multiplier_low": self.fault_multiplier_low,
-            "fault_multiplier_high": self.fault_multiplier_high,
+            "extreme_recovery_active": self._extreme_recovery_active,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -1122,8 +1557,7 @@ class Buffer:
             "  Synced to: %s\n"
             "  Manual speed: %.1f mm/s  chunk: %.1f mm\n"
             "  Drift gain: %.3f\n"
-            "  Multiplier low/high: %.3f / %.3f\n"
-            "  Fault multiplier low/high: %.3f / %.3f\n"
+            "  Recovery active: %s\n"
             "  Printing: %s"
             % (
                 status["name"],
@@ -1143,10 +1577,7 @@ class Buffer:
                 status["manual_speed"],
                 status["manual_move_distance"],
                 status["drift_gain"],
-                status["multiplier_low"],
-                status["multiplier_high"],
-                status["fault_multiplier_low"],
-                status["fault_multiplier_high"],
+                status["extreme_recovery_active"] or "none",
                 status["is_printing"],
             )
         )
@@ -1159,7 +1590,6 @@ class Buffer:
         self.state = STATE_STOPPED
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._safety_escalated = False
         self._sync()
         gcmd.respond_info("Buffer: automatic control enabled")
 
@@ -1185,10 +1615,10 @@ class Buffer:
             self.state = STATE_MANUAL_FEED
             self.motor_direction = FORWARD
             self._manual_feed_full_start = 0.0
-            stepper = self.extruder_stepper.stepper
             try:
-                self.force_move.manual_move(stepper, dist, speed,
-                                            self.manual_accel)
+                self.force_move.manual_move(
+                    self.extruder_stepper.stepper,
+                    dist, speed, self.manual_accel)
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_FEED failed: %s"
                                 % (self.short_name, e))
@@ -1214,10 +1644,10 @@ class Buffer:
             self._unsync()
             self.state = STATE_MANUAL_RETRACT
             self.motor_direction = BACK
-            stepper = self.extruder_stepper.stepper
             try:
-                self.force_move.manual_move(stepper, -dist, speed,
-                                            self.manual_accel)
+                self.force_move.manual_move(
+                    self.extruder_stepper.stepper,
+                    -dist, speed, self.manual_accel)
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_RETRACT failed: %s"
                                 % (self.short_name, e))
@@ -1245,17 +1675,29 @@ class Buffer:
         self._continuous_feed_direction = BACK
         self._continuous_feed_speed = speed
         self._retract_until_clear = True
-        self._do_retract_until_clear_chunk(self.reactor.monotonic())
+        eventtime = self.reactor.monotonic()
+        next_wake = self._do_retract_until_clear_chunk(eventtime)
+        if next_wake != self.reactor.NEVER:
+            if self._retract_clear_timer is None:
+                self._retract_clear_timer = self.reactor.register_timer(
+                    self._do_retract_until_clear_chunk, next_wake)
+            else:
+                self.reactor.update_timer(
+                    self._retract_clear_timer, next_wake)
         gcmd.respond_info(
             "Buffer: retracting at %.1f mm/s until filament clears" % speed)
 
     def _do_retract_until_clear_chunk(self, eventtime):
-        """Issue one retract chunk, check material switch, schedule next."""
+        """Issue one retract chunk and return the next waketime, or
+        NEVER if the loop should terminate.  Serves as both the inline
+        entry from cmd_BUFFER_RETRACT_UNTIL_CLEAR and the registered
+        timer callback.  See _do_continuous_chunk for why we return
+        the next waketime instead of calling update_timer."""
         if not self._retract_until_clear:
-            return
+            return self.reactor.NEVER
         if self.state != STATE_MANUAL_RETRACT:
             self._retract_until_clear = False
-            return
+            return self.reactor.NEVER
         if not self.material_present:
             # Filament has cleared the switch
             self._retract_until_clear = False
@@ -1264,29 +1706,34 @@ class Buffer:
             self.auto_enabled = False
             self.gcode.respond_info(
                 "Buffer: retract complete - filament cleared")
-            return
+            return self.reactor.NEVER
         if self.force_move is None:
             self._retract_until_clear = False
-            return
-        stepper = self.extruder_stepper.stepper
+            return self.reactor.NEVER
         try:
             self.force_move.manual_move(
-                stepper, -self._manual_chunk_dist,
-                self._continuous_feed_speed, self.manual_accel)
+                self.extruder_stepper.stepper,
+                -self._manual_chunk_dist, self._continuous_feed_speed,
+                self.manual_accel)
         except Exception as e:
             logging.warning(
                 "buffer[%s]: retract_until_clear chunk failed: %s"
                 % (self.short_name, e))
             self._retract_until_clear = False
-            return
-        self.reactor.register_callback(self._retract_until_clear_cb)
+            return self.reactor.NEVER
+        return eventtime + self._chunk_move_duration(
+            self._manual_chunk_dist, self._continuous_feed_speed,
+            self.manual_accel)
 
-    def _retract_until_clear_cb(self, eventtime):
-        self._do_retract_until_clear_chunk(eventtime)
+    def _cancel_retract_clear_timer(self):
+        if self._retract_clear_timer is not None:
+            self.reactor.update_timer(
+                self._retract_clear_timer, self.reactor.NEVER)
 
     def cmd_BUFFER_STOP(self, gcmd):
         self._cancel_fill()
         self._retract_until_clear = False
+        self._cancel_retract_clear_timer()
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED
