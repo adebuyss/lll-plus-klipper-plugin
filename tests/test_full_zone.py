@@ -38,6 +38,9 @@ class TestFullZoneTimeout:
         t = 10.0
         reactor._monotonic = t
         enabled_buf._update_rotation_distance(t)
+        # Idle extruder -> FULL recovery DEFERs, so the buffer sits in
+        # ZONE_FULL and this timeout path is the escape that fires.
+        assert enabled_buf._extreme_recovery_active is None
 
         t += enabled_buf.full_safety_timeout + 1.0
         reactor._monotonic = t

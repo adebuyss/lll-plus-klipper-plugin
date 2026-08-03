@@ -12,14 +12,14 @@ digraph buffer_state_machine {
     // Buffer stepper is synced to the extruder via shared trapq.
     // EMPTY_MIDDLE / MIDDLE / FULL_MIDDLE apply a rotation_distance
     // multiplier (rd_new = base_rd / multiplier).  ZONE_EMPTY and
-    // ZONE_FULL go through the unsync-and-recover path instead — at
+    // ZONE_FULL go through the VACTUAL recovery path instead — at
     // the extremes we stop chasing with rotation_distance.
 
     subgraph cluster_empty {
-        label="EMPTY\nunsync + recovery" labeljust=c fontsize=11 penwidth=2
+        label="EMPTY\nVACTUAL recovery" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        e_recover [label=<UNSYNCED<BR/><FONT POINT-SIZE="8">chunked active fill</FONT><BR/><FONT POINT-SIZE="8">manual_speed or rate × 1.2</FONT>> fillcolor="#f4cccc"]
+        e_recover [label=<SYNCED<BR/><FONT POINT-SIZE="8">VACTUAL forward</FONT><BR/><FONT POINT-SIZE="8">recovery_speed</FONT>> fillcolor="#f4cccc"]
     }
 
     subgraph cluster_empty_middle {
@@ -44,10 +44,10 @@ digraph buffer_state_machine {
     }
 
     subgraph cluster_full {
-        label="FULL\nunsync + recovery" labeljust=c fontsize=11 penwidth=2
+        label="FULL\nVACTUAL recovery" labeljust=c fontsize=11 penwidth=2
         style="filled,rounded" color="#ea9999" fillcolor="#fce8e8"
 
-        f_recover [label=<UNSYNCED<BR/><FONT POINT-SIZE="8">passive drain</FONT><BR/><FONT POINT-SIZE="8">(needs forward extruder)</FONT>> fillcolor="#f4cccc"]
+        f_recover [label=<SYNCED<BR/><FONT POINT-SIZE="8">VACTUAL reverse 1 mm/s</FONT><BR/><FONT POINT-SIZE="8">(needs forward extruder)</FONT>> fillcolor="#f4cccc"]
         f_defer  [label=<SYNCED<BR/><FONT POINT-SIZE="8">DEFER (extruder idle\nor retracting)</FONT>> fillcolor="#fce5cd"]
         f_retract [label=<RETRACT<BR/><FONT POINT-SIZE="8">unsync + force_move</FONT>> fillcolor="#cc0000" fontcolor=white]
     }
@@ -64,7 +64,7 @@ digraph buffer_state_machine {
     // (callback-driven via sensor edges; no waiting on the 0.5 s
     // control_interval tick).
 
-    e_recover -> m_neutral [label="recovery exits at\nMIDDLE → resync at 1.0" style=dashed]
+    e_recover -> m_neutral [label="recovery exits at\nMIDDLE" style=dashed]
     e_recover -> em_drift  [label="leaves EMPTY but\nnot at MIDDLE yet" style=dashed]
 
     em_drift -> e_recover  [label="empty triggers\n(forward / idle\n/ retracting)" style=dashed]
@@ -77,9 +77,10 @@ digraph buffer_state_machine {
     fm_drift -> f_recover [label="middle clears\n(extruder forward)" style=dashed]
     fm_drift -> f_defer   [label="middle clears\n(extruder idle/back)" style=dashed]
 
-    f_recover -> m_neutral [label="recovery exits at\nMIDDLE → resync at 1.0" style=dashed]
+    // NB: entry-only gating — an in-flight FULL recovery exits at the
+    // band boundary or extreme_recovery_timeout, not on extruder stop.
+    f_recover -> m_neutral [label="recovery exits at\nMIDDLE" style=dashed]
     f_recover -> fm_drift  [label="leaves FULL but\nnot at MIDDLE yet" style=dashed]
-    f_recover -> f_defer   [label="extruder stops/\nreverses mid-recovery" style=dashed]
 
     f_defer  -> f_recover  [label="extruder begins\nforward consumption" style=dashed]
     f_defer  -> m_neutral  [label="full clears +\nmiddle triggers" style=dashed]

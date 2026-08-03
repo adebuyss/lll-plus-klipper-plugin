@@ -44,6 +44,26 @@ _VACTUAL_USTEP_PER_LSB = 0.715
 # reactor-tick cost is trivial.
 _RECOVERY_POLL_INTERVAL = 0.05
 
+# FULL-recovery entry gate: minimum *signed* extruder rate (mm/s)
+# that counts as forward consumption.  Signed on purpose — a
+# retracting extruder (negative rate) must defer just like an idle
+# one; draining the buffer while the extruder pulls back would fight
+# it.  0.1 mm/s sits well below the slowest real print consumption
+# (~0.8-2 mm/s of 1.75 mm filament on fine profiles) and well above
+# an idle extruder, whose commanded position is exactly static so
+# the computed rate is exactly 0.  Restores the FULL gate that the
+# VACTUAL rewrite (cc94963) deleted: without it, a buffer synced at
+# full extend with the filament parked at the toolhead (post
+# manual-feed auto-stop) is drained out of FULL over and over and
+# the manual_feed_full_timeout stop can never fire.
+_EXTRUDER_RATE_IDLE_EPS = 0.1
+
+# Minimum eventtime delta for a fresh extruder-rate sample.  Calls
+# spaced closer than this reuse the cached rate instead of
+# collapsing to 0 (e.g. a sensor-edge call landing on the same tick
+# as the control-timer refresh).
+_RATE_SAMPLE_MIN_DT = 0.05
+
 # State machine transitions:
 #   DISABLED -> IDLE          on klippy:ready
 #   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
@@ -252,6 +272,13 @@ class Buffer:
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
 
+        # Extruder-consumption sampling for the FULL-recovery gate.
+        # (last_eventtime, last_commanded_pos) or None until primed;
+        # the cached rate is returned for close-spaced calls (see
+        # _RATE_SAMPLE_MIN_DT).
+        self._ext_rate_sample = None
+        self._ext_rate_cached = 0.0
+
         # Drift-correction rate-limit + zone hysteresis state.
         # _apply_multiplier rate-limits to 2 Hz during printing to
         # avoid stacked no-flush set_rotation_distance calls when a
@@ -395,6 +422,12 @@ class Buffer:
                 self.toolhead.get_extruder().get_name())
         except Exception:
             self._last_active_extruder = None
+        # Prime the extruder-rate sample so the first FULL-gate
+        # decision computes a real slope instead of collapsing to 0
+        # (recorded pitfall from the cc94963 design history).
+        self._ext_rate_sample = None
+        self._ext_rate_cached = 0.0
+        self._estimated_extruder_rate(self.reactor.monotonic())
         # Transition to IDLE
         self.state = STATE_IDLE
         # Look up print_stats
@@ -710,6 +743,15 @@ class Buffer:
         otherwise unsync.  For unbound buffers: re-sync to whatever is
         now active.  No-op while disabled, errored, or auto-disabled.
         """
+        # Reset + re-prime the rate sample: a sample captured from the
+        # old extruder's stepper computes a bogus delta against the new
+        # extruder's commanded position after a T0/T1 swap (recorded
+        # pitfall from the cc94963 design history).  Before the state
+        # guards on purpose — the sample is stale regardless of whether
+        # we act on the tool change.
+        self._ext_rate_sample = None
+        self._ext_rate_cached = 0.0
+        self._estimated_extruder_rate(self.reactor.monotonic())
         if self.state in (STATE_DISABLED, STATE_ERROR):
             return
         if not self.auto_enabled:
@@ -829,6 +871,45 @@ class Buffer:
     # FULL recovery:  reverse VACTUAL at 1 mm/s (slow drain — fast
     # enough to recover within timeout, slow enough not to fight a
     # forward-feeding extruder).
+
+    def _get_extruder_commanded_pos(self):
+        """Commanded position (mm) of the ACTIVE extruder's stepper,
+        or None if unreadable (no toolhead yet, dummy extruder,
+        extruder without a stepper).  None fails toward "idle" in
+        _estimated_extruder_rate."""
+        try:
+            extruder = self.toolhead.get_extruder()
+            return (extruder.extruder_stepper.stepper
+                    .get_commanded_position())
+        except Exception:
+            return None
+
+    def _estimated_extruder_rate(self, eventtime):
+        """Signed mm/s rate of the active extruder, sampled across
+        consecutive eventtimes.
+
+        Gates FULL recovery entry: the reverse drain only makes sense
+        against an extruder that is actively consuming filament.  An
+        idle or retracting extruder defers so full_safety_timeout ->
+        _do_safety_retract remains the hard escape (the pre-cc94963
+        design this resurrects).  Returns 0.0 when the position can't
+        be read — failing toward "idle" is the safe direction: the
+        buffer sits at FULL instead of surprise-draining it.
+        """
+        pos = self._get_extruder_commanded_pos()
+        if pos is None:
+            return 0.0
+        if self._ext_rate_sample is None:
+            self._ext_rate_sample = (eventtime, pos)
+            return self._ext_rate_cached
+        last_t, last_pos = self._ext_rate_sample
+        dt = eventtime - last_t
+        if dt < _RATE_SAMPLE_MIN_DT:
+            return self._ext_rate_cached
+        rate = (pos - last_pos) / dt
+        self._ext_rate_sample = (eventtime, pos)
+        self._ext_rate_cached = rate
+        return rate
 
     def _enter_empty_recovery(self, eventtime):
         if self._extreme_recovery_active is not None:
@@ -1061,13 +1142,34 @@ class Buffer:
         # filament, and surprise active motion (EMPTY) or auto-drain
         # (FULL) is unwanted.  This matches the safety-timeout policy
         # which also only ticks while printing.
+        #
+        # FULL recovery is additionally gated on the extruder actively
+        # consuming forward: the reverse drain only makes sense
+        # against a consuming extruder.  Idle or retracting defers,
+        # leaving the already-armed _safety_zone_start ticking so
+        # full_safety_timeout -> _do_safety_retract stays the hard
+        # escape.  Without this gate a buffer synced at full extend
+        # with the filament parked at the toolhead (post manual-feed
+        # auto-stop, or an initial fill that overshoots into FULL)
+        # enters a drain/re-extend loop and the
+        # manual_feed_full_timeout stop can never fire.  EMPTY stays
+        # ungated — forward-feeding an empty buffer is always desired.
+        # (Restores the pre-VACTUAL FULL gate from cc94963.)
         if (zone in (ZONE_FULL, ZONE_EMPTY)
                 and self._synced_to is not None
                 and self._is_printing()):
             if zone == ZONE_EMPTY:
                 self._enter_empty_recovery(eventtime)
-            else:
+                return
+            rate = self._estimated_extruder_rate(eventtime)
+            if rate > _EXTRUDER_RATE_IDLE_EPS:
                 self._enter_full_recovery(eventtime)
+            else:
+                self._dlog_throttled(
+                    eventtime, "full-defer", 2.0,
+                    "FULL recovery deferred: extruder rate %.3f mm/s "
+                    "<= %.2f (idle/retracting); full_safety_timeout "
+                    "remains armed", rate, _EXTRUDER_RATE_IDLE_EPS)
             return
 
         # Non-extreme zones: apply the drift-gain multiplier as usual,
@@ -1177,6 +1279,16 @@ class Buffer:
             if current_extruder != self._last_active_extruder:
                 self._handle_extruder_change(current_extruder)
                 self._last_active_extruder = current_extruder
+        # Keep the extruder-rate sample <= control_interval old.
+        # Without this the FULL gate would compute a long-window
+        # average at zone entry, and a manual extruder move minutes
+        # earlier (e.g. LOAD_FILAMENT priming the hotend) could leak
+        # a stale positive rate into the decision — exactly the
+        # load-flow scenario the gate exists to protect.  Runs before
+        # the MANUAL_FEED/MANUAL_RETRACT early returns on purpose so
+        # the sample stays fresh across a manual feed's auto-stop.
+        if self.toolhead is not None:
+            self._estimated_extruder_rate(eventtime)
         # Manual feed auto-stop on sustained full sensor.  Skip for
         # button-held feed (user's explicit intent — release to stop).
         # Preserves auto_enabled so the buffer returns to normal control

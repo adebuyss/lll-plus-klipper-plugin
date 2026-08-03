@@ -52,15 +52,30 @@ class TestEmptyZone:
 
 class TestFullZone:
     def test_full_enters_vactual_recovery(self, printing_buf, reactor):
-        # FULL recovery enters unconditionally — slow reverse VACTUAL
-        # drains regardless of extruder direction (no "defer if idle"
-        # branch any more).
+        # FULL recovery entry is gated on the extruder actively
+        # consuming forward — the reverse drain only makes sense
+        # against a consuming extruder.  Simulate a printing extruder
+        # so the gate passes.
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
         set_sensors(printing_buf, full=True)
         reactor._monotonic = 1.0
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._current_zone == ZONE_FULL
         assert printing_buf._extreme_recovery_active == ZONE_FULL
         assert printing_buf._synced_to is not None
+
+    def test_full_defers_when_extruder_idle(self, printing_buf, reactor):
+        # Idle extruder (static commanded position) -> FULL recovery
+        # DEFERs: the buffer stays synced at full extend so the
+        # sustained-full stop and full_safety_timeout escape can act.
+        set_sensors(printing_buf, full=True)
+        reactor._monotonic = 1.0
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._current_zone == ZONE_FULL
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._synced_to is not None
+        # The hard escape stays armed.
+        assert printing_buf._safety_zone_start == 1.0
 
 
 class TestEmptyMiddleZone:

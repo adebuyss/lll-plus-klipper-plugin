@@ -264,7 +264,12 @@ class TestVactualRecoveryEntry:
         assert 9500 < abs(vactual_writes[-1]) < 11000
 
     def test_full_entry_writes_reverse_vactual(
-            self, printing_buf, vactual_writes):
+            self, printing_buf, vactual_writes, reactor):
+        # Forward-consuming extruder so the FULL gate passes.  The
+        # reactor clock must track the eventtime — the mock extruder
+        # position derives from reactor.monotonic().
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+        reactor._monotonic = 1.0
         set_sensors(printing_buf, full=True)
         printing_buf._update_rotation_distance(1.0)
         assert printing_buf._extreme_recovery_active == ZONE_FULL
@@ -347,6 +352,8 @@ class TestVactualRecoveryExit:
         normal forward STEP/DIR motion under this wiring, so the nudge
         is functionally redundant for FULL exit — but the sequence
         must still run cleanly without leaving VACTUAL stuck."""
+        # Forward-consuming extruder so the FULL gate passes.
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
         set_sensors(printing_buf, full=True)
         reactor._monotonic = 1.0
         printing_buf._update_rotation_distance(1.0)
@@ -539,6 +546,92 @@ class TestRecoveryGatedOnPrinting:
         set_sensors(enabled_buf, full=True)
         enabled_buf._update_rotation_distance(1.0)
         assert enabled_buf._extreme_recovery_active is None
+        assert vactual_writes == []
+
+
+class TestFullRecoveryGatedOnExtruderConsumption:
+    """FULL recovery must only enter while the extruder is actively
+    consuming forward.  An idle or retracting extruder DEFERs so the
+    buffer stays parked at full extend (the load-to-toolhead flow)
+    and full_safety_timeout -> _do_safety_retract remains the hard
+    escape.  Regression guard for the drain/re-extend loop that
+    defeated the manual_feed_full_timeout stop.
+
+    NB: the mock extruder position derives from reactor.monotonic()
+    (see conftest _MockExtrusionStepper), so every test keeps
+    reactor._monotonic in step with the eventtime it passes in."""
+
+    def test_full_defers_when_extruder_idle(
+            self, printing_buf, vactual_writes, reactor):
+        # No set_rate: commanded position is static -> rate 0.
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert vactual_writes == []
+        # Still synced — defer is passive, not an unsync.
+        assert printing_buf._synced_to is not None
+        # The hard escape stays armed.
+        assert printing_buf._safety_zone_start == 1.0
+
+    def test_full_enters_when_extruder_consuming(
+            self, printing_buf, vactual_writes, reactor):
+        printing_buf.toolhead.get_extruder().set_rate(5.0, t0=0.0)
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active == ZONE_FULL
+        # Reverse drain -> positive VACTUAL (inverted polarity).
+        assert vactual_writes[-1] > 0
+
+    def test_full_defers_when_extruder_retracting(
+            self, printing_buf, vactual_writes, reactor):
+        # Signed gate: a retracting extruder must defer just like an
+        # idle one — draining the buffer while the extruder pulls
+        # back would fight it.
+        printing_buf.toolhead.get_extruder().set_rate(-5.0, t0=0.0)
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert vactual_writes == []
+
+    def test_deferred_full_still_escalates_to_safety_retract(
+            self, printing_buf, reactor, force_move):
+        # Defer-then-escalate is the complete fallback chain: the
+        # deferred FULL keeps _safety_zone_start ticking, and
+        # full_safety_timeout fires _do_safety_retract.
+        reactor._monotonic = 1.0
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.0)
+        assert printing_buf._extreme_recovery_active is None
+        assert printing_buf._safety_zone_start == 1.0
+
+        reactor._monotonic = 1.0 + printing_buf.full_safety_timeout + 1.0
+        printing_buf._control_timer_cb(reactor._monotonic)
+        assert printing_buf._extreme_recovery_active is None
+        # Safety retract issued a negative force_move distance.
+        assert force_move.moves[-1][1] < 0
+
+    def test_gate_uses_fresh_rate_after_stale_extruder_move(
+            self, printing_buf, vactual_writes, reactor):
+        # A manual extruder move minutes before FULL entry must not
+        # leak a stale positive rate into the gate decision.  The
+        # control timer refreshes the sample every tick so the entry
+        # decision sees a <= control_interval window.  Without that
+        # refresh, the rate here would average (50 mm - 0 mm) since
+        # boot and enter recovery on a bogus 31 mm/s.
+        stepper = (printing_buf.toolhead.get_extruder()
+                   .extruder_stepper.stepper)
+        stepper._position = 50.0  # extruder moved while zone was calm
+        reactor._monotonic = 1.0
+        printing_buf._control_timer_cb(1.0)   # samples the jump
+        reactor._monotonic = 1.5
+        printing_buf._control_timer_cb(1.5)   # fresh window: rate 0
+        reactor._monotonic = 1.6
+        set_sensors(printing_buf, full=True)
+        printing_buf._update_rotation_distance(1.6)
+        assert printing_buf._extreme_recovery_active is None
         assert vactual_writes == []
 
 
