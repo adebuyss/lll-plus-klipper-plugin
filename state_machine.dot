@@ -84,7 +84,7 @@ digraph buffer_state_machine {
     f_defer  -> f_recover  [label="extruder begins\nforward consumption" style=dashed]
     f_defer  -> m_neutral  [label="full clears +\nmiddle triggers" style=dashed]
 
-    f_retract -> m_neutral [label="re-sync after\nretract" style=dashed]
+    f_retract -> m_neutral [label="completion timer → STOPPED,\ncontrol timer re-syncs" style=dashed]
 
     // ===== Sensor conflict =====
 

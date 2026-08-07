@@ -1011,3 +1011,20 @@ class TestReEnableConsumesLatch:
         assert vactual_writes[before:] == []
         assert printing_buf._extreme_recovery_active == ZONE_EMPTY
         assert printing_buf.state == STATE_FEEDING
+
+
+class TestResyncAndRecoverySameTick:
+    """With the control timer's unconditional update call, the
+    auto-sync inside _update_rotation_distance restores sync within
+    one control_interval of any unsync — and extreme recovery can
+    enter on the very tick that re-syncs (the synced gate passes
+    because _sync ran earlier in the same call)."""
+
+    def test_resync_and_empty_recovery_same_tick(
+            self, printing_buf, vactual_writes):
+        printing_buf._unsync()
+        assert printing_buf._synced_to is None
+        set_sensors(printing_buf, empty=True)
+        printing_buf._update_rotation_distance(5.0)
+        assert printing_buf._synced_to is not None
+        assert printing_buf._extreme_recovery_active == ZONE_EMPTY

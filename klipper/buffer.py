@@ -317,6 +317,12 @@ class Buffer:
         self._fill_timer = None
         self._continuous_timer = None
         self._retract_clear_timer = None
+        # Completion timer for one-shot timed moves: fixed-distance
+        # BUFFER_FEED/RETRACT and the safety retract.  Fires at
+        # move-end (chunk_move_duration) to return the state machine
+        # to STOPPED/IDLE — without it those states were terminal
+        # until a manual BUFFER_STOP.
+        self._move_done_timer = None
 
         # Register events.  klippy:disconnect is critical: VACTUAL
         # persists across host disconnect and the TMC will keep
@@ -1170,9 +1176,14 @@ class Buffer:
         # Ensure we're synced when auto-enabled.  Skip during extreme
         # recovery — the recovery owns the unsynced state and will
         # resync via _exit_extreme_recovery when the zone returns.
+        # Material gate: after a runout _material_callback unsyncs but
+        # leaves auto_enabled=True in IDLE; filament is still moving
+        # during the runout, so without this gate the very next hall
+        # edge would re-sync a buffer that has nothing to feed.
         if (self._synced_to is None
                 and self._initial_fill_until <= 0.0
-                and self._extreme_recovery_active is None):
+                and self._extreme_recovery_active is None
+                and self.material_present):
             self._sync()
 
         # Safety timeout tracking.  Edge-based arming on zone entry
@@ -1236,6 +1247,13 @@ class Buffer:
         # filament, and surprise active motion (EMPTY) or auto-drain
         # (FULL) is unwanted.  This matches the safety-timeout policy
         # which also only ticks while printing.
+        #
+        # The synced gate below is deliberate: recovery assumes the
+        # sync-follow context.  Since the control timer now calls
+        # _update_rotation_distance unconditionally, the auto-sync
+        # above restores sync within one control_interval of any
+        # unsync (material permitting), so recovery can enter on the
+        # very tick that re-syncs — worst-case latency is one tick.
         if (zone in (ZONE_FULL, ZONE_EMPTY)
                 and self._synced_to is not None
                 and self._is_printing()):
@@ -1443,9 +1461,17 @@ class Buffer:
                     self._do_safety_retract(eventtime)
                     return eventtime + self.control_interval
 
-        # Periodic re-evaluation of rotation_distance
-        if self._synced_to is not None:
-            self._update_rotation_distance(eventtime)
+        # Periodic re-evaluation of rotation_distance.  Called
+        # UNCONDITIONALLY — the auto-sync inside it is the only path
+        # that restores sync after a safety retract or manual unsync,
+        # and gating this call on being synced (the old behavior) made
+        # re-sync depend entirely on a lucky sensor edge.  Upstream
+        # guards in this timer already filter MANUAL_* (early
+        # returns), not-auto-enabled, and ERROR/DISABLED, so the
+        # reachable states here are IDLE, FEEDING, STOPPED and
+        # RETRACTING; the auto-sync itself is additionally
+        # material-gated.
+        self._update_rotation_distance(eventtime)
 
         # Drain any rate-limit-deferred multiplier update.  Without
         # this, a multiplier change that was rate-limited away during
@@ -1459,12 +1485,13 @@ class Buffer:
     def _do_safety_retract(self, eventtime):
         """Forced retract when full zone times out.
 
-        Unsyncs, issues a retract via force_move.manual_move, then
-        leaves the stepper unsynced.  The next control timer cycle
-        will re-sync via _update_rotation_distance -> _sync() once
-        print_time has advanced past the move.  This pays a brief
-        toolhead dwell during a print — acceptable for a rare
-        fault-recovery path.
+        Unsyncs, issues a retract via force_move.manual_move, and arms
+        the shared completion timer: when the move's duration elapses,
+        _timed_move_done_cb restores RETRACTING -> STOPPED, and the
+        control timer's unconditional _update_rotation_distance call
+        then re-syncs (STOPPED -> FEEDING) within one
+        control_interval.  This pays a brief toolhead dwell during a
+        print — acceptable for a rare fault-recovery path.
         """
         logging.info("buffer[%s]: full zone safety retract"
                      % self.short_name)
@@ -1474,6 +1501,12 @@ class Buffer:
         self._unsync()
         self.state = STATE_RETRACTING
         self.motor_direction = BACK
+        # Armed before the move so a raising manual_move still exits
+        # RETRACTING instead of leaving it terminal.
+        self._arm_move_done_timer(
+            eventtime + self._chunk_move_duration(
+                self._manual_chunk_dist, self.manual_speed,
+                self.manual_accel))
         try:
             self.force_move.manual_move(
                 stepper, -self._manual_chunk_dist, self.manual_speed,
@@ -1588,6 +1621,10 @@ class Buffer:
         (retract), BUFFER_STOP, or button release.
         """
         self._cancel_fill()
+        # A pending fixed-move completion shares the MANUAL_* states,
+        # so the state guard alone would NOT protect this session —
+        # a stale fire would kill a button-held feed mid-hold.
+        self._cancel_move_done_timer()
         self._unsync()
         if direction == FORWARD:
             self.state = STATE_MANUAL_FEED
@@ -1646,13 +1683,58 @@ class Buffer:
                 self._continuous_timer, self.reactor.NEVER)
 
     def _stop_manual(self):
-        """Stop any pending manual move state.  Cancels the timer
-        explicitly to prevent the next scheduled chunk from firing
-        with stale state — the state guard in _do_continuous_chunk
-        is belt-and-suspenders on top of this."""
+        """Stop any pending manual move state.  Cancels the timers
+        explicitly to prevent the next scheduled chunk (or a pending
+        fixed-move completion) from firing with stale state — the
+        state guards in the callbacks are belt-and-suspenders on top
+        of this."""
         self.motor_direction = STOP
         self._manual_feed_full_start = 0.0
         self._cancel_continuous_timer()
+        self._cancel_move_done_timer()
+
+    # --- Timed-move completion ---
+
+    def _arm_move_done_timer(self, wake):
+        if self._move_done_timer is None:
+            self._move_done_timer = self.reactor.register_timer(
+                self._timed_move_done_cb, wake)
+        else:
+            self.reactor.update_timer(self._move_done_timer, wake)
+
+    def _cancel_move_done_timer(self):
+        if self._move_done_timer is not None:
+            self.reactor.update_timer(
+                self._move_done_timer, self.reactor.NEVER)
+
+    def _timed_move_done_cb(self, eventtime):
+        """One-shot completion for fixed-distance manual moves and the
+        safety retract.  Restores the state machine when the move's
+        real-time duration has elapsed; any takeover that changed
+        state in the meantime (error, disable, runout, a fresh
+        continuous feed) makes this a no-op via the state guard.
+
+        When auto-enabled and still unsynced, deliberately do NOT call
+        _sync() here — the control timer's unconditional
+        _update_rotation_distance call re-syncs within one
+        control_interval, with the material gate applied.  When a
+        control tick already re-synced mid-move (possible when
+        control_interval < move duration), promote directly to
+        FEEDING: _sync() only promotes on the STOPPED->synced edge,
+        so without this the buffer would sit synced-but-STOPPED
+        indefinitely."""
+        if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
+                              STATE_RETRACTING):
+            return self.reactor.NEVER
+        self.motor_direction = STOP
+        if not self.auto_enabled:
+            self.state = STATE_IDLE
+            return self.reactor.NEVER
+        self.state = STATE_STOPPED
+        if self._synced_to is not None:
+            self.state = STATE_FEEDING
+            self.motor_direction = FORWARD
+        return self.reactor.NEVER
 
     # --- Error handling ---
 
@@ -1839,6 +1921,13 @@ class Buffer:
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_FEED failed: %s"
                                 % (self.short_name, e))
+            # Armed even when manual_move raised — the completion
+            # restores STOPPED/IDLE either way instead of stranding
+            # the state machine in MANUAL_FEED forever.
+            self._arm_move_done_timer(
+                self.reactor.monotonic()
+                + self._chunk_move_duration(dist, speed,
+                                            self.manual_accel))
             gcmd.respond_info(
                 "Buffer: feeding %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -1868,6 +1957,11 @@ class Buffer:
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_RETRACT failed: %s"
                                 % (self.short_name, e))
+            # See cmd_BUFFER_FEED: completion restores STOPPED/IDLE.
+            self._arm_move_done_timer(
+                self.reactor.monotonic()
+                + self._chunk_move_duration(dist, speed,
+                                            self.manual_accel))
             gcmd.respond_info(
                 "Buffer: retracting %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -1886,6 +1980,9 @@ class Buffer:
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
         self._cancel_fill()
+        # Same shared-state hazard as _start_continuous_feed: this
+        # loop lives in MANUAL_RETRACT too.
+        self._cancel_move_done_timer()
         self._unsync()
         self.state = STATE_MANUAL_RETRACT
         self.motor_direction = BACK

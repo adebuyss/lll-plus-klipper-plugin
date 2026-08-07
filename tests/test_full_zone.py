@@ -4,6 +4,8 @@ import pytest
 from conftest import (
     ZONE_FULL,
     ZONE_FULL_MIDDLE,
+    STATE_RETRACTING,
+    STATE_STOPPED,
     set_sensors,
 )
 
@@ -156,3 +158,51 @@ class TestFullEnteredBeforePrinting:
         reactor._monotonic = t
         enabled_buf._update_rotation_distance(t)
         assert enabled_buf._safety_zone_start == 0.0
+
+
+class TestSafetyRetractCompletion:
+    """RETRACTING is no longer terminal: the shared completion timer
+    restores STOPPED after the move duration, and the control timer's
+    unconditional update call re-syncs (STOPPED -> FEEDING) within one
+    control_interval."""
+
+    def test_retracting_becomes_stopped_after_move_duration(
+            self, printing_buf, reactor):
+        """Completion step in isolation: fire the done callback
+        directly (no control tick in between) — unsynced completion
+        lands at STOPPED."""
+        from conftest import STOP
+        reactor._monotonic = 10.0
+        printing_buf._do_safety_retract(10.0)
+        assert printing_buf.state == STATE_RETRACTING
+        assert printing_buf._synced_to is None
+        printing_buf._timed_move_done_cb(10.4)  # > ~0.28 s duration
+        assert printing_buf.state == STATE_STOPPED
+        assert printing_buf.motor_direction == STOP
+
+    def test_full_pipeline_resyncs_after_safety_retract(
+            self, printing_buf, reactor):
+        """End to end via the reactor: done timer AND control timer
+        both fire during the advance — RETRACTING resolves all the
+        way back to synced FEEDING with no manual intervention."""
+        from conftest import STATE_FEEDING
+        reactor._monotonic = 10.0
+        printing_buf._do_safety_retract(10.0)
+        reactor.advance_time(0.4)
+        assert printing_buf._synced_to is not None
+        assert printing_buf.state == STATE_FEEDING
+
+    def test_retracting_promotes_to_feeding_if_resynced_mid_move(
+            self, printing_buf, reactor):
+        from conftest import STATE_FEEDING
+        reactor._monotonic = 10.0
+        printing_buf._do_safety_retract(10.0)
+        # A control tick lands mid-move (control_interval < move
+        # duration in non-default configs) and re-syncs first.
+        printing_buf._update_rotation_distance(10.1)
+        assert printing_buf._synced_to is not None
+        assert printing_buf.state == STATE_RETRACTING
+        reactor.advance_time(0.4)
+        # _sync only promotes on the STOPPED edge, so the completion
+        # callback must promote directly.
+        assert printing_buf.state == STATE_FEEDING

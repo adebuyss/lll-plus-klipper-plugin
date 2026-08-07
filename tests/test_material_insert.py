@@ -65,3 +65,37 @@ class TestMaterialRemoval:
         reactor._monotonic = 10.0
         buttons.callbacks["PE3"](10.0, 0)
         assert buf.material_present is False
+
+
+class TestRunoutNoResync:
+    """After a runout the buffer must stay unsynced until filament is
+    re-inserted: _material_callback leaves auto_enabled=True in IDLE,
+    and filament is still moving during the runout, so without the
+    material gate the very next hall edge would re-sync a buffer with
+    nothing to feed."""
+
+    def test_runout_hall_edge_does_not_resync(
+            self, enabled_buf, buttons, reactor):
+        from conftest import trigger_sensor
+        enabled_buf.material_present = True
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE3"](10.0, 0)  # runout
+        assert enabled_buf._synced_to is None
+        trigger_sensor(buttons, "PE1", True, 10.1)  # middle edge
+        assert enabled_buf._synced_to is None
+        assert enabled_buf.state == STATE_IDLE
+
+    def test_runout_control_tick_does_not_resync(
+            self, enabled_buf, buttons, reactor):
+        from conftest import set_sensors
+        vactual_writes = (
+            enabled_buf.printer.tmc2208.mcu_tmc.vactual_writes)
+        enabled_buf.material_present = True
+        enabled_buf._print_stats.state = "printing"
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE3"](10.0, 0)  # runout mid-print
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._control_timer_cb(10.5)
+        # No re-sync, and no surprise EMPTY recovery without filament.
+        assert enabled_buf._synced_to is None
+        assert vactual_writes == []

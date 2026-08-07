@@ -222,10 +222,18 @@ Earlier versions chased extreme zones by jamming `rotation_distance` to absolute
 | any (not ERROR)    | MANUAL_FEED    | `BUFFER_FEED` or feed button press               |
 | any (not ERROR)    | MANUAL_RETRACT | `BUFFER_RETRACT` or retract button press         |
 | MANUAL_*           | STOPPED/IDLE   | Button release                                   |
+| MANUAL_*           | STOPPED/IDLE   | Fixed-distance `BUFFER_FEED/RETRACT DIST=n` move completes |
+| STOPPED/FEEDING    | RETRACTING     | Full-zone safety retract (`full_safety_timeout`) |
+| RETRACTING         | STOPPED        | Retract move duration elapses (completion timer) |
 | any (not ERROR)    | STOPPED/IDLE   | Both buttons pressed (toggles auto-enable)       |
 | any                | ERROR          | Sensor conflict, forward timeout, safety timeout |
 | ERROR              | STOPPED/IDLE   | `BUFFER_CLEAR_ERROR` or 2s both-button hold      |
 | any                | DISABLED       | `BUFFER_DISABLE` or `klippy:shutdown`            |
+
+After a runout the buffer stays **IDLE and unsynced** until filament is re-inserted — hall-sensor
+edges during the runout no longer re-sync it. After a safety retract or a fixed-distance manual
+move, the control timer re-syncs automatically within one `control_interval` (no `BUFFER_STOP`
+needed).
 
 ## Multi-Buffer / Multi-Extruder Support
 

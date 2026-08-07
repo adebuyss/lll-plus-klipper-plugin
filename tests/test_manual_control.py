@@ -330,3 +330,80 @@ class TestButtonHeldOverridesAutoStop:
         assert enabled_buf.auto_enabled is True
         # State should have returned to STOPPED/FEEDING via _sync().
         assert enabled_buf.state in (STATE_STOPPED, STATE_FEEDING)
+
+
+class TestFixedMoveCompletion:
+    """Fixed-distance BUFFER_FEED/RETRACT (DIST>0) previously stranded
+    the state machine in MANUAL_* forever — no completion callback,
+    and sensor callbacks exclude manual states.  The shared completion
+    timer restores STOPPED/IDLE after the move's real duration."""
+
+    def _feed(self, b, dist=20.0):
+        from conftest import MockGcmd
+        b.cmd_BUFFER_FEED(MockGcmd(params={"DIST": dist}))
+        return b._chunk_move_duration(dist, b.manual_speed,
+                                      b.manual_accel)
+
+    def test_fixed_feed_returns_to_idle_after_duration(
+            self, buf, reactor):
+        reactor._monotonic = 10.0
+        dur = self._feed(buf)
+        assert buf.state == STATE_MANUAL_FEED
+        reactor.advance_time(dur + 0.1)
+        assert buf.state == STATE_IDLE
+        assert buf.motor_direction == STOP
+
+    def test_fixed_feed_returns_to_stopped_when_auto(
+            self, enabled_buf, reactor):
+        reactor._monotonic = 10.0
+        dur = self._feed(enabled_buf)
+        reactor.advance_time(dur + 0.1)
+        # Unsynced at completion -> STOPPED; the next control tick
+        # re-syncs and promotes to FEEDING.
+        assert enabled_buf.state == STATE_STOPPED
+        enabled_buf._control_timer_cb(reactor.monotonic())
+        assert enabled_buf._synced_to is not None
+        assert enabled_buf.state == STATE_FEEDING
+
+    def test_fixed_retract_returns_after_duration(self, buf, reactor):
+        from conftest import MockGcmd
+        reactor._monotonic = 10.0
+        buf.cmd_BUFFER_RETRACT(MockGcmd(params={"DIST": 15.0}))
+        assert buf.state == STATE_MANUAL_RETRACT
+        dur = buf._chunk_move_duration(15.0, buf.manual_speed,
+                                       buf.manual_accel)
+        reactor.advance_time(dur + 0.1)
+        assert buf.state == STATE_IDLE
+
+    def test_completion_noop_after_buffer_stop(
+            self, enabled_buf, reactor):
+        from conftest import MockGcmd
+        reactor._monotonic = 10.0
+        dur = self._feed(enabled_buf)
+        enabled_buf.cmd_BUFFER_STOP(MockGcmd())
+        state_after_stop = enabled_buf.state
+        reactor.advance_time(dur + 0.1)
+        # The stale completion must not fire (cancelled) nor change
+        # the state BUFFER_STOP established.
+        assert enabled_buf.state == state_after_stop
+
+    def test_completion_cancelled_by_button_feed(
+            self, enabled_buf, reactor):
+        reactor._monotonic = 10.0
+        dur = self._feed(enabled_buf)
+        # Button-held feed takes over the MANUAL_FEED state; the
+        # pending fixed-move completion must not kill it mid-hold.
+        enabled_buf._feed_button_callback(10.1, 1)
+        assert enabled_buf.state == STATE_MANUAL_FEED
+        reactor.advance_time(dur + 5.0)
+        assert enabled_buf.state == STATE_MANUAL_FEED
+
+    def test_fixed_feed_failure_still_recovers(self, buf, reactor):
+        def boom(*args, **kwargs):
+            raise Exception("manual_move failed")
+        buf.force_move.manual_move = boom
+        reactor._monotonic = 10.0
+        dur = self._feed(buf)
+        assert buf.state == STATE_MANUAL_FEED
+        reactor.advance_time(dur + 0.1)
+        assert buf.state == STATE_IDLE
