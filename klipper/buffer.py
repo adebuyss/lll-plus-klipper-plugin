@@ -251,6 +251,37 @@ class Buffer:
         # but the TMC ignores STEP/DIR while VACTUAL != 0.
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
+        # Pessimistic latch: "the chip may currently be driving the
+        # motor from VACTUAL."  Deliberately NOT derived from
+        # _extreme_recovery_active — the two disagree in three windows
+        # and every one of them ends with a running motor:
+        #   1. _enter_*_recovery writes VACTUAL *before* setting
+        #      _extreme_recovery_active, and bails out via _handle_error
+        #      if the write is unconfirmed.  mcu_uart.reg_write is
+        #      fire-and-forget at the wire level, so an unconfirmed
+        #      write means "the IFCNT read-back failed", NOT "the chip
+        #      never got it".
+        #   2. _stop_recovery_vactual writes a NONZERO latch nudge and
+        #      relies on a deferred callback ~50 ms later to clear it,
+        #      while its callers clear _extreme_recovery_active
+        #      immediately.
+        #   3. On klippy:disconnect the reactor is tearing down, so that
+        #      deferred clear may never run at all.
+        # Set before any nonzero write, cleared only by a CONFIRMED
+        # zero write, so the error always points at "might be running".
+        self._vactual_maybe_running = False
+        # One-shot per failure episode: an enable-pin driver kill has
+        # been requested (deferred) or executed.  A single dead-bus
+        # episode otherwise stacks doomed UART transactions — entry
+        # failure -> _handle_error -> _unsync -> _stop_recovery_vactual
+        # would retry the bus that just failed, at ~5 s of blocked
+        # greenlet per attempt (measured: serial response timeout on a
+        # dead MCU), and request the fallback again each time.  Once
+        # the kill is requested the motor cannot move (EN drops), so
+        # further UART attempts buy nothing.  Re-armed by the paths
+        # that bring the buffer back into service (BUFFER_ENABLE,
+        # error clear), which must first prove the bus works again.
+        self._driver_disable_requested = False
 
         # Drift-correction rate-limit + zone hysteresis state.
         # _apply_multiplier rate-limits to 2 Hz during printing to
@@ -381,6 +412,21 @@ class Buffer:
                 "buffer[%s]: get_step_dist() unavailable (%s); "
                 "VACTUAL conversion disabled" % (self.short_name, e))
             self._steps_per_mm = None
+        # Boot-time VACTUAL hygiene.  The TMC is powered from the motor
+        # rail, not the MCU, so a nonzero VACTUAL from a prior session
+        # survives klippy restarts and even FIRMWARE_RESTART's MCU
+        # reset — and there is no end-of-session path guaranteed to
+        # clear it: on an MCU shutdown every UART write fails (the
+        # firmware's enable-pin drop is what stops the motor), and on
+        # klippy:disconnect the MCU's own disconnect handler closes the
+        # serial before ours runs.  A fresh process therefore cannot
+        # trust the chip.  Mark it unknown and run the full stop
+        # sequence (zero + direction-latch nudge); a confirmed zero
+        # clears the latch, a failure leaves it set and kills the
+        # driver via the enable pin.
+        if self._mcu_tmc is not None:
+            self._vactual_maybe_running = True
+            self._stop_recovery_vactual()
         # Undo the auto-sync that [extruder_stepper]'s handle_connect
         # performed at klippy:connect.  The buffer stepper should not
         # follow the extruder until the user enables the buffer.
@@ -438,6 +484,13 @@ class Buffer:
         # stepping the motor unless we explicitly stop it.  Try the
         # register write first, then drop the enable pin as a fallback
         # — disabling the driver halts the TMC internal step generator.
+        #
+        # Both steps stay UNCONDITIONAL here, deliberately: this runs on
+        # klippy:disconnect as well as klippy:shutdown, and on
+        # disconnect the reactor is tearing down, so any deferred
+        # _clear_vactual_latch_nudge may never fire.  Do not gate either
+        # of these on _vactual_maybe_running — shutdown is exactly where
+        # the belt-and-braces is worth its cost.
         try:
             self._write_vactual(0)
         except Exception:
@@ -483,17 +536,93 @@ class Buffer:
         """
         if self._mcu_tmc is None:
             return False
+        # Latch BEFORE the write, not after.  Klipper's
+        # MCU_TMC_uart.set_register only raises once its IFCNT
+        # read-back retries are exhausted; the underlying
+        # mcu_uart.reg_write is one-way and never waits for a reply.
+        # So a failed nonzero write means "could not confirm", and the
+        # chip may be spinning.  Latching first keeps every downstream
+        # cleanup path armed in exactly that case.
+        if register_value:
+            self._vactual_maybe_running = True
         try:
             self._mcu_tmc.set_register("VACTUAL", register_value)
+            if not register_value:
+                # Only a CONFIRMED zero write releases the latch.
+                self._vactual_maybe_running = False
             return True
         except Exception as e:
             logging.warning("buffer[%s]: VACTUAL write failed: %s"
                             % (self.short_name, e))
             return False
 
+    def _disable_stepper_driver(self, reason):
+        """Last-resort motor stop that does not touch the TMC UART.
+
+        Every VACTUAL stop path runs over the same bit-banged UART that
+        just failed, so retrying it is the one thing guaranteed not to
+        help — and each retry is expensive (set_register retries 5x,
+        and every IFCNT read inside retries 5x on top of that, with a
+        0.5 s response timeout per attempt).  The enable pin is a plain
+        GPIO on the same MCU: dropping it disables the driver output
+        stage, which halts the chip's internal step generator whatever
+        VACTUAL happens to contain.
+
+        The motor goes limp rather than held.  For a filament buffer
+        that is strictly better than a runaway, and the buffer is
+        heading into an error state anyway on every path that calls
+        this.
+
+        The run_script itself is DEFERRED to a reactor callback rather
+        than issued inline.  This helper is reachable from gcode
+        command handlers — BUFFER_DISABLE / BUFFER_FEED / BUFFER_RETRACT
+        / BUFFER_RETRACT_UNTIL_CLEAR all reach it via _unsync ->
+        _stop_recovery_vactual — and Kalico's gcode mutex is not
+        reentrant: reactor.ReactorMutex.__enter__ parks the calling
+        greenlet on reactor.pause(NEVER) when the lock is already held,
+        so an inline gcode.run_script from inside a command handler
+        would hang klippy permanently.  A reactor callback runs on a
+        later iteration, once the handler has returned and released the
+        mutex.  The extra latency is one reactor iteration, which is
+        irrelevant next to a motor that is already running away.
+
+        _handle_shutdown deliberately does NOT route through here: it
+        runs on klippy:disconnect where the reactor may never drain
+        another callback, so it issues its own direct run_script.
+
+        One-shot per failure episode (_driver_disable_requested): the
+        first requester wins; repeats are dropped so the error unwind
+        does not spam the console or queue duplicate scripts.
+        """
+        if self._driver_disable_requested:
+            return
+        self._driver_disable_requested = True
+        logging.warning(
+            "buffer[%s]: disabling driver via enable pin — %s"
+            % (self.short_name, reason))
+        self.gcode.respond_info(
+            "Buffer[%s]: TMC UART unresponsive (%s); disabling driver to "
+            "stop the motor. Re-enable with BUFFER_ENABLE once the "
+            "connection is healthy." % (self.short_name, reason))
+        self.reactor.register_callback(self._do_disable_stepper_driver)
+
+    def _do_disable_stepper_driver(self, eventtime):
+        try:
+            self.gcode.run_script(
+                "SET_STEPPER_ENABLE STEPPER=%s ENABLE=0"
+                % self.stepper_name)
+        except Exception as e:
+            logging.error(
+                "buffer[%s]: enable-pin fallback FAILED (%s) — motor may "
+                "still be running" % (self.short_name, e))
+
     def _stop_recovery_vactual(self):
         """Stop VACTUAL recovery and restore correct STEP/DIR
-        interpretation via a brief directional nudge.
+        interpretation via a brief directional nudge.  Returns True
+        when the stop (VACTUAL=0) was confirmed on the chip, False
+        when it could not be — callers that intend to re-arm the
+        driver (BUFFER_ENABLE, error clear) must treat False as
+        "do not proceed".
 
         The TMC2208/2225 latches the sign of the last nonzero VACTUAL
         write and applies it to subsequent STEP pulses regardless of
@@ -514,7 +643,22 @@ class Buffer:
            mode with the corrected latch.  Physical motion at
            0.1 mm/s held 50 ms is well under one microstep.
         """
-        self._write_vactual(0)
+        if self._driver_disable_requested:
+            # A previous write this episode already proved the bus dead
+            # and the driver kill is pending or done — the motor cannot
+            # move with EN dropped, so more UART only stalls the
+            # reactor greenlet (~5 s per doomed attempt).  The latch
+            # stays set; whichever path re-enables must clear it first.
+            return False
+        if not self._write_vactual(0):
+            # The stop write is the one that must not fail: the chip is
+            # driving the motor right now and the UART just refused.
+            # Retrying over the same bus is pointless, and issuing the
+            # nudge would only queue two more doomed transactions.
+            # Kill the driver instead and leave the latch set so any
+            # later cleanup path still tries to zero VACTUAL.
+            self._disable_stepper_driver("VACTUAL stop write failed")
+            return False
         # Negate _mm_per_s_to_vactual's caller-facing "+forward"
         # convention to produce a POSITIVE raw register value —
         # opposite sign from EMPTY recovery's push, matching the
@@ -524,12 +668,19 @@ class Buffer:
         self.reactor.register_callback(
             self._clear_vactual_latch_nudge,
             self.reactor.monotonic() + 0.05)
+        return True
 
     def _clear_vactual_latch_nudge(self, eventtime):
         # Don't clobber a fresh recovery push if recovery has
         # restarted within the 50 ms nudge window.
-        if self._extreme_recovery_active is None:
-            self._write_vactual(0)
+        if self._extreme_recovery_active is not None:
+            return
+        if not self._write_vactual(0):
+            # The nudge is still live (0.1 mm/s creep, STEP/DIR still
+            # overridden) and we cannot clear it.  Same reasoning as
+            # the stop path: stop trusting the UART, drop the driver.
+            self._disable_stepper_driver(
+                "VACTUAL latch-nudge clear failed")
 
     def _chunk_move_duration(self, dist, speed, accel):
         """Real-time duration of a single force_move.manual_move
@@ -678,7 +829,18 @@ class Buffer:
         # TMC does NOT clear VACTUAL on its own; without this, BUFFER_
         # DISABLE / runout / error / tool-change while VACTUAL is
         # active would leave the motor running indefinitely.
-        self._stop_recovery_vactual()
+        #
+        # Gated on _vactual_maybe_running, NOT on
+        # _extreme_recovery_active (see the latch's definition in
+        # __init__ for why the latter is unsafe here).  The latch is
+        # False only when no nonzero VACTUAL has been written since the
+        # last confirmed zero, so skipping is provably safe — and it
+        # skips on every _unsync of a print that never entered
+        # recovery, which is the overwhelming majority of them.  Each
+        # skipped cleanup avoids three set_register round trips on a
+        # bit-banged 40 kbaud UART.
+        if self._vactual_maybe_running:
+            self._stop_recovery_vactual()
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
         if self._recovery_check_timer is not None:
@@ -835,6 +997,14 @@ class Buffer:
             return
         register = self._mm_per_s_to_vactual(self.recovery_speed)
         if not self._write_vactual(register):
+            # Unconfirmed write: the chip may already be feeding at
+            # recovery_speed.  Stop it by the one route that does not
+            # depend on the bus that just failed, then escalate.  The
+            # latch gate skips the fallback when no write can have
+            # left at all (_mcu_tmc is None).
+            if self._vactual_maybe_running:
+                self._disable_stepper_driver(
+                    "EMPTY recovery VACTUAL write failed")
             self._handle_error("EMPTY recovery: VACTUAL write failed")
             return
         self._extreme_recovery_active = ZONE_EMPTY
@@ -849,6 +1019,11 @@ class Buffer:
             return
         register = -self._mm_per_s_to_vactual(1.0)  # 1 mm/s slow drain
         if not self._write_vactual(register):
+            # Unconfirmed write: the chip may already be draining in
+            # reverse.  Same reasoning as _enter_empty_recovery.
+            if self._vactual_maybe_running:
+                self._disable_stepper_driver(
+                    "FULL recovery VACTUAL write failed")
             self._handle_error("FULL recovery: VACTUAL write failed")
             return
         self._extreme_recovery_active = ZONE_FULL
@@ -1395,8 +1570,12 @@ class Buffer:
         """Timer callback: clear error if both buttons still held."""
         if (self._feed_button_pressed and self._retract_button_pressed
                 and self.state == STATE_ERROR):
-            self._clear_error()
-            self.gcode.respond_info("Buffer: error cleared via buttons")
+            if self._clear_error():
+                self.gcode.respond_info(
+                    "Buffer: error cleared via buttons")
+            else:
+                self.gcode.respond_info(
+                    "Buffer: error NOT cleared - %s" % self.error_msg)
         self._error_clear_hold_start = 0.0
         return self.reactor.NEVER
 
@@ -1489,12 +1668,23 @@ class Buffer:
             self._trigger_pause(msg)
 
     def _clear_error(self):
-        """Clear error state."""
+        """Clear error state.  Returns False — and stays in ERROR —
+        when the chip-side VACTUAL state cannot be confirmed cleared,
+        for the same reason cmd_BUFFER_ENABLE refuses: leaving ERROR
+        re-arms sync and the driver, and a stale nonzero VACTUAL would
+        resume motion the moment the driver re-enables."""
+        self._driver_disable_requested = False
+        if (self._vactual_maybe_running
+                and not self._stop_recovery_vactual()):
+            self.error_msg = ("VACTUAL could not be cleared; "
+                              "TMC UART unresponsive")
+            return False
         self.state = STATE_STOPPED if self.auto_enabled else STATE_IDLE
         self.error_msg = ""
         self._safety_zone_start = 0.0
         if self.auto_enabled:
             self._sync()
+        return True
 
     def _trigger_pause(self, msg):
         try:
@@ -1530,6 +1720,8 @@ class Buffer:
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
             "extreme_recovery_active": self._extreme_recovery_active,
+            "vactual_maybe_running": self._vactual_maybe_running,
+            "driver_disable_requested": self._driver_disable_requested,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
         }
@@ -1586,6 +1778,31 @@ class Buffer:
         gcmd.respond_info(msg)
 
     def cmd_BUFFER_ENABLE(self, gcmd):
+        # No-op while extreme-zone recovery is driving the motor.
+        # Recovery implies enabled-and-synced already, and the latch
+        # consumption below would otherwise write the stop sequence —
+        # silently killing the recovery push while the poller stays
+        # armed, which manifests as a spurious "recovery exceeded"
+        # error a few seconds later.
+        if self._extreme_recovery_active is not None:
+            gcmd.respond_info(
+                "Buffer: already enabled (extreme-zone recovery in "
+                "progress)")
+            return
+        # Consume the VACTUAL latch before arming anything.  If a prior
+        # cleanup failed (or a prior session died mid-recovery), the
+        # chip still holds a nonzero VACTUAL and will resume motion the
+        # moment the driver re-enables — refuse until a confirmed zero
+        # lands.  Re-arm the one-shot fallback first so this attempt
+        # gets its own fresh try at the bus.
+        self._driver_disable_requested = False
+        if (self._vactual_maybe_running
+                and not self._stop_recovery_vactual()):
+            gcmd.respond_info(
+                "Buffer: NOT enabled - VACTUAL could not be cleared "
+                "(TMC UART unresponsive). Fix the connection and retry "
+                "BUFFER_ENABLE.")
+            return
         self.auto_enabled = True
         self.state = STATE_STOPPED
         self.error_msg = ""
@@ -1749,8 +1966,11 @@ class Buffer:
 
     def cmd_BUFFER_CLEAR_ERROR(self, gcmd):
         if self.state == STATE_ERROR:
-            self._clear_error()
-            gcmd.respond_info("Buffer: error cleared")
+            if self._clear_error():
+                gcmd.respond_info("Buffer: error cleared")
+            else:
+                gcmd.respond_info(
+                    "Buffer: error NOT cleared - %s" % self.error_msg)
         else:
             gcmd.respond_info("Buffer: no error to clear")
 

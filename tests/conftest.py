@@ -407,11 +407,26 @@ class MockMcuTmc:
         self.writes = []
         # Convenience: VACTUAL writes only, just the integer value.
         self.vactual_writes = []
+        # Failure injection.  Add a register name (e.g. "VACTUAL") to
+        # make set_register raise for it, modelling Klipper's
+        # MCU_TMC_uart.set_register raising command_error once its
+        # IFCNT read-back retries are exhausted.
+        self.fail_registers = set()
 
     def set_register(self, reg_name, value, print_time=None):
+        # Record the attempt even when failing.  This is faithful to
+        # the hardware: mcu_uart.reg_write is fire-and-forget, so the
+        # frame may well have reached the chip — set_register raises
+        # only because the IFCNT read-back could not confirm it.  That
+        # ambiguity is precisely what _vactual_maybe_running exists
+        # to model, so the mock must not pretend the write never left.
         self.writes.append((reg_name, value, print_time))
         if reg_name == "VACTUAL":
             self.vactual_writes.append(value)
+        if reg_name in self.fail_registers:
+            raise Exception(
+                "Unable to write tmc uart 'buffer_stepper' register %s"
+                % reg_name)
 
 
 class MockToolhead:
@@ -583,6 +598,15 @@ def buf(config, printer):
     # Fire ready
     for handler in printer.event_handlers.get("klippy:ready", []):
         handler()
+    # _handle_ready runs the boot-time VACTUAL hygiene sequence (the
+    # chip state is unknown at boot: zero + nudge + deferred zero).
+    # Drain the deferred clear and drop the captured writes so tests
+    # assert only the writes they themselves provoke.  Dedicated
+    # boot-hygiene tests construct their own Buffer instead of using
+    # this fixture.
+    printer.reactor.flush_callbacks()
+    printer.tmc2208.mcu_tmc.writes.clear()
+    printer.tmc2208.mcu_tmc.vactual_writes.clear()
     # Simulate the initial pin-state report from Klipper's buttons module
     # (material switch = no filament).  This consumes the _initial_state_received
     # guard so subsequent test callbacks are treated as real events.
@@ -663,6 +687,13 @@ def tmc_writes(printer):
     """All TMC register writes including (reg_name, value, print_time).
     Used by the latency-regression guard to assert print_time=None."""
     return printer.tmc2208.mcu_tmc.writes
+
+
+@pytest.fixture
+def mcu_tmc(printer):
+    """The mock mcu_tmc itself.  Tests use `mcu_tmc.fail_registers.add(
+    "VACTUAL")` to simulate an unresponsive TMC UART."""
+    return printer.tmc2208.mcu_tmc
 
 
 @pytest.fixture
