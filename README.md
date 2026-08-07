@@ -132,7 +132,7 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `pause_on_runout`      | True    | Pause print on filament runout                                   |
 | `pause_on_error`       | =pause_on_runout | Pause print when the buffer enters ERROR (sensor conflict, recovery/safety timeouts) |
 | `control_interval`     | 0.5     | Reactor timer interval (s) for safety timeout checks             |
-| `debug`                | False   | Enable debug logging of zone transitions and multiplier changes  |
+| `debug`                | False   | Enable debug logging: zone transitions, multiplier changes, VACTUAL writes, sync/unsync reasons, and a 10 s state heartbeat (zone/state/sync/recovery + toolhead-vs-MCU margin) |
 
 See `sample_config/lll-plus.cfg` for the full annotated reference.
 

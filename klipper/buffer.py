@@ -44,6 +44,12 @@ _VACTUAL_USTEP_PER_LSB = 0.715
 # reactor-tick cost is trivial.
 _RECOVERY_POLL_INTERVAL = 0.05
 
+# Debug-heartbeat cadence (seconds).  One periodic state line so the
+# log never goes silent for minutes between sensor edges — the Aug
+# 2026 MCU-shutdown forensics had a 433 s blind spot before the
+# fault because every log site was edge-triggered.
+_HEARTBEAT_INTERVAL = 10.0
+
 # State machine transitions:
 #   DISABLED -> IDLE          on klippy:ready
 #   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
@@ -320,6 +326,8 @@ class Buffer:
 
         # Per-key debug-log throttle: key -> (last_eventtime, suppressed_count)
         self._dlog_throttle = {}
+        # Debug heartbeat pacing (see _control_timer_cb).
+        self._last_heartbeat_at = 0.0
 
         # Timer handles
         self._control_timer = None
@@ -530,7 +538,7 @@ class Buffer:
                 % self.stepper_name)
         except Exception:
             pass
-        self._unsync()
+        self._unsync("shutdown")
         self.state = STATE_DISABLED
         self.auto_enabled = False
         logging.info("buffer[%s]: shutdown" % self.short_name)
@@ -579,6 +587,9 @@ class Buffer:
             if not register_value:
                 # Only a CONFIRMED zero write releases the latch.
                 self._vactual_maybe_running = False
+            # Success log (debug-gated): 590 recoveries in the Aug
+            # 2026 incident log left no record of what was written.
+            self._dlog(None, "VACTUAL write %d ok", register_value)
             return True
         except Exception as e:
             logging.warning("buffer[%s]: VACTUAL write failed: %s"
@@ -790,7 +801,7 @@ class Buffer:
             return
         if not self.material_present and self.auto_enabled:
             self._cancel_fill()
-            self._unsync()
+            self._unsync("runout")
             self.state = STATE_IDLE
             if self.pause_on_runout:
                 self._trigger_pause("buffer: filament runout detected")
@@ -814,12 +825,16 @@ class Buffer:
 
     # --- Extruder sync/unsync ---
 
-    def _sync(self):
+    def _sync(self, reason=None):
         """Sync the buffer stepper to the active extruder's trapq.
 
         If this buffer is bound to a specific extruder via the 'extruder'
         config param, only sync when that extruder is currently active.
         Otherwise sync to whatever extruder is active.
+
+        reason is a short slug threaded into the debug log — with a
+        dozen call sites, a bare "synced" line is nearly useless when
+        reconstructing a failure from klippy.log.
         """
         if self._synced_to is not None:
             return
@@ -838,13 +853,15 @@ class Buffer:
             if self.state == STATE_STOPPED:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
-            self._dlog(None, "synced to %s", extruder_name)
+            self._dlog(None, "synced to %s (%s)", extruder_name,
+                       reason or "-")
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
 
-    def _unsync(self):
-        """Unsync the buffer stepper from the extruder.
+    def _unsync(self, reason=None):
+        """Unsync the buffer stepper from the extruder.  reason is a
+        short slug for the debug log (see _sync).
 
         Restores the stepper's rotation_distance to the baseline so
         subsequent manual moves (BUFFER_FEED, BUFFER_RETRACT, safety
@@ -892,7 +909,7 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
-        self._dlog(None, "unsynced")
+        self._dlog(None, "unsynced (%s)", reason or "-")
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -908,10 +925,10 @@ class Buffer:
         if self.extruder_name is not None:
             if new_extruder_name == self.extruder_name:
                 if self._synced_to is None:
-                    self._sync()
+                    self._sync("tool-change")
             else:
                 if self._synced_to is not None:
-                    self._unsync()
+                    self._unsync("tool-change")
                     # Return to STOPPED so _sync() can promote back to
                     # FEEDING when our extruder is active again.
                     if self.state == STATE_FEEDING:
@@ -919,8 +936,8 @@ class Buffer:
         else:
             # Unbound — follow whatever is active.
             if self._synced_to is not None:
-                self._unsync()
-            self._sync()
+                self._unsync("tool-change")
+            self._sync("tool-change")
 
     # --- Rotation distance feedback ---
 
@@ -1250,7 +1267,7 @@ class Buffer:
                 and self._initial_fill_until <= 0.0
                 and self._extreme_recovery_active is None
                 and self.material_present):
-            self._sync()
+            self._sync("auto-resync")
             if self._synced_to is not None:
                 # Re-synced while printing with the arm at FULL —
                 # normalize at start_drain_speed before the generic
@@ -1297,7 +1314,7 @@ class Buffer:
                 and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
             self._initial_fill_until = 0.0
             self._cancel_fill_timer()
-            self._sync()
+            self._sync("fill-complete")
 
         # Mid-recovery handling: detect exit conditions.  The recovery
         # check timer also polls for these; this branch covers the
@@ -1364,7 +1381,7 @@ class Buffer:
         """
         if self.force_move is None:
             return
-        self._unsync()
+        self._unsync("initial-fill")
         self.state = STATE_FEEDING
         self.motor_direction = FORWARD
         next_wake = self._do_fill_chunk(eventtime)
@@ -1398,7 +1415,7 @@ class Buffer:
             self.gcode.respond_info(
                 "Buffer: initial fill timed out after %.0fs"
                 % self.initial_fill_timeout)
-            self._sync()
+            self._sync("fill-timeout")
             return self.reactor.NEVER
         # Abort: filament reached middle sensor or beyond
         zone = self._compute_zone()
@@ -1406,7 +1423,7 @@ class Buffer:
             self._initial_fill_until = 0.0
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
-            self._sync()
+            self._sync("fill-complete")
             return self.reactor.NEVER
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
@@ -1421,7 +1438,7 @@ class Buffer:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
-            self._sync()
+            self._sync("fill-error")
             return self.reactor.NEVER
         return eventtime + self._chunk_move_duration(
             self._manual_chunk_dist, self.manual_speed, self.manual_accel)
@@ -1434,6 +1451,33 @@ class Buffer:
     # --- Control timer ---
 
     def _control_timer_cb(self, eventtime):
+        # Debug heartbeat — BEFORE the manual-state early returns so
+        # it reports in every state.  margin is how far the queued
+        # motion runs ahead of the buffer stepper's MCU clock; a
+        # margin trending toward zero under load is the precursor of
+        # a "Rescheduled timer in the past" shutdown.  Uses
+        # toolhead.get_status (never get_last_move_time — that
+        # flushes the lookahead) and the buffer stepper's own MCU,
+        # which may be a secondary board.
+        if (self.debug
+                and eventtime - self._last_heartbeat_at
+                >= _HEARTBEAT_INTERVAL):
+            self._last_heartbeat_at = eventtime
+            margin = -1.0
+            try:
+                mcu = self.extruder_stepper.stepper.get_mcu()
+                margin = (self.toolhead.get_status(eventtime)
+                          ["print_time"]
+                          - mcu.estimated_print_time(eventtime))
+            except Exception:
+                pass
+            self._dlog(eventtime,
+                       "heartbeat zone=%s state=%s synced=%s "
+                       "recovery=%s latch=%s material=%s margin=%.3f",
+                       self._current_zone, self.state, self._synced_to,
+                       self._extreme_recovery_active,
+                       self._vactual_maybe_running,
+                       self.material_present, margin)
         # Poll active extruder to detect tool changes.  The toolhead's
         # active extruder can change via ACTIVATE_EXTRUDER / T0/T1 macros
         # without firing a dedicated event, so we sample it each tick.
@@ -1459,7 +1503,7 @@ class Buffer:
                     self._stop_manual()
                     if self.auto_enabled:
                         self.state = STATE_STOPPED
-                        self._sync()
+                        self._sync("manual-feed-stop")
                     else:
                         self.state = STATE_IDLE
                     self._manual_feed_full_start = 0.0
@@ -1486,7 +1530,7 @@ class Buffer:
                 self._stop_manual()
                 if self.auto_enabled:
                     self.state = STATE_STOPPED
-                    self._sync()
+                    self._sync("manual-retract-stop")
                 else:
                     self.state = STATE_IDLE
                 self.gcode.respond_info(
@@ -1573,7 +1617,7 @@ class Buffer:
         self.gcode.respond_info(
             "Buffer: full zone timeout - retracting")
         stepper = self.extruder_stepper.stepper
-        self._unsync()
+        self._unsync("safety-retract")
         self.state = STATE_RETRACTING
         self.motor_direction = BACK
         # Armed before the move so a raising manual_move still exits
@@ -1637,12 +1681,12 @@ class Buffer:
         self._stop_manual()
         if self.auto_enabled:
             self.auto_enabled = False
-            self._unsync()
+            self._unsync("buttons-disable")
             self.state = STATE_IDLE
         else:
             self.auto_enabled = True
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("buttons-enable")
         self.gcode.respond_info(
             "Buffer: %s via buttons"
             % ("enabled" if self.auto_enabled else "disabled"))
@@ -1651,7 +1695,7 @@ class Buffer:
         """Restore state after manual button release."""
         if self.auto_enabled:
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("button-release")
         else:
             self.state = STATE_IDLE
 
@@ -1700,7 +1744,7 @@ class Buffer:
         # so the state guard alone would NOT protect this session —
         # a stale fire would kill a button-held feed mid-hold.
         self._cancel_move_done_timer()
-        self._unsync()
+        self._unsync("manual-continuous")
         if direction == FORWARD:
             self.state = STATE_MANUAL_FEED
         else:
@@ -1815,7 +1859,7 @@ class Buffer:
 
     def _handle_error(self, msg):
         self._cancel_fill()
-        self._unsync()
+        self._unsync("error")
         self.state = STATE_ERROR
         self.error_msg = msg
         self.motor_direction = STOP
@@ -1840,7 +1884,7 @@ class Buffer:
         self.error_msg = ""
         self._safety_zone_start = 0.0
         if self.auto_enabled:
-            self._sync()
+            self._sync("error-cleared")
         return True
 
     def _trigger_pause(self, msg):
@@ -1972,7 +2016,7 @@ class Buffer:
         self.state = STATE_STOPPED
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._sync()
+        self._sync("enable")
         # The recommended START_PRINT flow disables the buffer during
         # heat/level and re-enables right before the prime line — for
         # file prints print_stats is already "printing" there, so this
@@ -1986,7 +2030,7 @@ class Buffer:
     def cmd_BUFFER_DISABLE(self, gcmd):
         self.auto_enabled = False
         self._cancel_fill()
-        self._unsync()
+        self._unsync("disable")
         self.state = STATE_DISABLED
         gcmd.respond_info("Buffer: automatic control disabled")
 
@@ -2001,7 +2045,7 @@ class Buffer:
         if dist > 0.0:
             # Fixed distance feed
             self._cancel_fill()
-            self._unsync()
+            self._unsync("manual-feed")
             self.state = STATE_MANUAL_FEED
             self.motor_direction = FORWARD
             self._manual_feed_full_start = 0.0
@@ -2038,7 +2082,7 @@ class Buffer:
         if dist > 0.0:
             # Fixed distance retract
             self._cancel_fill()
-            self._unsync()
+            self._unsync("manual-retract")
             self.state = STATE_MANUAL_RETRACT
             self.motor_direction = BACK
             try:
@@ -2074,7 +2118,7 @@ class Buffer:
         # Same shared-state hazard as _start_continuous_feed: this
         # loop lives in MANUAL_RETRACT too.
         self._cancel_move_done_timer()
-        self._unsync()
+        self._unsync("retract-until-clear")
         self.state = STATE_MANUAL_RETRACT
         self.motor_direction = BACK
         self._continuous_feed_direction = BACK
@@ -2142,7 +2186,7 @@ class Buffer:
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("stop")
         else:
             self.state = STATE_IDLE
         gcmd.respond_info("Buffer: stopped")

@@ -463,6 +463,13 @@ class MockToolhead:
     def get_last_move_time(self):
         return self._last_move_time
 
+    def get_status(self, eventtime):
+        """Non-flushing status snapshot, mirroring production
+        toolhead.get_status — the heartbeat must use this, never
+        get_last_move_time (which flushes the lookahead)."""
+        return {"print_time": self._last_move_time,
+                "estimated_print_time": eventtime}
+
     def dwell(self, delay):
         self.dwell_calls.append(delay)
         self._last_move_time += max(0.0, delay)
