@@ -64,7 +64,7 @@ gcode:
 
 ### Pause / resume
 
-The buffer automatically pauses the print on filament runout (`pause_on_runout: True`). If you use custom pause/resume macros, disable the buffer on pause and re-enable on resume so it doesn't fight the parked extruder:
+The buffer automatically pauses the print on filament runout (`pause_on_runout: True`). On RESUME, the `print_stats:start_printing` event re-triggers print-start normalization, so an arm left at FULL by a mid-pause filament load is drained at `start_drain_speed` automatically. If you use custom pause/resume macros, disable the buffer on pause and re-enable on resume so it doesn't fight the parked extruder:
 
 ```ini
 [gcode_macro PAUSE]
@@ -123,6 +123,7 @@ Copy `sample_config/lll-plus.cfg` into your Klipper config directory and adjust 
 | `extreme_recovery_timeout` | 10.0 | Per-attempt cap on VACTUAL recovery (hard error on exceed)       |
 | `manual_speed`         | 40.0    | Speed (mm/s) for manual feed/retract (trapezoid-ramped, safe at 40) |
 | `recovery_speed`       | 10.0    | Speed (mm/s) of EMPTY-zone VACTUAL recovery (instant velocity step — lower ceiling than manual_speed) |
+| `start_drain_speed`    | 5.0     | Reverse-drain speed (mm/s) for print-start FULL normalization (mid-print FULL recovery stays at 1 mm/s) |
 | `manual_accel`         | 1500.0  | Acceleration (mm/s^2) for manual feed/retract                    |
 | `manual_move_distance` | 10.0    | Distance (mm) per manual / safety-retract chunk                  |
 | `error_clear_hold_time`| 2.0     | Seconds both buttons must be held to clear error                 |
@@ -183,6 +184,16 @@ When the buffer hits ZONE_EMPTY or ZONE_FULL during a print, the plugin uses the
 
 - **EMPTY** recovery writes VACTUAL at `recovery_speed` (default 10 mm/s) and polls every 50 ms for zone exit. The recovery velocity is intentionally lower than `manual_speed` because VACTUAL is an instant velocity step at the TMC chip — there's no trapezoid acceleration ramp, so the safe instant-step ceiling on the reference hardware (stealthchop, 0.3 A) is ~30 mm/s. Bump `recovery_speed` higher if you have spreadcycle, higher run_current, or consistently high-flow prints. If recovery cannot pull the buffer out of EMPTY within `extreme_recovery_timeout` seconds, the buffer writes VACTUAL=0 and raises a hard error.
 - **FULL** recovery writes a negative VACTUAL at 1 mm/s (slow drain). Fast enough to recover from FULL within a reasonable timeout, slow enough not to fight an extruder that's also feeding forward at typical print speeds. The 200 mm FULL_MIDDLE → MIDDLE travel takes ~20 s at 1 mm/s.
+
+### Print-start normalization
+
+Filament loading deliberately ends with the buffer arm at FULL — continuous feed auto-stops on a sustained full sensor — so a print *beginning* with a full arm is the expected state, not drift. When that happens the arm is drained at `start_drain_speed` (default 5 mm/s) instead of the mid-print 1 mm/s, via three stateless triggers that all check the same gates (auto-enabled, synced, printing, material present, zone FULL, no recovery already active):
+
+1. the Kalico `print_stats:start_printing` event — fires on every print start **and every resume**, so a RESUME after M600/runout reload re-normalizes too (mainline Klipper never emits this event; the other two triggers carry the feature there);
+2. `BUFFER_ENABLE` while a print is active — with the recommended START_PRINT flow (disable early, enable right before the prime line) `print_stats` is already `"printing"` for file prints, so this is the trigger that fires in practice;
+3. automatic re-sync while printing.
+
+`extreme_recovery_timeout` caps each attempt (10 s at 5 mm/s = 50 mm of drain — raise it for longer arms). If the start event fires before an early `BUFFER_DISABLE` in your macros, the brief drain is stopped cleanly by the disable; harmless. On drivers without TMC UART the failed VACTUAL write escalates exactly like the generic FULL entry. Normalization never changes the state machine — the buffer stays synced and FEEDING throughout.
 
 Manual feed/retract (buttons, `BUFFER_FEED`/`BUFFER_RETRACT`, `BUFFER_RETRACT_UNTIL_CLEAR`, initial fill, safety retract) uses the proven `_unsync()` + `force_move.manual_move` + `_sync()` pattern. These paths run outside a print so the toolhead-dwell cost is invisible.
 

@@ -560,6 +560,12 @@ class MockPrinter:
     def register_event_handler(self, event, callback):
         self.event_handlers.setdefault(event, []).append(callback)
 
+    def send_event(self, event, *params):
+        """Mirror production Printer.send_event: run handlers in
+        registration order, return their results."""
+        return [cb(*params)
+                for cb in self.event_handlers.get(event, [])]
+
 
 # ---------------------------------------------------------------------------
 # Default config values matching buffer.py expectations

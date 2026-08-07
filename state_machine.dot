@@ -85,6 +85,7 @@ digraph buffer_state_machine {
     f_defer  -> m_neutral  [label="full clears +\nmiddle triggers" style=dashed]
 
     f_retract -> m_neutral [label="completion timer → STOPPED,\ncontrol timer re-syncs" style=dashed]
+    m_neutral -> f_recover [label="print start w/ arm FULL →\ndrain at start_drain_speed" style=dashed]
 
     // ===== Sensor conflict =====
 

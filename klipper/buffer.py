@@ -144,6 +144,16 @@ class Buffer:
         # consistently high-flow prints that outrun the default.
         self.recovery_speed = config.getfloat("recovery_speed", 10.0,
                                               above=0.0)
+        # Print-start normalization drain speed.  Filament loading
+        # deliberately ends with the arm at FULL (continuous feed
+        # auto-stops on sustained full), so FULL at print start is
+        # the expected state, not a fault.  When a print starts (or
+        # BUFFER_ENABLE runs mid-print / on RESUME) with the arm at
+        # FULL, drain at this speed instead of the slow 1 mm/s used
+        # for mid-print drift over-fill.  Same VACTUAL stall-ceiling
+        # considerations as recovery_speed apply.
+        self.start_drain_speed = config.getfloat("start_drain_speed",
+                                                 5.0, above=0.0)
         self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
@@ -335,6 +345,12 @@ class Buffer:
                                             self._handle_shutdown)
         self.printer.register_event_handler("klippy:disconnect",
                                             self._handle_shutdown)
+        # Kalico fires this on every virtual_sdcard print start and
+        # resume (mainline Klipper never emits it — harmless there).
+        # Drives print-start FULL normalization; see
+        # _maybe_start_print_normalization.
+        self.printer.register_event_handler("print_stats:start_printing",
+                                            self._handle_print_start)
 
         # Register gcode commands via mux so multiple [buffer ...] sections
         # can coexist and be selected with BUFFER=name.  For the bare
@@ -1020,10 +1036,14 @@ class Buffer:
                    register, self.recovery_speed)
         self._arm_recovery_timer(eventtime + _RECOVERY_POLL_INTERVAL)
 
-    def _enter_full_recovery(self, eventtime):
+    def _enter_full_recovery(self, eventtime, drain_speed=1.0):
+        """Reverse-VACTUAL drain out of the FULL band.  The default
+        1 mm/s is the mid-print drift-over-fill drain (slow enough
+        not to fight a forward-feeding extruder); print-start
+        normalization passes start_drain_speed instead."""
         if self._extreme_recovery_active is not None:
             return
-        register = -self._mm_per_s_to_vactual(1.0)  # 1 mm/s slow drain
+        register = -self._mm_per_s_to_vactual(drain_speed)
         if not self._write_vactual(register):
             # Unconfirmed write: the chip may already be draining in
             # reverse.  Same reasoning as _enter_empty_recovery.
@@ -1035,9 +1055,48 @@ class Buffer:
         self._extreme_recovery_active = ZONE_FULL
         self._recovery_started_at = eventtime
         self._dlog(eventtime,
-                   "recovery enter FULL vactual=%d (1.0 mm/s reverse)",
-                   register)
+                   "recovery enter FULL vactual=%d (%.1f mm/s reverse)",
+                   register, drain_speed)
         self._arm_recovery_timer(eventtime + 0.5)
+
+    def _maybe_start_print_normalization(self, eventtime):
+        """One-shot FULL drain at print start.  Loading parks the arm
+        at FULL by design, so a print beginning with a full arm is the
+        common case, not drift — drain it at start_drain_speed rather
+        than the mid-print 1 mm/s.  Stateless: all gates re-checked at
+        call time, so the three triggers (print_stats:start_printing,
+        BUFFER_ENABLE while printing, auto-re-sync while printing) can
+        fire in any order and duplicates are no-ops via the
+        recovery-active gate.  The per-attempt extreme_recovery_timeout
+        caps the drain (10 s at 5 mm/s = 50 mm); raise it for longer
+        buffer arms."""
+        if not self.auto_enabled:
+            return
+        if self._synced_to is None:
+            return
+        if self._extreme_recovery_active is not None:
+            return
+        if not self.material_present:
+            return
+        if not self._is_printing():
+            return
+        if self._compute_zone() != ZONE_FULL:
+            return
+        self._dlog(eventtime,
+                   "print-start normalization: FULL at start, draining "
+                   "at %.1f mm/s", self.start_drain_speed)
+        self._enter_full_recovery(eventtime, self.start_drain_speed)
+
+    def _handle_print_start(self):
+        """print_stats:start_printing handler (Kalico-only event; on
+        mainline Klipper it never fires and the BUFFER_ENABLE /
+        auto-re-sync hooks carry the feature).  Fired from
+        virtual_sdcard's work_handler on every print start AND every
+        resume, before the file's first line runs.  Deferred to a
+        reactor callback: event handlers run inside the work_handler
+        dispatch and must stay cheap."""
+        self.reactor.register_callback(
+            self._maybe_start_print_normalization)
 
     def _arm_recovery_timer(self, wake):
         if self._recovery_check_timer is None:
@@ -1185,6 +1244,15 @@ class Buffer:
                 and self._extreme_recovery_active is None
                 and self.material_present):
             self._sync()
+            if self._synced_to is not None:
+                # Re-synced while printing with the arm at FULL —
+                # normalize at start_drain_speed before the generic
+                # 1 mm/s entry below can claim it.  When this fires,
+                # the mid-recovery branch returns for the rest of
+                # this tick; the per-attempt extreme_recovery_timeout
+                # is the governing cap (cumulative arming is skipped
+                # via in_active_recovery).
+                self._maybe_start_print_normalization(eventtime)
 
         # Safety timeout tracking.  Edge-based arming on zone entry
         # preserves the be70969 intent: stale state from before printing
@@ -1799,6 +1867,7 @@ class Buffer:
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
             "recovery_speed": self.recovery_speed,
+            "start_drain_speed": self.start_drain_speed,
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
             "extreme_recovery_active": self._extreme_recovery_active,
@@ -1890,6 +1959,14 @@ class Buffer:
         self.error_msg = ""
         self._safety_zone_start = 0.0
         self._sync()
+        # The recommended START_PRINT flow disables the buffer during
+        # heat/level and re-enables right before the prime line — for
+        # file prints print_stats is already "printing" there, so this
+        # hook (not the start event) is the one that normalizes a
+        # loaded-full arm in practice.
+        if self._synced_to is not None:
+            self._maybe_start_print_normalization(
+                self.reactor.monotonic())
         gcmd.respond_info("Buffer: automatic control enabled")
 
     def cmd_BUFFER_DISABLE(self, gcmd):
