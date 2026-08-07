@@ -147,3 +147,76 @@ class TestClearError:
         buf.auto_enabled = False
         buf._clear_error()
         assert buf.state == "idle"
+
+
+class TestPolicyKnobs:
+    """_is_printing fails safe without print_stats, and pause_on_error
+    (default-chained to pause_on_runout) gates error pausing
+    independently of runout pausing."""
+
+    def _make_buf(self, printer, **overrides):
+        import buffer as buffer_module
+        from conftest import MockConfig, DEFAULT_CONFIG
+        values = dict(DEFAULT_CONFIG)
+        values.update(overrides)
+        b = buffer_module.Buffer(MockConfig(printer, values))
+        for handler in printer.event_handlers.get("klippy:ready", []):
+            handler()
+        b._initial_state_received = True
+        b._any_sensor_reported = True
+        b.sensor_states = {"empty": False, "middle": False,
+                           "full": False}
+        return b
+
+    def test_is_printing_false_without_print_stats(self, buf):
+        buf._print_stats = None
+        assert buf._is_printing() is False
+
+    def test_no_recovery_without_print_stats(
+            self, enabled_buf, reactor):
+        from conftest import set_sensors
+        vactual_writes = (
+            enabled_buf.printer.tmc2208.mcu_tmc.vactual_writes)
+        enabled_buf._print_stats = None
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._update_rotation_distance(1.0)
+        assert enabled_buf._extreme_recovery_active is None
+        assert vactual_writes == []
+
+    def test_no_safety_timeout_without_print_stats(
+            self, enabled_buf, reactor):
+        from conftest import set_sensors, STATE_ERROR
+        enabled_buf._print_stats = None
+        set_sensors(enabled_buf, empty=True)
+        enabled_buf._update_rotation_distance(1.0)
+        enabled_buf._control_timer_cb(
+            1.0 + enabled_buf.empty_safety_timeout + 1.0)
+        assert enabled_buf.state != STATE_ERROR
+
+    def test_pause_on_error_defaults_to_pause_on_runout(
+            self, printer, gcode):
+        b = self._make_buf(printer, pause_on_runout=False)
+        assert b.pause_on_error is False
+        b._handle_error("test error")
+        assert "PAUSE" not in gcode.scripts_run
+
+    def test_pause_on_error_override_true(self, printer, gcode):
+        b = self._make_buf(printer, pause_on_runout=False,
+                           pause_on_error=True)
+        b._handle_error("test error")
+        assert "PAUSE" in gcode.scripts_run
+
+    def test_pause_on_error_override_false(
+            self, printer, gcode, buttons, reactor):
+        b = self._make_buf(printer, pause_on_runout=True,
+                           pause_on_error=False)
+        # Error path: no pause.
+        b._handle_error("test error")
+        assert "PAUSE" not in gcode.scripts_run
+        b._clear_error()
+        # Runout path: still pauses.
+        b.material_present = True
+        b.auto_enabled = True
+        reactor._monotonic = 10.0
+        buttons.callbacks["PE3"](10.0, 0)
+        assert "PAUSE" in gcode.scripts_run

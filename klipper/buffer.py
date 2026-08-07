@@ -158,6 +158,13 @@ class Buffer:
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
+        # Whether ERROR-state entry (sensor conflict, recovery/safety
+        # timeouts, VACTUAL failures) pauses the print.  Historically
+        # pause_on_runout gated this too, despite its name; the
+        # default chains to it so existing configs behave unchanged.
+        # Must be parsed AFTER pause_on_runout.
+        self.pause_on_error = config.getboolean("pause_on_error",
+                                                self.pause_on_runout)
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
@@ -1814,7 +1821,7 @@ class Buffer:
         self.motor_direction = STOP
         logging.error("buffer[%s]: %s" % (self.short_name, msg))
         self.gcode.respond_info("Buffer ERROR: %s" % msg)
-        if self.pause_on_runout:
+        if self.pause_on_error:
             self._trigger_pause(msg)
 
     def _clear_error(self):
@@ -1875,11 +1882,18 @@ class Buffer:
             "driver_disable_requested": self._driver_disable_requested,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
+            "pause_on_runout": self.pause_on_runout,
+            "pause_on_error": self.pause_on_error,
         }
 
     def _is_printing(self):
+        # Safe default: without print_stats (no [virtual_sdcard]) we
+        # cannot know a print is running, so treat the machine as not
+        # printing — no surprise recovery motion, normalization, or
+        # safety-timeout escalation on such setups.  Drift-gain
+        # feedback is unaffected (it doesn't gate on printing).
         if self._print_stats is None:
-            return True
+            return False
         return (self._print_stats.get_status(
             self.reactor.monotonic())["state"] == "printing")
 
