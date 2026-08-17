@@ -74,17 +74,19 @@ digraph buffer_state_machine {
     m_neutral -> fm_drift [label="full\ntriggers" style=dashed]
 
     fm_drift -> m_neutral [label="full\nclears" style=dashed]
-    fm_drift -> f_recover [label="middle clears\n(extruder forward)" style=dashed]
+    fm_drift -> f_recover [label="      middle clears\n      (extruder forward)" style=dashed]
     fm_drift -> f_defer   [label="middle clears\n(extruder idle/back)" style=dashed]
 
     f_recover -> m_neutral [label="recovery exits at\nMIDDLE → resync at 1.0" style=dashed]
-    f_recover -> fm_drift  [label="leaves FULL but\nnot at MIDDLE yet" style=dashed]
+    // West ports: keeps this label clear of the antiparallel edge's label
+    f_recover:w -> fm_drift:w  [label="leaves FULL but\nnot at MIDDLE yet" style=dashed]
     f_recover -> f_defer   [label="extruder stops/\nreverses mid-recovery" style=dashed]
 
     f_defer  -> f_recover  [label="extruder begins\nforward consumption" style=dashed]
     f_defer  -> m_neutral  [label="full clears +\nmiddle triggers" style=dashed]
 
-    f_retract -> m_neutral [label="re-sync after\nretract" style=dashed]
+    f_retract -> m_neutral [label="completion timer → STOPPED,\ncontrol timer re-syncs" style=dashed]
+    m_neutral -> f_recover [label="print start w/ arm FULL →\ndrain at start_drain_speed" style=dashed]
 
     // ===== Sensor conflict =====
 

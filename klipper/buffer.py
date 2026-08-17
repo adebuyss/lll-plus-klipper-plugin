@@ -44,6 +44,12 @@ _VACTUAL_USTEP_PER_LSB = 0.715
 # reactor-tick cost is trivial.
 _RECOVERY_POLL_INTERVAL = 0.05
 
+# Debug-heartbeat cadence (seconds).  One periodic state line so the
+# log never goes silent for minutes between sensor edges — the Aug
+# 2026 MCU-shutdown forensics had a 433 s blind spot before the
+# fault because every log site was edge-triggered.
+_HEARTBEAT_INTERVAL = 10.0
+
 # State machine transitions:
 #   DISABLED -> IDLE          on klippy:ready
 #   IDLE -> STOPPED           on material insert (auto-enable) or BUFFER_ENABLE
@@ -144,10 +150,27 @@ class Buffer:
         # consistently high-flow prints that outrun the default.
         self.recovery_speed = config.getfloat("recovery_speed", 10.0,
                                               above=0.0)
+        # Print-start normalization drain speed.  Filament loading
+        # deliberately ends with the arm at FULL (continuous feed
+        # auto-stops on sustained full), so FULL at print start is
+        # the expected state, not a fault.  When a print starts (or
+        # BUFFER_ENABLE runs mid-print / on RESUME) with the arm at
+        # FULL, drain at this speed instead of the slow 1 mm/s used
+        # for mid-print drift over-fill.  Same VACTUAL stall-ceiling
+        # considerations as recovery_speed apply.
+        self.start_drain_speed = config.getfloat("start_drain_speed",
+                                                 5.0, above=0.0)
         self.manual_accel = config.getfloat("manual_accel", 1500.0, above=0.0)
         self.manual_move_distance = config.getfloat(
             "manual_move_distance", 10.0, above=0.0)
         self.pause_on_runout = config.getboolean("pause_on_runout", True)
+        # Whether ERROR-state entry (sensor conflict, recovery/safety
+        # timeouts, VACTUAL failures) pauses the print.  Historically
+        # pause_on_runout gated this too, despite its name; the
+        # default chains to it so existing configs behave unchanged.
+        # Must be parsed AFTER pause_on_runout.
+        self.pause_on_error = config.getboolean("pause_on_error",
+                                                self.pause_on_runout)
         self.debug = config.getboolean("debug", False)
         self.control_interval = config.getfloat("control_interval", 0.5,
                                                 above=0.05)
@@ -251,6 +274,37 @@ class Buffer:
         # but the TMC ignores STEP/DIR while VACTUAL != 0.
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
+        # Pessimistic latch: "the chip may currently be driving the
+        # motor from VACTUAL."  Deliberately NOT derived from
+        # _extreme_recovery_active — the two disagree in three windows
+        # and every one of them ends with a running motor:
+        #   1. _enter_*_recovery writes VACTUAL *before* setting
+        #      _extreme_recovery_active, and bails out via _handle_error
+        #      if the write is unconfirmed.  mcu_uart.reg_write is
+        #      fire-and-forget at the wire level, so an unconfirmed
+        #      write means "the IFCNT read-back failed", NOT "the chip
+        #      never got it".
+        #   2. _stop_recovery_vactual writes a NONZERO latch nudge and
+        #      relies on a deferred callback ~50 ms later to clear it,
+        #      while its callers clear _extreme_recovery_active
+        #      immediately.
+        #   3. On klippy:disconnect the reactor is tearing down, so that
+        #      deferred clear may never run at all.
+        # Set before any nonzero write, cleared only by a CONFIRMED
+        # zero write, so the error always points at "might be running".
+        self._vactual_maybe_running = False
+        # One-shot per failure episode: an enable-pin driver kill has
+        # been requested (deferred) or executed.  A single dead-bus
+        # episode otherwise stacks doomed UART transactions — entry
+        # failure -> _handle_error -> _unsync -> _stop_recovery_vactual
+        # would retry the bus that just failed, at ~5 s of blocked
+        # greenlet per attempt (measured: serial response timeout on a
+        # dead MCU), and request the fallback again each time.  Once
+        # the kill is requested the motor cannot move (EN drops), so
+        # further UART attempts buy nothing.  Re-armed by the paths
+        # that bring the buffer back into service (BUFFER_ENABLE,
+        # error clear), which must first prove the bus works again.
+        self._driver_disable_requested = False
 
         # Drift-correction rate-limit + zone hysteresis state.
         # _apply_multiplier rate-limits to 2 Hz during printing to
@@ -272,6 +326,8 @@ class Buffer:
 
         # Per-key debug-log throttle: key -> (last_eventtime, suppressed_count)
         self._dlog_throttle = {}
+        # Debug heartbeat pacing (see _control_timer_cb).
+        self._last_heartbeat_at = 0.0
 
         # Timer handles
         self._control_timer = None
@@ -286,6 +342,12 @@ class Buffer:
         self._fill_timer = None
         self._continuous_timer = None
         self._retract_clear_timer = None
+        # Completion timer for one-shot timed moves: fixed-distance
+        # BUFFER_FEED/RETRACT and the safety retract.  Fires at
+        # move-end (chunk_move_duration) to return the state machine
+        # to STOPPED/IDLE — without it those states were terminal
+        # until a manual BUFFER_STOP.
+        self._move_done_timer = None
 
         # Register events.  klippy:disconnect is critical: VACTUAL
         # persists across host disconnect and the TMC will keep
@@ -298,6 +360,12 @@ class Buffer:
                                             self._handle_shutdown)
         self.printer.register_event_handler("klippy:disconnect",
                                             self._handle_shutdown)
+        # Kalico fires this on every virtual_sdcard print start and
+        # resume (mainline Klipper never emits it — harmless there).
+        # Drives print-start FULL normalization; see
+        # _maybe_start_print_normalization.
+        self.printer.register_event_handler("print_stats:start_printing",
+                                            self._handle_print_start)
 
         # Register gcode commands via mux so multiple [buffer ...] sections
         # can coexist and be selected with BUFFER=name.  For the bare
@@ -381,6 +449,21 @@ class Buffer:
                 "buffer[%s]: get_step_dist() unavailable (%s); "
                 "VACTUAL conversion disabled" % (self.short_name, e))
             self._steps_per_mm = None
+        # Boot-time VACTUAL hygiene.  The TMC is powered from the motor
+        # rail, not the MCU, so a nonzero VACTUAL from a prior session
+        # survives klippy restarts and even FIRMWARE_RESTART's MCU
+        # reset — and there is no end-of-session path guaranteed to
+        # clear it: on an MCU shutdown every UART write fails (the
+        # firmware's enable-pin drop is what stops the motor), and on
+        # klippy:disconnect the MCU's own disconnect handler closes the
+        # serial before ours runs.  A fresh process therefore cannot
+        # trust the chip.  Mark it unknown and run the full stop
+        # sequence (zero + direction-latch nudge); a confirmed zero
+        # clears the latch, a failure leaves it set and kills the
+        # driver via the enable pin.
+        if self._mcu_tmc is not None:
+            self._vactual_maybe_running = True
+            self._stop_recovery_vactual()
         # Undo the auto-sync that [extruder_stepper]'s handle_connect
         # performed at klippy:connect.  The buffer stepper should not
         # follow the extruder until the user enables the buffer.
@@ -438,6 +521,13 @@ class Buffer:
         # stepping the motor unless we explicitly stop it.  Try the
         # register write first, then drop the enable pin as a fallback
         # — disabling the driver halts the TMC internal step generator.
+        #
+        # Both steps stay UNCONDITIONAL here, deliberately: this runs on
+        # klippy:disconnect as well as klippy:shutdown, and on
+        # disconnect the reactor is tearing down, so any deferred
+        # _clear_vactual_latch_nudge may never fire.  Do not gate either
+        # of these on _vactual_maybe_running — shutdown is exactly where
+        # the belt-and-braces is worth its cost.
         try:
             self._write_vactual(0)
         except Exception:
@@ -448,7 +538,7 @@ class Buffer:
                 % self.stepper_name)
         except Exception:
             pass
-        self._unsync()
+        self._unsync("shutdown")
         self.state = STATE_DISABLED
         self.auto_enabled = False
         logging.info("buffer[%s]: shutdown" % self.short_name)
@@ -483,17 +573,96 @@ class Buffer:
         """
         if self._mcu_tmc is None:
             return False
+        # Latch BEFORE the write, not after.  Klipper's
+        # MCU_TMC_uart.set_register only raises once its IFCNT
+        # read-back retries are exhausted; the underlying
+        # mcu_uart.reg_write is one-way and never waits for a reply.
+        # So a failed nonzero write means "could not confirm", and the
+        # chip may be spinning.  Latching first keeps every downstream
+        # cleanup path armed in exactly that case.
+        if register_value:
+            self._vactual_maybe_running = True
         try:
             self._mcu_tmc.set_register("VACTUAL", register_value)
+            if not register_value:
+                # Only a CONFIRMED zero write releases the latch.
+                self._vactual_maybe_running = False
+            # Success log (debug-gated): 590 recoveries in the Aug
+            # 2026 incident log left no record of what was written.
+            self._dlog(None, "VACTUAL write %d ok", register_value)
             return True
         except Exception as e:
             logging.warning("buffer[%s]: VACTUAL write failed: %s"
                             % (self.short_name, e))
             return False
 
+    def _disable_stepper_driver(self, reason):
+        """Last-resort motor stop that does not touch the TMC UART.
+
+        Every VACTUAL stop path runs over the same bit-banged UART that
+        just failed, so retrying it is the one thing guaranteed not to
+        help — and each retry is expensive (set_register retries 5x,
+        and every IFCNT read inside retries 5x on top of that, with a
+        0.5 s response timeout per attempt).  The enable pin is a plain
+        GPIO on the same MCU: dropping it disables the driver output
+        stage, which halts the chip's internal step generator whatever
+        VACTUAL happens to contain.
+
+        The motor goes limp rather than held.  For a filament buffer
+        that is strictly better than a runaway, and the buffer is
+        heading into an error state anyway on every path that calls
+        this.
+
+        The run_script itself is DEFERRED to a reactor callback rather
+        than issued inline.  This helper is reachable from gcode
+        command handlers — BUFFER_DISABLE / BUFFER_FEED / BUFFER_RETRACT
+        / BUFFER_RETRACT_UNTIL_CLEAR all reach it via _unsync ->
+        _stop_recovery_vactual — and Kalico's gcode mutex is not
+        reentrant: reactor.ReactorMutex.__enter__ parks the calling
+        greenlet on reactor.pause(NEVER) when the lock is already held,
+        so an inline gcode.run_script from inside a command handler
+        would hang klippy permanently.  A reactor callback runs on a
+        later iteration, once the handler has returned and released the
+        mutex.  The extra latency is one reactor iteration, which is
+        irrelevant next to a motor that is already running away.
+
+        _handle_shutdown deliberately does NOT route through here: it
+        runs on klippy:disconnect where the reactor may never drain
+        another callback, so it issues its own direct run_script.
+
+        One-shot per failure episode (_driver_disable_requested): the
+        first requester wins; repeats are dropped so the error unwind
+        does not spam the console or queue duplicate scripts.
+        """
+        if self._driver_disable_requested:
+            return
+        self._driver_disable_requested = True
+        logging.warning(
+            "buffer[%s]: disabling driver via enable pin — %s"
+            % (self.short_name, reason))
+        self.gcode.respond_info(
+            "Buffer[%s]: TMC UART unresponsive (%s); disabling driver to "
+            "stop the motor. Re-enable with BUFFER_ENABLE once the "
+            "connection is healthy." % (self.short_name, reason))
+        self.reactor.register_callback(self._do_disable_stepper_driver)
+
+    def _do_disable_stepper_driver(self, eventtime):
+        try:
+            self.gcode.run_script(
+                "SET_STEPPER_ENABLE STEPPER=%s ENABLE=0"
+                % self.stepper_name)
+        except Exception as e:
+            logging.error(
+                "buffer[%s]: enable-pin fallback FAILED (%s) — motor may "
+                "still be running" % (self.short_name, e))
+
     def _stop_recovery_vactual(self):
         """Stop VACTUAL recovery and restore correct STEP/DIR
-        interpretation via a brief directional nudge.
+        interpretation via a brief directional nudge.  Returns True
+        when the stop (VACTUAL=0) was confirmed on the chip, False
+        when it could not be — callers that intend to re-arm the
+        driver (BUFFER_ENABLE, error clear) must treat False as
+        "do not proceed".
 
         The TMC2208/2225 latches the sign of the last nonzero VACTUAL
         write and applies it to subsequent STEP pulses regardless of
@@ -514,7 +683,22 @@ class Buffer:
            mode with the corrected latch.  Physical motion at
            0.1 mm/s held 50 ms is well under one microstep.
         """
-        self._write_vactual(0)
+        if self._driver_disable_requested:
+            # A previous write this episode already proved the bus dead
+            # and the driver kill is pending or done — the motor cannot
+            # move with EN dropped, so more UART only stalls the
+            # reactor greenlet (~5 s per doomed attempt).  The latch
+            # stays set; whichever path re-enables must clear it first.
+            return False
+        if not self._write_vactual(0):
+            # The stop write is the one that must not fail: the chip is
+            # driving the motor right now and the UART just refused.
+            # Retrying over the same bus is pointless, and issuing the
+            # nudge would only queue two more doomed transactions.
+            # Kill the driver instead and leave the latch set so any
+            # later cleanup path still tries to zero VACTUAL.
+            self._disable_stepper_driver("VACTUAL stop write failed")
+            return False
         # Negate _mm_per_s_to_vactual's caller-facing "+forward"
         # convention to produce a POSITIVE raw register value —
         # opposite sign from EMPTY recovery's push, matching the
@@ -524,12 +708,19 @@ class Buffer:
         self.reactor.register_callback(
             self._clear_vactual_latch_nudge,
             self.reactor.monotonic() + 0.05)
+        return True
 
     def _clear_vactual_latch_nudge(self, eventtime):
         # Don't clobber a fresh recovery push if recovery has
         # restarted within the 50 ms nudge window.
-        if self._extreme_recovery_active is None:
-            self._write_vactual(0)
+        if self._extreme_recovery_active is not None:
+            return
+        if not self._write_vactual(0):
+            # The nudge is still live (0.1 mm/s creep, STEP/DIR still
+            # overridden) and we cannot clear it.  Same reasoning as
+            # the stop path: stop trusting the UART, drop the driver.
+            self._disable_stepper_driver(
+                "VACTUAL latch-nudge clear failed")
 
     def _chunk_move_duration(self, dist, speed, accel):
         """Real-time duration of a single force_move.manual_move
@@ -610,7 +801,7 @@ class Buffer:
             return
         if not self.material_present and self.auto_enabled:
             self._cancel_fill()
-            self._unsync()
+            self._unsync("runout")
             self.state = STATE_IDLE
             if self.pause_on_runout:
                 self._trigger_pause("buffer: filament runout detected")
@@ -634,12 +825,16 @@ class Buffer:
 
     # --- Extruder sync/unsync ---
 
-    def _sync(self):
+    def _sync(self, reason=None):
         """Sync the buffer stepper to the active extruder's trapq.
 
         If this buffer is bound to a specific extruder via the 'extruder'
         config param, only sync when that extruder is currently active.
         Otherwise sync to whatever extruder is active.
+
+        reason is a short slug threaded into the debug log — with a
+        dozen call sites, a bare "synced" line is nearly useless when
+        reconstructing a failure from klippy.log.
         """
         if self._synced_to is not None:
             return
@@ -658,13 +853,15 @@ class Buffer:
             if self.state == STATE_STOPPED:
                 self.state = STATE_FEEDING
                 self.motor_direction = FORWARD
-            self._dlog(None, "synced to %s", extruder_name)
+            self._dlog(None, "synced to %s (%s)", extruder_name,
+                       reason or "-")
         except Exception as e:
             logging.warning("buffer[%s]: sync failed: %s"
                             % (self.short_name, e))
 
-    def _unsync(self):
-        """Unsync the buffer stepper from the extruder.
+    def _unsync(self, reason=None):
+        """Unsync the buffer stepper from the extruder.  reason is a
+        short slug for the debug log (see _sync).
 
         Restores the stepper's rotation_distance to the baseline so
         subsequent manual moves (BUFFER_FEED, BUFFER_RETRACT, safety
@@ -678,7 +875,18 @@ class Buffer:
         # TMC does NOT clear VACTUAL on its own; without this, BUFFER_
         # DISABLE / runout / error / tool-change while VACTUAL is
         # active would leave the motor running indefinitely.
-        self._stop_recovery_vactual()
+        #
+        # Gated on _vactual_maybe_running, NOT on
+        # _extreme_recovery_active (see the latch's definition in
+        # __init__ for why the latter is unsafe here).  The latch is
+        # False only when no nonzero VACTUAL has been written since the
+        # last confirmed zero, so skipping is provably safe — and it
+        # skips on every _unsync of a print that never entered
+        # recovery, which is the overwhelming majority of them.  Each
+        # skipped cleanup avoids three set_register round trips on a
+        # bit-banged 40 kbaud UART.
+        if self._vactual_maybe_running:
+            self._stop_recovery_vactual()
         self._extreme_recovery_active = None
         self._recovery_started_at = 0.0
         if self._recovery_check_timer is not None:
@@ -701,7 +909,7 @@ class Buffer:
         self._rd_multiplier = 1.0
         self.motor_direction = STOP
         self._safety_zone_start = 0.0
-        self._dlog(None, "unsynced")
+        self._dlog(None, "unsynced (%s)", reason or "-")
 
     def _handle_extruder_change(self, new_extruder_name):
         """React to the active extruder changing.
@@ -717,10 +925,10 @@ class Buffer:
         if self.extruder_name is not None:
             if new_extruder_name == self.extruder_name:
                 if self._synced_to is None:
-                    self._sync()
+                    self._sync("tool-change")
             else:
                 if self._synced_to is not None:
-                    self._unsync()
+                    self._unsync("tool-change")
                     # Return to STOPPED so _sync() can promote back to
                     # FEEDING when our extruder is active again.
                     if self.state == STATE_FEEDING:
@@ -728,8 +936,8 @@ class Buffer:
         else:
             # Unbound — follow whatever is active.
             if self._synced_to is not None:
-                self._unsync()
-            self._sync()
+                self._unsync("tool-change")
+            self._sync("tool-change")
 
     # --- Rotation distance feedback ---
 
@@ -835,6 +1043,14 @@ class Buffer:
             return
         register = self._mm_per_s_to_vactual(self.recovery_speed)
         if not self._write_vactual(register):
+            # Unconfirmed write: the chip may already be feeding at
+            # recovery_speed.  Stop it by the one route that does not
+            # depend on the bus that just failed, then escalate.  The
+            # latch gate skips the fallback when no write can have
+            # left at all (_mcu_tmc is None).
+            if self._vactual_maybe_running:
+                self._disable_stepper_driver(
+                    "EMPTY recovery VACTUAL write failed")
             self._handle_error("EMPTY recovery: VACTUAL write failed")
             return
         self._extreme_recovery_active = ZONE_EMPTY
@@ -844,19 +1060,67 @@ class Buffer:
                    register, self.recovery_speed)
         self._arm_recovery_timer(eventtime + _RECOVERY_POLL_INTERVAL)
 
-    def _enter_full_recovery(self, eventtime):
+    def _enter_full_recovery(self, eventtime, drain_speed=1.0):
+        """Reverse-VACTUAL drain out of the FULL band.  The default
+        1 mm/s is the mid-print drift-over-fill drain (slow enough
+        not to fight a forward-feeding extruder); print-start
+        normalization passes start_drain_speed instead."""
         if self._extreme_recovery_active is not None:
             return
-        register = -self._mm_per_s_to_vactual(1.0)  # 1 mm/s slow drain
+        register = -self._mm_per_s_to_vactual(drain_speed)
         if not self._write_vactual(register):
+            # Unconfirmed write: the chip may already be draining in
+            # reverse.  Same reasoning as _enter_empty_recovery.
+            if self._vactual_maybe_running:
+                self._disable_stepper_driver(
+                    "FULL recovery VACTUAL write failed")
             self._handle_error("FULL recovery: VACTUAL write failed")
             return
         self._extreme_recovery_active = ZONE_FULL
         self._recovery_started_at = eventtime
         self._dlog(eventtime,
-                   "recovery enter FULL vactual=%d (1.0 mm/s reverse)",
-                   register)
+                   "recovery enter FULL vactual=%d (%.1f mm/s reverse)",
+                   register, drain_speed)
         self._arm_recovery_timer(eventtime + 0.5)
+
+    def _maybe_start_print_normalization(self, eventtime):
+        """One-shot FULL drain at print start.  Loading parks the arm
+        at FULL by design, so a print beginning with a full arm is the
+        common case, not drift — drain it at start_drain_speed rather
+        than the mid-print 1 mm/s.  Stateless: all gates re-checked at
+        call time, so the three triggers (print_stats:start_printing,
+        BUFFER_ENABLE while printing, auto-re-sync while printing) can
+        fire in any order and duplicates are no-ops via the
+        recovery-active gate.  The per-attempt extreme_recovery_timeout
+        caps the drain (10 s at 5 mm/s = 50 mm); raise it for longer
+        buffer arms."""
+        if not self.auto_enabled:
+            return
+        if self._synced_to is None:
+            return
+        if self._extreme_recovery_active is not None:
+            return
+        if not self.material_present:
+            return
+        if not self._is_printing():
+            return
+        if self._compute_zone() != ZONE_FULL:
+            return
+        self._dlog(eventtime,
+                   "print-start normalization: FULL at start, draining "
+                   "at %.1f mm/s", self.start_drain_speed)
+        self._enter_full_recovery(eventtime, self.start_drain_speed)
+
+    def _handle_print_start(self):
+        """print_stats:start_printing handler (Kalico-only event; on
+        mainline Klipper it never fires and the BUFFER_ENABLE /
+        auto-re-sync hooks carry the feature).  Fired from
+        virtual_sdcard's work_handler on every print start AND every
+        resume, before the file's first line runs.  Deferred to a
+        reactor callback: event handlers run inside the work_handler
+        dispatch and must stay cheap."""
+        self.reactor.register_callback(
+            self._maybe_start_print_normalization)
 
     def _arm_recovery_timer(self, wake):
         if self._recovery_check_timer is None:
@@ -995,10 +1259,24 @@ class Buffer:
         # Ensure we're synced when auto-enabled.  Skip during extreme
         # recovery — the recovery owns the unsynced state and will
         # resync via _exit_extreme_recovery when the zone returns.
+        # Material gate: after a runout _material_callback unsyncs but
+        # leaves auto_enabled=True in IDLE; filament is still moving
+        # during the runout, so without this gate the very next hall
+        # edge would re-sync a buffer that has nothing to feed.
         if (self._synced_to is None
                 and self._initial_fill_until <= 0.0
-                and self._extreme_recovery_active is None):
-            self._sync()
+                and self._extreme_recovery_active is None
+                and self.material_present):
+            self._sync("auto-resync")
+            if self._synced_to is not None:
+                # Re-synced while printing with the arm at FULL —
+                # normalize at start_drain_speed before the generic
+                # 1 mm/s entry below can claim it.  When this fires,
+                # the mid-recovery branch returns for the rest of
+                # this tick; the per-attempt extreme_recovery_timeout
+                # is the governing cap (cumulative arming is skipped
+                # via in_active_recovery).
+                self._maybe_start_print_normalization(eventtime)
 
         # Safety timeout tracking.  Edge-based arming on zone entry
         # preserves the be70969 intent: stale state from before printing
@@ -1036,7 +1314,7 @@ class Buffer:
                 and zone not in (ZONE_EMPTY, ZONE_EMPTY_MIDDLE)):
             self._initial_fill_until = 0.0
             self._cancel_fill_timer()
-            self._sync()
+            self._sync("fill-complete")
 
         # Mid-recovery handling: detect exit conditions.  The recovery
         # check timer also polls for these; this branch covers the
@@ -1061,6 +1339,13 @@ class Buffer:
         # filament, and surprise active motion (EMPTY) or auto-drain
         # (FULL) is unwanted.  This matches the safety-timeout policy
         # which also only ticks while printing.
+        #
+        # The synced gate below is deliberate: recovery assumes the
+        # sync-follow context.  Since the control timer now calls
+        # _update_rotation_distance unconditionally, the auto-sync
+        # above restores sync within one control_interval of any
+        # unsync (material permitting), so recovery can enter on the
+        # very tick that re-syncs — worst-case latency is one tick.
         if (zone in (ZONE_FULL, ZONE_EMPTY)
                 and self._synced_to is not None
                 and self._is_printing()):
@@ -1096,7 +1381,7 @@ class Buffer:
         """
         if self.force_move is None:
             return
-        self._unsync()
+        self._unsync("initial-fill")
         self.state = STATE_FEEDING
         self.motor_direction = FORWARD
         next_wake = self._do_fill_chunk(eventtime)
@@ -1130,7 +1415,7 @@ class Buffer:
             self.gcode.respond_info(
                 "Buffer: initial fill timed out after %.0fs"
                 % self.initial_fill_timeout)
-            self._sync()
+            self._sync("fill-timeout")
             return self.reactor.NEVER
         # Abort: filament reached middle sensor or beyond
         zone = self._compute_zone()
@@ -1138,7 +1423,7 @@ class Buffer:
             self._initial_fill_until = 0.0
             logging.info("buffer[%s]: initial fill complete (zone=%s)"
                          % (self.short_name, zone))
-            self._sync()
+            self._sync("fill-complete")
             return self.reactor.NEVER
         # Abort: fill was cancelled (disable, runout, error)
         if self._initial_fill_until <= 0.0:
@@ -1153,7 +1438,7 @@ class Buffer:
             logging.warning("buffer[%s]: fill chunk failed: %s"
                             % (self.short_name, e))
             self._initial_fill_until = 0.0
-            self._sync()
+            self._sync("fill-error")
             return self.reactor.NEVER
         return eventtime + self._chunk_move_duration(
             self._manual_chunk_dist, self.manual_speed, self.manual_accel)
@@ -1166,6 +1451,33 @@ class Buffer:
     # --- Control timer ---
 
     def _control_timer_cb(self, eventtime):
+        # Debug heartbeat — BEFORE the manual-state early returns so
+        # it reports in every state.  margin is how far the queued
+        # motion runs ahead of the buffer stepper's MCU clock; a
+        # margin trending toward zero under load is the precursor of
+        # a "Rescheduled timer in the past" shutdown.  Uses
+        # toolhead.get_status (never get_last_move_time — that
+        # flushes the lookahead) and the buffer stepper's own MCU,
+        # which may be a secondary board.
+        if (self.debug
+                and eventtime - self._last_heartbeat_at
+                >= _HEARTBEAT_INTERVAL):
+            self._last_heartbeat_at = eventtime
+            margin = -1.0
+            try:
+                mcu = self.extruder_stepper.stepper.get_mcu()
+                margin = (self.toolhead.get_status(eventtime)
+                          ["print_time"]
+                          - mcu.estimated_print_time(eventtime))
+            except Exception:
+                pass
+            self._dlog(eventtime,
+                       "heartbeat zone=%s state=%s synced=%s "
+                       "recovery=%s latch=%s material=%s margin=%.3f",
+                       self._current_zone, self.state, self._synced_to,
+                       self._extreme_recovery_active,
+                       self._vactual_maybe_running,
+                       self.material_present, margin)
         # Poll active extruder to detect tool changes.  The toolhead's
         # active extruder can change via ACTIVATE_EXTRUDER / T0/T1 macros
         # without firing a dedicated event, so we sample it each tick.
@@ -1191,7 +1503,7 @@ class Buffer:
                     self._stop_manual()
                     if self.auto_enabled:
                         self.state = STATE_STOPPED
-                        self._sync()
+                        self._sync("manual-feed-stop")
                     else:
                         self.state = STATE_IDLE
                     self._manual_feed_full_start = 0.0
@@ -1218,7 +1530,7 @@ class Buffer:
                 self._stop_manual()
                 if self.auto_enabled:
                     self.state = STATE_STOPPED
-                    self._sync()
+                    self._sync("manual-retract-stop")
                 else:
                     self.state = STATE_IDLE
                 self.gcode.respond_info(
@@ -1268,9 +1580,17 @@ class Buffer:
                     self._do_safety_retract(eventtime)
                     return eventtime + self.control_interval
 
-        # Periodic re-evaluation of rotation_distance
-        if self._synced_to is not None:
-            self._update_rotation_distance(eventtime)
+        # Periodic re-evaluation of rotation_distance.  Called
+        # UNCONDITIONALLY — the auto-sync inside it is the only path
+        # that restores sync after a safety retract or manual unsync,
+        # and gating this call on being synced (the old behavior) made
+        # re-sync depend entirely on a lucky sensor edge.  Upstream
+        # guards in this timer already filter MANUAL_* (early
+        # returns), not-auto-enabled, and ERROR/DISABLED, so the
+        # reachable states here are IDLE, FEEDING, STOPPED and
+        # RETRACTING; the auto-sync itself is additionally
+        # material-gated.
+        self._update_rotation_distance(eventtime)
 
         # Drain any rate-limit-deferred multiplier update.  Without
         # this, a multiplier change that was rate-limited away during
@@ -1284,21 +1604,28 @@ class Buffer:
     def _do_safety_retract(self, eventtime):
         """Forced retract when full zone times out.
 
-        Unsyncs, issues a retract via force_move.manual_move, then
-        leaves the stepper unsynced.  The next control timer cycle
-        will re-sync via _update_rotation_distance -> _sync() once
-        print_time has advanced past the move.  This pays a brief
-        toolhead dwell during a print — acceptable for a rare
-        fault-recovery path.
+        Unsyncs, issues a retract via force_move.manual_move, and arms
+        the shared completion timer: when the move's duration elapses,
+        _timed_move_done_cb restores RETRACTING -> STOPPED, and the
+        control timer's unconditional _update_rotation_distance call
+        then re-syncs (STOPPED -> FEEDING) within one
+        control_interval.  This pays a brief toolhead dwell during a
+        print — acceptable for a rare fault-recovery path.
         """
         logging.info("buffer[%s]: full zone safety retract"
                      % self.short_name)
         self.gcode.respond_info(
             "Buffer: full zone timeout - retracting")
         stepper = self.extruder_stepper.stepper
-        self._unsync()
+        self._unsync("safety-retract")
         self.state = STATE_RETRACTING
         self.motor_direction = BACK
+        # Armed before the move so a raising manual_move still exits
+        # RETRACTING instead of leaving it terminal.
+        self._arm_move_done_timer(
+            eventtime + self._chunk_move_duration(
+                self._manual_chunk_dist, self.manual_speed,
+                self.manual_accel))
         try:
             self.force_move.manual_move(
                 stepper, -self._manual_chunk_dist, self.manual_speed,
@@ -1354,12 +1681,12 @@ class Buffer:
         self._stop_manual()
         if self.auto_enabled:
             self.auto_enabled = False
-            self._unsync()
+            self._unsync("buttons-disable")
             self.state = STATE_IDLE
         else:
             self.auto_enabled = True
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("buttons-enable")
         self.gcode.respond_info(
             "Buffer: %s via buttons"
             % ("enabled" if self.auto_enabled else "disabled"))
@@ -1368,7 +1695,7 @@ class Buffer:
         """Restore state after manual button release."""
         if self.auto_enabled:
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("button-release")
         else:
             self.state = STATE_IDLE
 
@@ -1395,8 +1722,12 @@ class Buffer:
         """Timer callback: clear error if both buttons still held."""
         if (self._feed_button_pressed and self._retract_button_pressed
                 and self.state == STATE_ERROR):
-            self._clear_error()
-            self.gcode.respond_info("Buffer: error cleared via buttons")
+            if self._clear_error():
+                self.gcode.respond_info(
+                    "Buffer: error cleared via buttons")
+            else:
+                self.gcode.respond_info(
+                    "Buffer: error NOT cleared - %s" % self.error_msg)
         self._error_clear_hold_start = 0.0
         return self.reactor.NEVER
 
@@ -1409,7 +1740,11 @@ class Buffer:
         (retract), BUFFER_STOP, or button release.
         """
         self._cancel_fill()
-        self._unsync()
+        # A pending fixed-move completion shares the MANUAL_* states,
+        # so the state guard alone would NOT protect this session —
+        # a stale fire would kill a button-held feed mid-hold.
+        self._cancel_move_done_timer()
+        self._unsync("manual-continuous")
         if direction == FORWARD:
             self.state = STATE_MANUAL_FEED
         else:
@@ -1467,34 +1802,90 @@ class Buffer:
                 self._continuous_timer, self.reactor.NEVER)
 
     def _stop_manual(self):
-        """Stop any pending manual move state.  Cancels the timer
-        explicitly to prevent the next scheduled chunk from firing
-        with stale state — the state guard in _do_continuous_chunk
-        is belt-and-suspenders on top of this."""
+        """Stop any pending manual move state.  Cancels the timers
+        explicitly to prevent the next scheduled chunk (or a pending
+        fixed-move completion) from firing with stale state — the
+        state guards in the callbacks are belt-and-suspenders on top
+        of this."""
         self.motor_direction = STOP
         self._manual_feed_full_start = 0.0
         self._cancel_continuous_timer()
+        self._cancel_move_done_timer()
+
+    # --- Timed-move completion ---
+
+    def _arm_move_done_timer(self, wake):
+        if self._move_done_timer is None:
+            self._move_done_timer = self.reactor.register_timer(
+                self._timed_move_done_cb, wake)
+        else:
+            self.reactor.update_timer(self._move_done_timer, wake)
+
+    def _cancel_move_done_timer(self):
+        if self._move_done_timer is not None:
+            self.reactor.update_timer(
+                self._move_done_timer, self.reactor.NEVER)
+
+    def _timed_move_done_cb(self, eventtime):
+        """One-shot completion for fixed-distance manual moves and the
+        safety retract.  Restores the state machine when the move's
+        real-time duration has elapsed; any takeover that changed
+        state in the meantime (error, disable, runout, a fresh
+        continuous feed) makes this a no-op via the state guard.
+
+        When auto-enabled and still unsynced, deliberately do NOT call
+        _sync() here — the control timer's unconditional
+        _update_rotation_distance call re-syncs within one
+        control_interval, with the material gate applied.  When a
+        control tick already re-synced mid-move (possible when
+        control_interval < move duration), promote directly to
+        FEEDING: _sync() only promotes on the STOPPED->synced edge,
+        so without this the buffer would sit synced-but-STOPPED
+        indefinitely."""
+        if self.state not in (STATE_MANUAL_FEED, STATE_MANUAL_RETRACT,
+                              STATE_RETRACTING):
+            return self.reactor.NEVER
+        self.motor_direction = STOP
+        if not self.auto_enabled:
+            self.state = STATE_IDLE
+            return self.reactor.NEVER
+        self.state = STATE_STOPPED
+        if self._synced_to is not None:
+            self.state = STATE_FEEDING
+            self.motor_direction = FORWARD
+        return self.reactor.NEVER
 
     # --- Error handling ---
 
     def _handle_error(self, msg):
         self._cancel_fill()
-        self._unsync()
+        self._unsync("error")
         self.state = STATE_ERROR
         self.error_msg = msg
         self.motor_direction = STOP
         logging.error("buffer[%s]: %s" % (self.short_name, msg))
         self.gcode.respond_info("Buffer ERROR: %s" % msg)
-        if self.pause_on_runout:
+        if self.pause_on_error:
             self._trigger_pause(msg)
 
     def _clear_error(self):
-        """Clear error state."""
+        """Clear error state.  Returns False — and stays in ERROR —
+        when the chip-side VACTUAL state cannot be confirmed cleared,
+        for the same reason cmd_BUFFER_ENABLE refuses: leaving ERROR
+        re-arms sync and the driver, and a stale nonzero VACTUAL would
+        resume motion the moment the driver re-enables."""
+        self._driver_disable_requested = False
+        if (self._vactual_maybe_running
+                and not self._stop_recovery_vactual()):
+            self.error_msg = ("VACTUAL could not be cleared; "
+                              "TMC UART unresponsive")
+            return False
         self.state = STATE_STOPPED if self.auto_enabled else STATE_IDLE
         self.error_msg = ""
         self._safety_zone_start = 0.0
         if self.auto_enabled:
-            self._sync()
+            self._sync("error-cleared")
+        return True
 
     def _trigger_pause(self, msg):
         try:
@@ -1527,16 +1918,26 @@ class Buffer:
             "synced_to": self._synced_to,
             "manual_speed": self.manual_speed,
             "recovery_speed": self.recovery_speed,
+            "start_drain_speed": self.start_drain_speed,
             "manual_move_distance": self.manual_move_distance,
             "drift_gain": self.drift_gain,
             "extreme_recovery_active": self._extreme_recovery_active,
+            "vactual_maybe_running": self._vactual_maybe_running,
+            "driver_disable_requested": self._driver_disable_requested,
             "is_printing": self._is_printing(),
             "manual_feed_full_timeout": self.manual_feed_full_timeout,
+            "pause_on_runout": self.pause_on_runout,
+            "pause_on_error": self.pause_on_error,
         }
 
     def _is_printing(self):
+        # Safe default: without print_stats (no [virtual_sdcard]) we
+        # cannot know a print is running, so treat the machine as not
+        # printing — no surprise recovery motion, normalization, or
+        # safety-timeout escalation on such setups.  Drift-gain
+        # feedback is unaffected (it doesn't gate on printing).
         if self._print_stats is None:
-            return True
+            return False
         return (self._print_stats.get_status(
             self.reactor.monotonic())["state"] == "printing")
 
@@ -1586,17 +1987,50 @@ class Buffer:
         gcmd.respond_info(msg)
 
     def cmd_BUFFER_ENABLE(self, gcmd):
+        # No-op while extreme-zone recovery is driving the motor.
+        # Recovery implies enabled-and-synced already, and the latch
+        # consumption below would otherwise write the stop sequence —
+        # silently killing the recovery push while the poller stays
+        # armed, which manifests as a spurious "recovery exceeded"
+        # error a few seconds later.
+        if self._extreme_recovery_active is not None:
+            gcmd.respond_info(
+                "Buffer: already enabled (extreme-zone recovery in "
+                "progress)")
+            return
+        # Consume the VACTUAL latch before arming anything.  If a prior
+        # cleanup failed (or a prior session died mid-recovery), the
+        # chip still holds a nonzero VACTUAL and will resume motion the
+        # moment the driver re-enables — refuse until a confirmed zero
+        # lands.  Re-arm the one-shot fallback first so this attempt
+        # gets its own fresh try at the bus.
+        self._driver_disable_requested = False
+        if (self._vactual_maybe_running
+                and not self._stop_recovery_vactual()):
+            gcmd.respond_info(
+                "Buffer: NOT enabled - VACTUAL could not be cleared "
+                "(TMC UART unresponsive). Fix the connection and retry "
+                "BUFFER_ENABLE.")
+            return
         self.auto_enabled = True
         self.state = STATE_STOPPED
         self.error_msg = ""
         self._safety_zone_start = 0.0
-        self._sync()
+        self._sync("enable")
+        # The recommended START_PRINT flow disables the buffer during
+        # heat/level and re-enables right before the prime line — for
+        # file prints print_stats is already "printing" there, so this
+        # hook (not the start event) is the one that normalizes a
+        # loaded-full arm in practice.
+        if self._synced_to is not None:
+            self._maybe_start_print_normalization(
+                self.reactor.monotonic())
         gcmd.respond_info("Buffer: automatic control enabled")
 
     def cmd_BUFFER_DISABLE(self, gcmd):
         self.auto_enabled = False
         self._cancel_fill()
-        self._unsync()
+        self._unsync("disable")
         self.state = STATE_DISABLED
         gcmd.respond_info("Buffer: automatic control disabled")
 
@@ -1611,7 +2045,7 @@ class Buffer:
         if dist > 0.0:
             # Fixed distance feed
             self._cancel_fill()
-            self._unsync()
+            self._unsync("manual-feed")
             self.state = STATE_MANUAL_FEED
             self.motor_direction = FORWARD
             self._manual_feed_full_start = 0.0
@@ -1622,6 +2056,13 @@ class Buffer:
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_FEED failed: %s"
                                 % (self.short_name, e))
+            # Armed even when manual_move raised — the completion
+            # restores STOPPED/IDLE either way instead of stranding
+            # the state machine in MANUAL_FEED forever.
+            self._arm_move_done_timer(
+                self.reactor.monotonic()
+                + self._chunk_move_duration(dist, speed,
+                                            self.manual_accel))
             gcmd.respond_info(
                 "Buffer: feeding %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -1641,7 +2082,7 @@ class Buffer:
         if dist > 0.0:
             # Fixed distance retract
             self._cancel_fill()
-            self._unsync()
+            self._unsync("manual-retract")
             self.state = STATE_MANUAL_RETRACT
             self.motor_direction = BACK
             try:
@@ -1651,6 +2092,11 @@ class Buffer:
             except Exception as e:
                 logging.warning("buffer[%s]: BUFFER_RETRACT failed: %s"
                                 % (self.short_name, e))
+            # See cmd_BUFFER_FEED: completion restores STOPPED/IDLE.
+            self._arm_move_done_timer(
+                self.reactor.monotonic()
+                + self._chunk_move_duration(dist, speed,
+                                            self.manual_accel))
             gcmd.respond_info(
                 "Buffer: retracting %.0fmm at %.1f mm/s" % (dist, speed))
         else:
@@ -1669,7 +2115,10 @@ class Buffer:
             return
         speed = gcmd.get_float("SPEED", self.manual_speed, above=0.0)
         self._cancel_fill()
-        self._unsync()
+        # Same shared-state hazard as _start_continuous_feed: this
+        # loop lives in MANUAL_RETRACT too.
+        self._cancel_move_done_timer()
+        self._unsync("retract-until-clear")
         self.state = STATE_MANUAL_RETRACT
         self.motor_direction = BACK
         self._continuous_feed_direction = BACK
@@ -1737,7 +2186,7 @@ class Buffer:
         self._stop_manual()
         if self.auto_enabled:
             self.state = STATE_STOPPED
-            self._sync()
+            self._sync("stop")
         else:
             self.state = STATE_IDLE
         gcmd.respond_info("Buffer: stopped")
@@ -1749,8 +2198,11 @@ class Buffer:
 
     def cmd_BUFFER_CLEAR_ERROR(self, gcmd):
         if self.state == STATE_ERROR:
-            self._clear_error()
-            gcmd.respond_info("Buffer: error cleared")
+            if self._clear_error():
+                gcmd.respond_info("Buffer: error cleared")
+            else:
+                gcmd.respond_info(
+                    "Buffer: error NOT cleared - %s" % self.error_msg)
         else:
             gcmd.respond_info("Buffer: no error to clear")
 
